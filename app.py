@@ -3,42 +3,58 @@ from FlightRadar24 import FlightRadar24API
 import os
 
 app = Flask(__name__)
-fr_api = FlightRadar24API()
 
 @app.route('/api/get_eta/<flight_code>', methods=['GET'])
 def get_eta(flight_code):
     try:
-        # Chuẩn hóa mã chuyến bay (Viết hoa và xóa khoảng trắng)
+        fr_api = FlightRadar24API()
         flight_code = flight_code.strip().upper()
         
-        # Lấy danh sách TOÀN BỘ chuyến bay đang bay trên bầu trời
-        flights = fr_api.get_flights()
+        # 1. Thu hẹp vùng quét (chỉ tập trung vào không phận Việt Nam và lân cận)
+        # Việc này giúp giảm lượng dữ liệu tải về, tránh bị FlightRadar chặn IP
+        bounds_vn = "23.39,8.55,102.14,109.46"
+        flights = fr_api.get_flights(bounds=bounds_vn)
         
-        # Dò tìm chuyến bay có số hiệu khớp với mã của bạn (VD: VN159)
         target_flight = None
         for f in flights:
+            # Kiểm tra xem mã chuyến bay có khớp không
             if f.number.upper() == flight_code or f.callsign.upper() == flight_code:
                 target_flight = f
                 break
                 
         if not target_flight:
-            return jsonify({"status": "error", "message": "Không tìm thấy chuyến bay trên radar"}), 404
+            return jsonify({
+                "status": "error", 
+                "message": f"Không tìm thấy chuyến bay {flight_code} trong vùng bay VN"
+            }), 404
         
-        # Lấy chi tiết chuyến bay để quét ra giờ hạ cánh (ETA)
+        # 2. Lấy chi tiết để kiểm tra điểm đến và giờ hạ cánh (ETA)
         details = fr_api.get_flight_details(target_flight)
+        
+        # Lấy mã sân bay đến (IATA code)
+        dest_airport = details.get('airport', {}).get('destination', {}).get('code', {}).get('iata')
+        
+        # Lọc: Chỉ xử lý nếu điểm đến là Đà Nẵng (DAD)
+        if dest_airport != "DAD":
+            return jsonify({
+                "status": "error", 
+                "message": f"Chuyến bay {flight_code} không về Đà Nẵng (Đang về {dest_airport})"
+            }), 400
+
         eta_seconds = details.get('time', {}).get('estimated', {}).get('arrival')
         
         if eta_seconds:
-            # Trả về giờ ETA tính bằng Milliseconds cho App Android
             return jsonify({
                 "status": "success",
                 "flight_code": flight_code,
+                "destination": "Da Nang (DAD)",
                 "eta_millis": eta_seconds * 1000
             })
         else:
-            return jsonify({"status": "error", "message": "Chưa có giờ ETA"}), 400
+            return jsonify({"status": "error", "message": "Chuyến bay đã về DAD hoặc chưa có ETA"}), 400
 
     except Exception as e:
+        # Nếu bị lỗi 429 hoặc lỗi mạng, trả về thông báo để App biết và thử lại sau
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
