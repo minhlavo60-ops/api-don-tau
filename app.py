@@ -15,14 +15,13 @@ ETA_API_KEY = os.environ.get(
     "0982e7c09397ca3ed579775a9a29ff208a1715d0526fbb65b67a61c1cb126923",
 )
 
-POLL_INTERVAL = 60          # 1 phút
+POLL_INTERVAL = 60           # 1 phút
 TARGET_AIRPORT = "DAD"
-STALE_AFTER_MS = 10 * 60 * 1000   # 10 phút không update coi như stale
+STALE_AFTER_MS = 10 * 60 * 1000   # data > 10 phút coi như stale
 
-# ---- shared state ----
 _lock = threading.Lock()
-QUEUE = set()         # các flight code app đăng ký theo dõi
-TRACKED = {}          # code -> {eta_millis, status, updated_at}
+QUEUE = set()           # flight codes app đăng ký theo dõi
+TRACKED = {}            # code -> {eta_millis, status, updated_at}
 LAST_POLL_MS = None
 LAST_ERROR = None
 
@@ -30,7 +29,7 @@ fr_api = FlightRadar24API()
 
 
 # =====================================================
-# Background poller — 1 vòng = 1 call FR24, cập nhật cả 5 tàu
+# Background poller — 1 call FR24/phút, cập nhật cả nhóm
 # =====================================================
 def poll_arrivals_loop():
     global LAST_POLL_MS, LAST_ERROR
@@ -85,9 +84,6 @@ def poll_arrivals_loop():
         time.sleep(POLL_INTERVAL)
 
 
-# =====================================================
-# Auth
-# =====================================================
 def require_api_key():
     client_key = request.headers.get("X-API-Key", "")
     if not ETA_API_KEY:
@@ -95,6 +91,26 @@ def require_api_key():
     if not hmac.compare_digest(client_key, ETA_API_KEY):
         return jsonify({"status": "error", "message": "Sai mật khẩu truy cập server"}), 401
     return None
+
+
+def build_etas_payload():
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        result = {}
+        for code in QUEUE:
+            data = TRACKED.get(code)
+            if data is None:
+                result[code] = {"status": "pending"}
+            else:
+                stale = (now_ms - data["updated_at"]) > STALE_AFTER_MS
+                result[code] = {**data, "stale": stale}
+        return {
+            "status": "success",
+            "server_time_millis": now_ms,
+            "last_poll_millis": LAST_POLL_MS,
+            "last_error": LAST_ERROR,
+            "flights": result,
+        }
 
 
 # =====================================================
@@ -119,27 +135,25 @@ def remove_track(flight_code):
     return jsonify({"status": "success", "tracked": sorted(QUEUE)})
 
 
-@app.route('/api/etas', methods=['GET'])
+@app.route('/api/etas', methods=['GET', 'POST'])
 def get_all_etas():
-    """App gọi endpoint này để lấy ETA cả 5 tàu trong 1 lần."""
+    """
+    GET  → trả về toàn bộ tàu đang theo dõi (cache).
+    POST → body {"codes":["VN123","VJ456",...]} sẽ đăng ký thêm các mã rồi trả về.
+    App nên gọi POST với danh sách flight code hiện đang có để vừa đảm bảo
+    server biết theo dõi vừa nhận ETA trong 1 call.
+    """
     if (err := require_api_key()): return err
-    now_ms = int(time.time() * 1000)
-    with _lock:
-        result = {}
-        for code in QUEUE:
-            data = TRACKED.get(code)
-            if data is None:
-                result[code] = {"status": "pending"}
-            else:
-                stale = (now_ms - data["updated_at"]) > STALE_AFTER_MS
-                result[code] = {**data, "stale": stale}
-        return jsonify({
-            "status": "success",
-            "server_time_millis": now_ms,
-            "last_poll_millis": LAST_POLL_MS,
-            "last_error": LAST_ERROR,
-            "flights": result,
-        })
+
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        codes = body.get('codes', []) or []
+        cleaned = [c.strip().upper() for c in codes if isinstance(c, str) and c.strip()]
+        if cleaned:
+            with _lock:
+                QUEUE.update(cleaned)
+
+    return jsonify(build_etas_payload())
 
 
 @app.route('/api/get_eta/<flight_code>', methods=['GET'])
@@ -174,12 +188,9 @@ def get_eta(flight_code):
 
 
 # =====================================================
-# Start poller (chỉ 1 lần kể cả khi Flask reload)
+# Khởi động poller
 # =====================================================
 def _start_poller():
-    if os.environ.get("WERKZEUG_RUN_MAIN") != "true" and not os.environ.get("RENDER"):
-        # Tránh chạy 2 lần khi flask debug reloader
-        pass
     t = threading.Thread(target=poll_arrivals_loop, daemon=True)
     t.start()
 
