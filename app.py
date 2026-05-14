@@ -12,7 +12,7 @@ def get_eta(flight_code):
         
         # 1. Thu hẹp vùng quét (chỉ tập trung vào không phận Việt Nam và lân cận)
         # Việc này giúp giảm lượng dữ liệu tải về, tránh bị FlightRadar chặn IP
-        bounds_vn = "23.39,8.55,102.14,109.46"
+        bounds_vn = "25.00,5.00,100.00,115.00"
         flights = fr_api.get_flights(bounds=bounds_vn)
         
         target_flight = None
