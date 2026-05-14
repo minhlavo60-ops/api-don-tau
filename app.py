@@ -2,110 +2,21 @@ from flask import Flask, jsonify, request
 from FlightRadar24 import FlightRadar24API
 import hmac
 import os
-import threading
-import time
-import logging
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
 
+# Mật khẩu/token truy cập server.
+# Trên Render nên tạo Environment Variable:
+#   ETA_API_KEY=0982e7c09397ca3ed579775a9a29ff208a1715d0526fbb65b67a61c1cb126923
+# Nếu chưa cấu hình ENV, server sẽ dùng token mặc định bên dưới.
 ETA_API_KEY = os.environ.get(
     "ETA_API_KEY",
     "0982e7c09397ca3ed579775a9a29ff208a1715d0526fbb65b67a61c1cb126923",
 )
 
-POLL_INTERVAL = 60                       # poll nền: 1 phút/lần
-IMMEDIATE_POLL_COOLDOWN_MS = 10_000      # ép poll ngay nhưng tối thiểu cách nhau 10s
-TARGET_AIRPORT = "DAD"
-STALE_AFTER_MS = 10 * 60 * 1000
-
-_lock = threading.Lock()
-_immediate_poll_lock = threading.Lock()
-QUEUE = set()
-TRACKED = {}
-LAST_POLL_MS = None
-LAST_IMMEDIATE_POLL_MS = 0
-LAST_ERROR = None
-
-fr_api = FlightRadar24API()
-
-
-def _do_poll():
-    """1 chu kỳ poll FR24 → cập nhật TRACKED. Có thể raise lên trên."""
-    global LAST_POLL_MS, LAST_ERROR
-    airport = fr_api.get_airport_details(TARGET_AIRPORT)
-    arrivals = (
-        airport.get('airport', {})
-               .get('pluginData', {})
-               .get('schedule', {})
-               .get('arrivals', {})
-               .get('data', []) or []
-    )
-
-    now_ms = int(time.time() * 1000)
-    seen = {}
-    for item in arrivals:
-        flight = item.get('flight') or {}
-        ident = flight.get('identification') or {}
-        number = ((ident.get('number') or {}).get('default') or "").upper()
-        callsign = (ident.get('callsign') or "").upper()
-        eta_sec = ((flight.get('time') or {}).get('estimated') or {}).get('arrival')
-        status_text = ((flight.get('status') or {}).get('text') or "")
-        entry = {
-            "eta_millis": eta_sec * 1000 if eta_sec else None,
-            "status": status_text,
-            "updated_at": now_ms,
-        }
-        if number:
-            seen[number] = entry
-        if callsign:
-            seen[callsign] = entry
-
-    with _lock:
-        matched = 0
-        for code in QUEUE:
-            if code in seen:
-                TRACKED[code] = seen[code]
-                matched += 1
-        LAST_POLL_MS = now_ms
-        LAST_ERROR = None
-    log.info(f"Poll DAD: {len(arrivals)} arrivals, matched {matched}/{len(QUEUE)}")
-
-
-def _try_immediate_poll(reason: str = "") -> bool:
-    """Poll ngay khi có sự kiện 'mã mới', nhưng không sát nhau quá COOLDOWN."""
-    global LAST_IMMEDIATE_POLL_MS, LAST_ERROR
-    with _immediate_poll_lock:
-        now = int(time.time() * 1000)
-        if now - LAST_IMMEDIATE_POLL_MS < IMMEDIATE_POLL_COOLDOWN_MS:
-            return False
-        LAST_IMMEDIATE_POLL_MS = now
-
-    try:
-        _do_poll()
-        log.info(f"Immediate poll OK ({reason})")
-        return True
-    except Exception as e:
-        with _lock:
-            LAST_ERROR = str(e)
-        log.warning(f"Immediate poll fail ({reason}): {e}")
-        return False
-
-
-def poll_arrivals_loop():
-    global LAST_ERROR
-    while True:
-        try:
-            _do_poll()
-        except Exception as e:
-            with _lock:
-                LAST_ERROR = str(e)
-            log.exception("Scheduled poll failed")
-        time.sleep(POLL_INTERVAL)
-
 
 def require_api_key():
+    """Kiểm tra mật khẩu từ app gửi lên qua header X-API-Key."""
     client_key = request.headers.get("X-API-Key", "")
     if not ETA_API_KEY:
         return jsonify({"status": "error", "message": "Server chưa cấu hình ETA_API_KEY"}), 500
@@ -114,108 +25,59 @@ def require_api_key():
     return None
 
 
-def build_etas_payload():
-    now_ms = int(time.time() * 1000)
-    with _lock:
-        result = {}
-        for code in QUEUE:
-            data = TRACKED.get(code)
-            if data is None:
-                result[code] = {"status": "pending"}
-            else:
-                stale = (now_ms - data["updated_at"]) > STALE_AFTER_MS
-                result[code] = {**data, "stale": stale}
-        return {
-            "status": "success",
-            "server_time_millis": now_ms,
-            "last_poll_millis": LAST_POLL_MS,
-            "last_error": LAST_ERROR,
-            "flights": result,
-        }
-
-
-@app.route('/api/track/<flight_code>', methods=['POST'])
-def add_track(flight_code):
-    if (err := require_api_key()): return err
-    code = flight_code.strip().upper()
-    with _lock:
-        is_new = code not in TRACKED
-        QUEUE.add(code)
-    if is_new:
-        _try_immediate_poll(f"track new {code}")
-    return jsonify({"status": "success", "tracked": sorted(QUEUE)})
-
-
-@app.route('/api/track/<flight_code>', methods=['DELETE'])
-def remove_track(flight_code):
-    if (err := require_api_key()): return err
-    code = flight_code.strip().upper()
-    with _lock:
-        QUEUE.discard(code)
-        TRACKED.pop(code, None)
-    return jsonify({"status": "success", "tracked": sorted(QUEUE)})
-
-
-@app.route('/api/etas', methods=['GET', 'POST'])
-def get_all_etas():
-    if (err := require_api_key()): return err
-
-    if request.method == 'POST':
-        body = request.get_json(silent=True) or {}
-        codes = body.get('codes', []) or []
-        cleaned = [c.strip().upper() for c in codes if isinstance(c, str) and c.strip()]
-        if cleaned:
-            with _lock:
-                new_codes = [c for c in cleaned if c not in TRACKED]
-                QUEUE.update(cleaned)
-            if new_codes:
-                _try_immediate_poll(f"new codes {new_codes}")
-
-    return jsonify(build_etas_payload())
-
-
 @app.route('/api/get_eta/<flight_code>', methods=['GET'])
 def get_eta(flight_code):
-    if (err := require_api_key()): return err
-    code = flight_code.strip().upper()
-    with _lock:
-        QUEUE.add(code)
-        data = TRACKED.get(code)
+    auth_error = require_api_key()
+    if auth_error is not None:
+        return auth_error
 
-    # Cache trống → ép poll ngay (cooldown sẽ kiểm soát tần suất)
-    if data is None:
-        _try_immediate_poll(f"miss {code}")
-        with _lock:
-            data = TRACKED.get(code)
+    try:
+        fr_api = FlightRadar24API()
+        flight_code = flight_code.strip().upper()
 
-    if data is None:
-        return jsonify({
-            "status": "pending",
-            "message": f"Đã thêm {code} vào queue, FR24 chưa thấy chuyến này"
-        })
-    if data.get("eta_millis") is None:
-        return jsonify({
-            "status": "error",
-            "message": f"Chuyến {code} chưa có ETA / đã hạ cánh",
-            "status_text": data.get("status"),
-        }), 400
+        # Thu hẹp vùng quét: Việt Nam và lân cận.
+        # Giảm dữ liệu tải về, hạn chế nguy cơ bị FlightRadar chặn IP.
+        bounds_vn = "25.00,5.00,100.00,115.00"
+        flights = fr_api.get_flights(bounds=bounds_vn)
 
-    return jsonify({
-        "status": "success",
-        "flight_code": code,
-        "destination": "Da Nang (DAD)",
-        "eta_millis": data["eta_millis"],
-        "status_text": data.get("status"),
-        "updated_at": data.get("updated_at"),
-    })
+        target_flight = None
+        for f in flights:
+            number = (getattr(f, "number", None) or "").upper()
+            callsign = (getattr(f, "callsign", None) or "").upper()
+            if number == flight_code or callsign == flight_code:
+                target_flight = f
+                break
 
+        if not target_flight:
+            return jsonify({
+                "status": "error",
+                "message": f"Không tìm thấy chuyến bay {flight_code} trong vùng bay VN"
+            }), 404
 
-def _start_poller():
-    t = threading.Thread(target=poll_arrivals_loop, daemon=True)
-    t.start()
+        details = fr_api.get_flight_details(target_flight)
 
+        dest_airport = details.get('airport', {}).get('destination', {}).get('code', {}).get('iata')
 
-_start_poller()
+        if dest_airport != "DAD":
+            return jsonify({
+                "status": "error",
+                "message": f"Chuyến bay {flight_code} không về Đà Nẵng (Đang về {dest_airport})"
+            }), 400
+
+        eta_seconds = details.get('time', {}).get('estimated', {}).get('arrival')
+
+        if eta_seconds:
+            return jsonify({
+                "status": "success",
+                "flight_code": flight_code,
+                "destination": "Da Nang (DAD)",
+                "eta_millis": eta_seconds * 1000
+            })
+
+        return jsonify({"status": "error", "message": "Chuyến bay đã về DAD hoặc chưa có ETA"}), 400
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 if __name__ == '__main__':
