@@ -13,10 +13,11 @@ Pipeline:
     hoặc altitude ≤ field_elev + 200ft && ground_speed < 80kt.
   - Khi flight mất khỏi scan: bump miss_count. FINAL + miss≥2 → LANDED
     (FR24 thường ngừng track sau touchdown). EN_ROUTE + miss≥5 → LOST.
+  - v2.1: thêm latitude, longitude, heading để app vẽ bản đồ.
 
 API giữ tương thích bản cũ: /api/etas, /api/track/<code>, /api/get_eta/<code>.
-Response thêm field state, confidence, altitude_ft, ground_speed_kt,
-distance_km, on_ground, stale_seconds, landed.
+Response v2.1 thêm: state, confidence, altitude_ft, ground_speed_kt,
+distance_km, on_ground, latitude, longitude, heading, stale_seconds, landed.
 """
 from __future__ import annotations
 
@@ -114,6 +115,10 @@ class FlightEntry:
     vertical_speed: Optional[int] = None
     distance_km: Optional[float] = None
     on_ground: bool = False
+    # Vị trí + hướng để app vẽ marker bản đồ
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    heading: Optional[int] = None
     updated_at: int = 0                  # ms — lần cuối có data thật
     history: list = field(default_factory=list)
     miss_count: int = 0
@@ -130,6 +135,9 @@ class FlightEntry:
             "vertical_speed": self.vertical_speed,
             "distance_km": self.distance_km,
             "on_ground": self.on_ground,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "heading": self.heading,
             "updated_at": self.updated_at,
             "stale_seconds": stale_seconds,
             "stale": stale_seconds is not None and stale_seconds > 600,
@@ -256,12 +264,13 @@ def _compute_confidence(history: list) -> str:
 # ===========================================================
 
 def _extract_sensors(flight) -> dict:
-    """Đọc altitude/speed/lat/lng/on_ground từ Flight object, sanitize."""
+    """Đọc altitude/speed/lat/lng/on_ground/heading từ Flight object, sanitize."""
     lat = getattr(flight, "latitude", None)
     lng = getattr(flight, "longitude", None)
     alt = getattr(flight, "altitude", None)
     gs = getattr(flight, "ground_speed", None)
     vs = getattr(flight, "vertical_speed", None)
+    heading = getattr(flight, "heading", None)
     on_ground = (getattr(flight, "on_ground", 0) or 0) == 1
 
     # Giá trị ≤0 thường là sentinel "không có data"
@@ -269,13 +278,22 @@ def _extract_sensors(flight) -> dict:
         alt = None
     if isinstance(gs, (int, float)) and gs < 0:
         gs = None
+    # heading hợp lệ 0-359
+    if isinstance(heading, (int, float)):
+        heading = int(heading) % 360
+    else:
+        heading = None
 
     distance_km = None
+    lat_clean = None
+    lng_clean = None
     if lat is not None and lng is not None:
         try:
-            distance_km = _haversine_km(float(lat), float(lng), DAD_LAT, DAD_LNG)
+            lat_clean = float(lat)
+            lng_clean = float(lng)
+            distance_km = _haversine_km(lat_clean, lng_clean, DAD_LAT, DAD_LNG)
         except (TypeError, ValueError):
-            distance_km = None
+            pass
 
     return {
         "alt_ft": int(alt) if isinstance(alt, (int, float)) else None,
@@ -283,6 +301,9 @@ def _extract_sensors(flight) -> dict:
         "vs": int(vs) if isinstance(vs, (int, float)) else None,
         "on_ground": on_ground,
         "distance_km": distance_km,
+        "lat": lat_clean,
+        "lng": lng_clean,
+        "heading": heading,
     }
 
 
@@ -376,6 +397,9 @@ def _process_match(code: str, flight, details: Optional[dict],
                 vertical_speed=sensors["vs"],
                 distance_km=distance_rounded,
                 on_ground=sensors["on_ground"],
+                latitude=sensors["lat"],
+                longitude=sensors["lng"],
+                heading=sensors["heading"],
                 updated_at=now_ms,
                 history=old.history[:] if old else [],
                 miss_count=0,
@@ -408,6 +432,9 @@ def _process_match(code: str, flight, details: Optional[dict],
         vertical_speed=sensors["vs"],
         distance_km=distance_rounded,
         on_ground=sensors["on_ground"],
+        latitude=sensors["lat"],
+        longitude=sensors["lng"],
+        heading=sensors["heading"],
         updated_at=now_ms,
         history=history,
         miss_count=0,
@@ -416,7 +443,7 @@ def _process_match(code: str, flight, details: Optional[dict],
 
 
 def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optional[FlightEntry]:
-    """Mã KHÔNG xuất hiện trong scan cycle này."""
+    """Mã KHÔNG xuất hiện trong scan cycle này. Giữ vị trí cuối để map vẫn vẽ được."""
     if old is None:
         return None
 
@@ -438,6 +465,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             vertical_speed=old.vertical_speed,
             distance_km=old.distance_km,
             on_ground=old.on_ground,
+            latitude=old.latitude,
+            longitude=old.longitude,
+            heading=old.heading,
             updated_at=old.updated_at,
             history=old.history,
             miss_count=miss_count,
@@ -457,6 +487,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 vertical_speed=old.vertical_speed,
                 distance_km=old.distance_km,
                 on_ground=old.on_ground,
+                latitude=old.latitude,
+                longitude=old.longitude,
+                heading=old.heading,
                 updated_at=old.updated_at,
                 history=old.history,
                 miss_count=miss_count,
@@ -472,6 +505,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             vertical_speed=old.vertical_speed,
             distance_km=old.distance_km,
             on_ground=old.on_ground,
+            latitude=old.latitude,
+            longitude=old.longitude,
+            heading=old.heading,
             updated_at=old.updated_at,
             history=old.history,
             miss_count=miss_count,
@@ -488,6 +524,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         vertical_speed=old.vertical_speed,
         distance_km=old.distance_km,
         on_ground=old.on_ground,
+        latitude=old.latitude,
+        longitude=old.longitude,
+        heading=old.heading,
         updated_at=old.updated_at,
         history=old.history,
         miss_count=miss_count,
