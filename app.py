@@ -96,6 +96,14 @@ APPROACH_PHYS_WEIGHT = 0.4
 MISS_LANDED_FROM_FINAL = 2   # state cũ = FINAL & miss ≥ 2 → LANDED
 MISS_DROP_THRESHOLD = 5      # miss ≥ 5 → LOST (hoặc LANDED nếu trước đó APPROACH)
 
+# Theo dõi sau hạ cánh: tiếp tục refresh khi tàu đã touchdown/taxi,
+# chỉ dừng khi speed rất thấp gần sân bay hoặc mất track quá lâu sau touchdown.
+PARKED_GS_KT = int(os.environ.get("PARKED_GS_KT", "5"))
+PARKED_DIST_KM = float(os.environ.get("PARKED_DIST_KM", "5.0"))
+LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "12"))
+GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
+TERMINAL_STATES = {"PARKED", "LOST"}
+
 # ===========================================================
 # STATE TOÀN CỤC
 # ===========================================================
@@ -150,7 +158,9 @@ class FlightEntry:
             "updated_at": self.updated_at,
             "stale_seconds": stale_seconds,
             "stale": stale_seconds is not None and stale_seconds > 600,
-            "landed": self.landed,
+            "landed": self.state in ("LANDED", "TAXIING", "PARKED") or self.landed,
+            "taxiing": self.state == "TAXIING",
+            "parked": self.state == "PARKED",
             "miss_count": self.miss_count,
         }
 
@@ -188,6 +198,13 @@ def _physics_eta_ms(distance_km: Optional[float], gs_kt: Optional[int], now_ms: 
 # PHÂN LOẠI TRẠNG THÁI
 # ===========================================================
 
+def _is_parked_on_ground(gs_kt: Optional[int], dist_km: Optional[float]) -> bool:
+    """Tàu được xem là đã vào bến/dừng khi ground speed rất thấp gần DAD."""
+    if gs_kt is None or dist_km is None:
+        return False
+    return gs_kt <= PARKED_GS_KT and dist_km <= PARKED_DIST_KM
+
+
 def _classify_state(
     on_ground: bool,
     alt_ft: Optional[int],
@@ -197,18 +214,21 @@ def _classify_state(
     fr24_live: bool,
     now_ms: int,
 ) -> str:
-    # Touchdown đã chắc chắn
+    # Sau touchdown vẫn tiếp tục theo dõi. Không dùng LANDED làm state kết thúc nữa.
     if on_ground:
-        return "LANDED"
+        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "TAXIING"
+
     if real_arrival_ms is not None and real_arrival_ms <= now_ms:
-        return "LANDED"
+        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "LANDED"
+
     if not fr24_live:
-        return "LANDED"
+        # FR24 có thể tắt live ngay sau touchdown. Chưa xem là PARKED nếu không có speed thấp.
+        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "LANDED"
 
     # Physical detection phòng khi on_ground không ổn định
     if alt_ft is not None and gs_kt is not None:
         if alt_ft <= DAD_FIELD_ELEV_FT + TOUCHDOWN_ALT_AGL_FT and gs_kt < TOUCHDOWN_GS_KT:
-            return "LANDED"
+            return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "TAXIING"
 
     # Thiếu data → mặc định EN_ROUTE để app vẫn nhận ETA từ FR24
     if alt_ft is None or dist_km is None:
@@ -315,7 +335,7 @@ def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int) -> bool:
     """Có cần poll lại FR24 để cập nhật live position không."""
     if entry is None:
         return True
-    if entry.state in ("LANDED", "LOST"):
+    if entry.state in TERMINAL_STATES:
         return False
     if not entry.updated_at:
         return True
@@ -443,14 +463,14 @@ def _process_match(code: str, flight, details: Optional[dict],
         now_ms=now_ms,
     )
 
-    # Sticky LANDED: đã hạ rồi thì không revert
-    if old and old.state == "LANDED":
-        state = "LANDED"
+    # Sticky PARKED: đã dừng/vào bến rồi thì không revert về taxi/airborne.
+    if old and old.state == "PARKED":
+        state = "PARKED"
 
     distance_rounded = round(sensors["distance_km"], 1) if sensors["distance_km"] is not None else None
 
     # ETA cuối cùng theo state
-    if state == "LANDED":
+    if state in ("LANDED", "TAXIING", "PARKED"):
         if real_arrival_ms is not None:
             eta_ms = real_arrival_ms
         elif old and old.eta_millis is not None:
@@ -527,7 +547,7 @@ def _process_match(code: str, flight, details: Optional[dict],
         updated_at=now_ms,
         history=history,
         miss_count=0,
-        landed=(state == "LANDED"),
+        landed=(state in ("LANDED", "TAXIING", "PARKED")),
     )
 
 
@@ -536,11 +556,32 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
     if old is None:
         return None
 
-    # Đã LANDED: giữ nguyên, không bump
-    if old.state == "LANDED":
+    # Đã PARKED: trạng thái kết thúc, giữ nguyên.
+    if old.state == "PARKED":
         return old
 
     miss_count = old.miss_count + 1
+
+    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như đã vào bến/dừng.
+    if old.state in GROUND_ACTIVE_STATES and miss_count >= LANDED_MISS_TO_PARKED:
+        log.info("%s: %s + missed %d → PARKED", code, old.state, miss_count)
+        return FlightEntry(
+            state="PARKED",
+            eta_millis=old.eta_millis or now_ms,
+            confidence="LOW",
+            altitude_ft=old.altitude_ft,
+            ground_speed_kt=0 if old.ground_speed_kt is None else old.ground_speed_kt,
+            vertical_speed=old.vertical_speed,
+            distance_km=old.distance_km,
+            on_ground=True,
+            latitude=old.latitude,
+            longitude=old.longitude,
+            heading=old.heading,
+            updated_at=old.updated_at,
+            history=old.history,
+            miss_count=miss_count,
+            landed=True,
+        )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
     if old.state == "FINAL" and miss_count >= MISS_LANDED_FROM_FINAL:
@@ -674,7 +715,7 @@ def _extract_arrival_metadata(flight, details: Optional[dict]) -> dict:
 
 
 def _eta_within_scan_window(entry: FlightEntry, now_ms: int, max_minutes: int) -> bool:
-    if entry.state in ("LANDED", "LOST"):
+    if entry.state in TERMINAL_STATES:
         return False
     if entry.eta_millis is None:
         return False
