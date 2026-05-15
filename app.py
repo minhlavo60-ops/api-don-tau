@@ -59,6 +59,9 @@ DAD_FIELD_ELEV_FT = 33  # Đà Nẵng gần mực nước biển
 # Nhịp poll
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 IMMEDIATE_POLL_COOLDOWN_MS = 10_000
+# Nếu app hỏi lại mà dữ liệu cũ hơn ngưỡng này thì server poll FR24 ngay,
+# không chỉ trả cache. Dùng để bảo đảm marker bản đồ chạy theo vị trí thật.
+POSITION_REFRESH_STALE_MS = int(os.environ.get("POSITION_REFRESH_STALE_MS", "45000"))
 
 # Parallel get_flight_details
 DETAIL_TIMEOUT_S = 8
@@ -260,6 +263,72 @@ def _compute_confidence(history: list) -> str:
 
 
 # ===========================================================
+# CHUẨN HÓA MÃ BAY & REFRESH CACHE
+# ===========================================================
+
+def _normalize_code(value) -> str:
+    """Chuẩn hóa mã bay để so khớp ổn định: 'VJ 962' == 'VJ962'."""
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value).upper().strip() if ch.isalnum())
+
+
+def _clean_code(value) -> str:
+    """Chuẩn hóa mã từ app trước khi đưa vào QUEUE."""
+    return _normalize_code(value)
+
+
+def _code_aliases(value) -> set[str]:
+    """
+    Tạo alias IATA/ICAO thường gặp để tránh mất match giữa lịch bay và FR24.
+    Ví dụ: VN134 ↔ HVN134, VJ962 ↔ VJC962.
+    """
+    base = _normalize_code(value)
+    if not base:
+        return set()
+    aliases = {base}
+    airline_aliases = {
+        "VN": "HVN",
+        "HVN": "VN",
+        "VJ": "VJC",
+        "VJC": "VJ",
+        "QH": "BAV",
+        "BAV": "QH",
+        "VU": "VAG",
+        "VAG": "VU",
+    }
+    for prefix, alt_prefix in airline_aliases.items():
+        if base.startswith(prefix) and len(base) > len(prefix):
+            suffix = base[len(prefix):]
+            if suffix.isdigit():
+                aliases.add(alt_prefix + suffix)
+    return aliases
+
+
+def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int) -> bool:
+    """Có cần poll lại FR24 để cập nhật live position không."""
+    if entry is None:
+        return True
+    if entry.state in ("LANDED", "LOST"):
+        return False
+    if not entry.updated_at:
+        return True
+    return now_ms - entry.updated_at >= POSITION_REFRESH_STALE_MS
+
+
+def _server_needs_poll_for_codes(codes: list[str], now_ms: int) -> bool:
+    """Bảo vệ trường hợp background poller không chạy / HTTP chỉ đang trả cache cũ."""
+    if not codes:
+        return False
+    if LAST_POLL_MS is None:
+        return True
+    if now_ms - LAST_POLL_MS >= POSITION_REFRESH_STALE_MS:
+        return True
+    with _lock:
+        return any(_entry_needs_refresh(TRACKED.get(code), now_ms) for code in codes)
+
+
+# ===========================================================
 # TRÍCH XUẤT DỮ LIỆU TỪ FR24
 # ===========================================================
 
@@ -397,9 +466,9 @@ def _process_match(code: str, flight, details: Optional[dict],
                 vertical_speed=sensors["vs"],
                 distance_km=distance_rounded,
                 on_ground=sensors["on_ground"],
-                latitude=sensors["lat"],
-                longitude=sensors["lng"],
-                heading=sensors["heading"],
+                latitude=sensors["lat"] if sensors["lat"] is not None else (old.latitude if old else None),
+                longitude=sensors["lng"] if sensors["lng"] is not None else (old.longitude if old else None),
+                heading=sensors["heading"] if sensors["heading"] is not None else (old.heading if old else None),
                 updated_at=now_ms,
                 history=old.history[:] if old else [],
                 miss_count=0,
@@ -423,6 +492,20 @@ def _process_match(code: str, flight, details: Optional[dict],
             code, old.state, state, sensors["alt_ft"], sensors["gs_kt"], dist_str,
         )
 
+    # Log từng cycle để kiểm tra map có nhận live lat/lng hay server đang trả cache cũ.
+    old_lat = old.latitude if old else None
+    old_lng = old.longitude if old else None
+    changed = (
+        old is None
+        or old_lat != sensors["lat"]
+        or old_lng != sensors["lng"]
+        or (old.heading if old else None) != sensors["heading"]
+    )
+    log.info(
+        "Live %s state=%s eta=%s lat=%s lng=%s heading=%s changed=%s",
+        code, state, eta_ms, sensors["lat"], sensors["lng"], sensors["heading"], changed,
+    )
+
     return FlightEntry(
         state=state,
         eta_millis=eta_ms,
@@ -432,9 +515,9 @@ def _process_match(code: str, flight, details: Optional[dict],
         vertical_speed=sensors["vs"],
         distance_km=distance_rounded,
         on_ground=sensors["on_ground"],
-        latitude=sensors["lat"],
-        longitude=sensors["lng"],
-        heading=sensors["heading"],
+        latitude=sensors["lat"] if sensors["lat"] is not None else (old.latitude if old else None),
+        longitude=sensors["lng"] if sensors["lng"] is not None else (old.longitude if old else None),
+        heading=sensors["heading"] if sensors["heading"] is not None else (old.heading if old else None),
         updated_at=now_ms,
         history=history,
         miss_count=0,
@@ -563,18 +646,30 @@ def _do_poll() -> None:
     fr_api = FlightRadar24API()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
 
-    # Match codes. Pre-filter theo destination_iata để bỏ qua tàu rõ ràng không về DAD.
+    # Match codes ổn định. Không dùng trực tiếp number/callsign làm key,
+    # vì FR24 có lúc trả "VJ 962", có lúc "VJ962", có lúc callsign khác.
+    queue_by_norm = {}
+    for code in queue_snapshot:
+        for alias in _code_aliases(code):
+            queue_by_norm[alias] = code
+
     targets = {}
     for f in flights:
-        number = (getattr(f, "number", None) or "").upper()
-        callsign = (getattr(f, "callsign", None) or "").upper()
+        number_raw = getattr(f, "number", None)
+        callsign_raw = getattr(f, "callsign", None)
         dest = (getattr(f, "destination_airport_iata", None) or "").upper()
         if dest and dest != TARGET_AIRPORT:
             continue
-        if number and number in queue_snapshot:
-            targets[number] = f
-        elif callsign and callsign in queue_snapshot:
-            targets[callsign] = f
+
+        candidate_keys = set()
+        candidate_keys.update(_code_aliases(number_raw))
+        candidate_keys.update(_code_aliases(callsign_raw))
+
+        for key in candidate_keys:
+            if key and key in queue_by_norm:
+                requested_code = queue_by_norm[key]
+                targets[requested_code] = f
+                break
 
     # Parallel fetch details (5 worker, timeout 8s/call)
     details_map = {}
@@ -631,11 +726,12 @@ def _do_poll() -> None:
     )
 
 
-def _try_immediate_poll(reason: str = "") -> bool:
+def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
     global LAST_IMMEDIATE_POLL_MS, LAST_ERROR
     with _immediate_poll_lock:
         now = int(time.time() * 1000)
-        if now - LAST_IMMEDIATE_POLL_MS < IMMEDIATE_POLL_COOLDOWN_MS:
+        if not bypass_cooldown and now - LAST_IMMEDIATE_POLL_MS < IMMEDIATE_POLL_COOLDOWN_MS:
+            log.info("Immediate poll skipped by cooldown (%s)", reason)
             return False
         LAST_IMMEDIATE_POLL_MS = now
     try:
@@ -692,6 +788,7 @@ def build_etas_payload() -> dict:
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
             "poll_interval_seconds": POLL_INTERVAL,
             "last_error": LAST_ERROR,
+            "pid": os.getpid(),
             "flights": result,
         }
 
@@ -708,6 +805,7 @@ def health():
             "poll_interval_seconds": POLL_INTERVAL,
             "tracked_count": len(TRACKED),
             "queue_count": len(QUEUE),
+            "pid": os.getpid(),
         })
 
 
@@ -718,13 +816,20 @@ def get_all_etas():
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         codes = body.get("codes", []) or []
-        cleaned = [c.strip().upper() for c in codes if isinstance(c, str) and c.strip()]
+        cleaned = [_clean_code(c) for c in codes if isinstance(c, str) and _clean_code(c)]
+        force_refresh = bool(body.get("force_refresh") or body.get("client_time_millis"))
         if cleaned:
+            now_ms = int(time.time() * 1000)
             with _lock:
                 new_codes = [c for c in cleaned if c not in TRACKED]
                 QUEUE.update(cleaned)
-            if new_codes:
-                _try_immediate_poll(f"new {new_codes}")
+            # Bản cũ chỉ poll khi có mã mới. Vì vậy mã đã theo dõi có thể chỉ trả cache cũ,
+            # làm bản đồ đứng im. Bản này poll lại khi app hỏi refresh / dữ liệu stale.
+            if new_codes or force_refresh or _server_needs_poll_for_codes(cleaned, now_ms):
+                _try_immediate_poll(
+                    f"etas refresh new={new_codes} force={force_refresh} codes={cleaned}",
+                    bypass_cooldown=force_refresh,
+                )
     return jsonify(build_etas_payload())
 
 
@@ -732,7 +837,7 @@ def get_all_etas():
 def add_track(flight_code):
     if (err := require_api_key()):
         return err
-    code = flight_code.strip().upper()
+    code = _clean_code(flight_code)
     with _lock:
         is_new = code not in TRACKED
         QUEUE.add(code)
@@ -745,7 +850,7 @@ def add_track(flight_code):
 def remove_track(flight_code):
     if (err := require_api_key()):
         return err
-    code = flight_code.strip().upper()
+    code = _clean_code(flight_code)
     with _lock:
         QUEUE.discard(code)
         TRACKED.pop(code, None)
@@ -756,13 +861,15 @@ def remove_track(flight_code):
 def get_eta(flight_code):
     if (err := require_api_key()):
         return err
-    code = flight_code.strip().upper()
+    code = _clean_code(flight_code)
+    now_ms = int(time.time() * 1000)
     with _lock:
         QUEUE.add(code)
         entry = TRACKED.get(code)
 
-    if entry is None:
-        _try_immediate_poll(f"miss {code}")
+    # GET từng chuyến cũng phải có quyền kéo live data mới, không chỉ trả cache.
+    if entry is None or _entry_needs_refresh(entry, now_ms):
+        _try_immediate_poll(f"get_eta refresh {code}")
         with _lock:
             entry = TRACKED.get(code)
 
@@ -773,6 +880,7 @@ def get_eta(flight_code):
             "flight_code": code,
             "message": f"Chưa có ETA cho {code}",
             "server_time_millis": now_ms,
+            "pid": os.getpid(),
         })
 
     public = entry.to_public(now_ms)
@@ -781,6 +889,7 @@ def get_eta(flight_code):
         "flight_code": code,
         "destination": "Da Nang (DAD)",
         "server_time_millis": now_ms,
+        "pid": os.getpid(),
     })
     return jsonify(public)
 
