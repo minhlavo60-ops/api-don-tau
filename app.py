@@ -63,6 +63,12 @@ IMMEDIATE_POLL_COOLDOWN_MS = 10_000
 # không chỉ trả cache. Dùng để bảo đảm marker bản đồ chạy theo vị trí thật.
 POSITION_REFRESH_STALE_MS = int(os.environ.get("POSITION_REFRESH_STALE_MS", "45000"))
 
+# Auto-discovery: quét mọi chuyến đang bay về DAD trong N phút tới.
+AUTO_SCAN_DEFAULT_MINUTES = int(os.environ.get("AUTO_SCAN_DEFAULT_MINUTES", "60"))
+AUTO_SCAN_MAX_MINUTES = int(os.environ.get("AUTO_SCAN_MAX_MINUTES", "180"))
+AUTO_SCAN_MAX_CANDIDATES = int(os.environ.get("AUTO_SCAN_MAX_CANDIDATES", "120"))
+AUTO_SCAN_MAX_RESULTS = int(os.environ.get("AUTO_SCAN_MAX_RESULTS", "60"))
+
 # Parallel get_flight_details
 DETAIL_TIMEOUT_S = 8
 DETAIL_POOL_SIZE = 5
@@ -617,6 +623,167 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
     )
 
 
+
+# ===========================================================
+# AUTO-DISCOVERY ARRIVALS VỀ DAD
+# ===========================================================
+
+def _safe_nested_get(data: Optional[dict], *path, default=None):
+    """Lấy field lồng nhau từ dict FR24 một cách an toàn."""
+    cur = data or {}
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if cur is not None else default
+
+
+def _best_flight_code(flight, details: Optional[dict] = None) -> str:
+    """Ưu tiên số hiệu thương mại nếu FR24 có; fallback sang callsign."""
+    candidates = [
+        _safe_nested_get(details, "identification", "number", "default"),
+        _safe_nested_get(details, "identification", "number", "iata"),
+        getattr(flight, "number", None),
+        _safe_nested_get(details, "identification", "callsign"),
+        getattr(flight, "callsign", None),
+        _safe_nested_get(details, "identification", "number", "icao"),
+    ]
+    for value in candidates:
+        code = _clean_code(value)
+        if code:
+            return code
+    return ""
+
+
+def _extract_arrival_metadata(flight, details: Optional[dict]) -> dict:
+    """Metadata nhẹ để app tự tạo thẻ hàng chờ nếu lịch bay chưa có."""
+    origin_iata = _safe_nested_get(details, "airport", "origin", "code", "iata", default="") or ""
+    dest_iata = _safe_nested_get(details, "airport", "destination", "code", "iata", default="") or ""
+    aircraft_type = (
+        _safe_nested_get(details, "aircraft", "model", "code", default="")
+        or getattr(flight, "aircraft_code", None)
+        or ""
+    )
+    return {
+        "origin_iata": str(origin_iata).upper(),
+        "destination_iata": str(dest_iata).upper(),
+        "aircraft_type": str(aircraft_type).upper(),
+        "callsign": _normalize_code(getattr(flight, "callsign", None)),
+        "number": _normalize_code(getattr(flight, "number", None)),
+    }
+
+
+def _eta_within_scan_window(entry: FlightEntry, now_ms: int, max_minutes: int) -> bool:
+    if entry.state in ("LANDED", "LOST"):
+        return False
+    if entry.eta_millis is None:
+        return False
+    # Cho phép lệch quá khứ rất nhỏ do clock skew, nhưng không lấy tàu đã quá giờ lâu.
+    return now_ms - 60_000 <= entry.eta_millis <= now_ms + max_minutes * 60_000
+
+
+def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_queue: bool = True) -> list[dict]:
+    """
+    Quét toàn vùng bounds, lấy mọi chuyến đang bay về DAD có ETA trong max_minutes.
+
+    Khác với _do_poll(): hàm này không cần QUEUE có sẵn. Nó tự tìm ứng viên DAD,
+    lấy details, tính ETA/vị trí, rồi tùy add_to_queue để đưa vào QUEUE/TRACKED.
+    """
+    max_minutes = max(5, min(int(max_minutes or AUTO_SCAN_DEFAULT_MINUTES), AUTO_SCAN_MAX_MINUTES))
+    now_ms = int(time.time() * 1000)
+    fr_api = FlightRadar24API()
+    flights = fr_api.get_flights(bounds=BOUNDS_DAD)
+
+    # Candidate nhanh: giữ lại flight có destination=DAD hoặc chưa có destination field.
+    # Không bỏ flight thiếu dest vì FR24 đôi khi chỉ có dest trong get_flight_details().
+    candidates = []
+    for f in flights:
+        dest_hint = (getattr(f, "destination_airport_iata", None) or "").upper()
+        if dest_hint and dest_hint != TARGET_AIRPORT:
+            continue
+        candidates.append(f)
+        if len(candidates) >= AUTO_SCAN_MAX_CANDIDATES:
+            break
+
+    details_by_idx = {}
+    if candidates:
+        with ThreadPoolExecutor(max_workers=DETAIL_POOL_SIZE) as ex:
+            futures = {
+                idx: ex.submit(_safe_get_details, fr_api, flight)
+                for idx, flight in enumerate(candidates)
+            }
+            for idx, fut in futures.items():
+                try:
+                    details_by_idx[idx] = fut.result(timeout=DETAIL_TIMEOUT_S)
+                except FuturesTimeout:
+                    log.warning("Auto-scan detail timeout idx=%s", idx)
+                    details_by_idx[idx] = None
+                except Exception as e:
+                    log.warning("Auto-scan detail fail idx=%s: %s", idx, e)
+                    details_by_idx[idx] = None
+
+    discovered: list[dict] = []
+    staged_updates: dict[str, FlightEntry] = {}
+    staged_queue: set[str] = set()
+
+    for idx, flight in enumerate(candidates):
+        details = details_by_idx.get(idx)
+        dest_iata = ""
+        fr24_eta_ms = None
+        if details:
+            fr24_eta_ms, _, _, dest_iata = _extract_eta_from_details(details)
+        dest_hint = (getattr(flight, "destination_airport_iata", None) or "").upper()
+        if dest_iata and dest_iata != TARGET_AIRPORT:
+            continue
+        if not dest_iata and dest_hint and dest_hint != TARGET_AIRPORT:
+            continue
+        if not dest_iata and not dest_hint:
+            # Không xác định được có về DAD hay không thì bỏ để tránh thêm nhầm.
+            continue
+
+        code = _best_flight_code(flight, details)
+        if not code:
+            continue
+
+        with _lock:
+            old = TRACKED.get(code)
+
+        entry = _process_match(code, flight, details, old, now_ms)
+        if entry is None:
+            continue
+        if not _eta_within_scan_window(entry, now_ms, max_minutes):
+            continue
+
+        public = entry.to_public(now_ms)
+        meta = _extract_arrival_metadata(flight, details)
+        public.update(meta)
+        public.update({
+            "flight_code": code,
+            "code": code,
+            "destination": TARGET_AIRPORT,
+        })
+        discovered.append(public)
+        staged_updates[code] = entry
+        staged_queue.add(code)
+
+    discovered.sort(key=lambda item: item.get("eta_millis") or 9_999_999_999_999)
+    if len(discovered) > AUTO_SCAN_MAX_RESULTS:
+        discovered = discovered[:AUTO_SCAN_MAX_RESULTS]
+        keep_codes = {item["flight_code"] for item in discovered}
+        staged_updates = {code: entry for code, entry in staged_updates.items() if code in keep_codes}
+        staged_queue = {code for code in staged_queue if code in keep_codes}
+
+    if add_to_queue and staged_queue:
+        with _lock:
+            QUEUE.update(staged_queue)
+            TRACKED.update(staged_updates)
+
+    log.info(
+        "Auto-scan arrivals: bounds=%d, candidates=%d, found=%d, add_to_queue=%s, max_minutes=%d",
+        len(flights), len(candidates), len(discovered), add_to_queue, max_minutes,
+    )
+    return discovered
+
 # ===========================================================
 # POLLER
 # ===========================================================
@@ -807,6 +974,54 @@ def health():
             "queue_count": len(QUEUE),
             "pid": os.getpid(),
         })
+
+
+
+@app.route("/api/scan_arrivals", methods=["GET", "POST"])
+def scan_arrivals():
+    """Quét mọi tàu đang bay về DAD trong N phút tới và tùy chọn đưa vào QUEUE server."""
+    if (err := require_api_key()):
+        return err
+
+    body = request.get_json(silent=True) or {}
+    raw_minutes = body.get("max_minutes") or request.args.get("max_minutes") or AUTO_SCAN_DEFAULT_MINUTES
+    try:
+        max_minutes = int(raw_minutes)
+    except (TypeError, ValueError):
+        max_minutes = AUTO_SCAN_DEFAULT_MINUTES
+    max_minutes = max(5, min(max_minutes, AUTO_SCAN_MAX_MINUTES))
+
+    add_to_queue_raw = body.get("add_to_queue", request.args.get("add_to_queue", "true"))
+    if isinstance(add_to_queue_raw, str):
+        add_to_queue = add_to_queue_raw.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        add_to_queue = bool(add_to_queue_raw)
+
+    try:
+        arrivals = _discover_dad_arrivals(max_minutes=max_minutes, add_to_queue=add_to_queue)
+        now_ms = int(time.time() * 1000)
+        with _lock:
+            tracked = sorted(QUEUE)
+        return jsonify({
+            "status": "success",
+            "server_time_millis": now_ms,
+            "max_minutes": max_minutes,
+            "add_to_queue": add_to_queue,
+            "count": len(arrivals),
+            "flights": arrivals,
+            "tracked": tracked,
+            "pid": os.getpid(),
+        })
+    except Exception as e:
+        log.exception("Auto-scan arrivals failed")
+        with _lock:
+            global LAST_ERROR
+            LAST_ERROR = str(e)
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "server_time_millis": int(time.time() * 1000),
+        }), 500
 
 
 @app.route("/api/etas", methods=["GET", "POST"])
