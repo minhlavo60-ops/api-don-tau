@@ -56,11 +56,22 @@ DAD_LAT = 16.0439
 DAD_LNG = 108.1989
 DAD_FIELD_ELEV_FT = 33  # Đà Nẵng gần mực nước biển
 
-# Nhịp poll
+# Nhịp poll nền tối đa. Adaptive polling bên dưới sẽ tự giảm xuống 20s/30s khi có tàu gần hạ.
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 IMMEDIATE_POLL_COOLDOWN_MS = 10_000
+
+# Adaptive polling: giảm tải server miễn phí nhưng vẫn cập nhật dày khi tàu gần DAD/taxi.
+ADAPTIVE_POLL_FAR_MS = int(os.environ.get("ADAPTIVE_POLL_FAR_MS", "60000"))       # tàu còn xa
+ADAPTIVE_POLL_MID_MS = int(os.environ.get("ADAPTIVE_POLL_MID_MS", "30000"))       # approach xa / còn 10-20 phút
+ADAPTIVE_POLL_NEAR_MS = int(os.environ.get("ADAPTIVE_POLL_NEAR_MS", "20000"))     # final / còn dưới 10 phút
+ADAPTIVE_POLL_TAXI_MS = int(os.environ.get("ADAPTIVE_POLL_TAXI_MS", "20000"))     # đã hạ, đang taxi
+ADAPTIVE_MID_REMAINING_MS = int(os.environ.get("ADAPTIVE_MID_REMAINING_MS", str(20 * 60_000)))
+ADAPTIVE_NEAR_REMAINING_MS = int(os.environ.get("ADAPTIVE_NEAR_REMAINING_MS", str(10 * 60_000)))
+ADAPTIVE_MID_DISTANCE_KM = float(os.environ.get("ADAPTIVE_MID_DISTANCE_KM", "120"))
+ADAPTIVE_NEAR_DISTANCE_KM = float(os.environ.get("ADAPTIVE_NEAR_DISTANCE_KM", "45"))
+
 # Nếu app hỏi lại mà dữ liệu cũ hơn ngưỡng này thì server poll FR24 ngay,
-# không chỉ trả cache. Dùng để bảo đảm marker bản đồ chạy theo vị trí thật.
+# không chỉ trả cache. Dùng làm fallback khi app không gửi min_refresh_ms.
 POSITION_REFRESH_STALE_MS = int(os.environ.get("POSITION_REFRESH_STALE_MS", "45000"))
 
 # Auto-discovery: quét mọi chuyến đang bay về DAD trong N phút tới.
@@ -331,7 +342,40 @@ def _code_aliases(value) -> set[str]:
     return aliases
 
 
-def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int) -> bool:
+def _desired_refresh_interval_ms(entry: Optional[FlightEntry], now_ms: int) -> int:
+    """Chu kỳ refresh thông minh cho từng tàu.
+
+    Server/app biết tàu xa hay gần nhờ state, ETA còn lại và distance_km đã lấy từ FR24.
+    - Xa: 60s
+    - Approach/còn 10-20 phút: 30s
+    - Final/còn dưới 10 phút/gần sân bay/taxi: 20s
+    """
+    if entry is None:
+        return ADAPTIVE_POLL_NEAR_MS
+    if entry.state in TERMINAL_STATES:
+        return ADAPTIVE_POLL_FAR_MS
+    if entry.state in GROUND_ACTIVE_STATES or entry.state == "FINAL":
+        return ADAPTIVE_POLL_NEAR_MS
+    if entry.state == "APPROACH":
+        return ADAPTIVE_POLL_MID_MS
+
+    if entry.eta_millis is not None:
+        remaining = entry.eta_millis - now_ms
+        if remaining <= ADAPTIVE_NEAR_REMAINING_MS:
+            return ADAPTIVE_POLL_NEAR_MS
+        if remaining <= ADAPTIVE_MID_REMAINING_MS:
+            return ADAPTIVE_POLL_MID_MS
+
+    if entry.distance_km is not None:
+        if entry.distance_km <= ADAPTIVE_NEAR_DISTANCE_KM:
+            return ADAPTIVE_POLL_NEAR_MS
+        if entry.distance_km <= ADAPTIVE_MID_DISTANCE_KM:
+            return ADAPTIVE_POLL_MID_MS
+
+    return ADAPTIVE_POLL_FAR_MS
+
+
+def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int, min_refresh_ms: Optional[int] = None) -> bool:
     """Có cần poll lại FR24 để cập nhật live position không."""
     if entry is None:
         return True
@@ -339,19 +383,34 @@ def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int) -> bool:
         return False
     if not entry.updated_at:
         return True
-    return now_ms - entry.updated_at >= POSITION_REFRESH_STALE_MS
+    desired = min_refresh_ms if min_refresh_ms is not None else _desired_refresh_interval_ms(entry, now_ms)
+    desired = max(5_000, int(desired))
+    return now_ms - entry.updated_at >= desired
 
 
-def _server_needs_poll_for_codes(codes: list[str], now_ms: int) -> bool:
+def _server_needs_poll_for_codes(codes: list[str], now_ms: int, min_refresh_ms: Optional[int] = None) -> bool:
     """Bảo vệ trường hợp background poller không chạy / HTTP chỉ đang trả cache cũ."""
     if not codes:
         return False
     if LAST_POLL_MS is None:
         return True
-    if now_ms - LAST_POLL_MS >= POSITION_REFRESH_STALE_MS:
+    desired = min_refresh_ms if min_refresh_ms is not None else POSITION_REFRESH_STALE_MS
+    desired = max(5_000, int(desired))
+    if now_ms - LAST_POLL_MS >= desired:
         return True
     with _lock:
-        return any(_entry_needs_refresh(TRACKED.get(code), now_ms) for code in codes)
+        return any(_entry_needs_refresh(TRACKED.get(code), now_ms, desired) for code in codes)
+
+
+def _adaptive_poll_interval_ms(now_ms: Optional[int] = None) -> int:
+    """Chu kỳ poll nền toàn server. Nếu có ít nhất 1 tàu gần hạ/taxi thì poll nhanh hơn."""
+    now_ms = now_ms or int(time.time() * 1000)
+    with _lock:
+        active_entries = [entry for entry in TRACKED.values() if entry.state not in TERMINAL_STATES]
+    if not active_entries:
+        return min(POLL_INTERVAL * 1000, ADAPTIVE_POLL_FAR_MS)
+    desired = min(_desired_refresh_interval_ms(entry, now_ms) for entry in active_entries)
+    return min(POLL_INTERVAL * 1000, desired)
 
 
 # ===========================================================
@@ -963,7 +1022,9 @@ def poll_loop() -> None:
             with _lock:
                 LAST_ERROR = str(e)
             log.exception("Scheduled poll failed")
-        time.sleep(POLL_INTERVAL)
+        sleep_ms = _adaptive_poll_interval_ms()
+        log.info("Next scheduled poll in %.1fs", sleep_ms / 1000.0)
+        time.sleep(max(5.0, sleep_ms / 1000.0))
 
 
 # ===========================================================
@@ -995,6 +1056,7 @@ def build_etas_payload() -> dict:
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
             "poll_interval_seconds": POLL_INTERVAL,
+            "adaptive_poll_interval_ms": _adaptive_poll_interval_ms(now_ms),
             "last_error": LAST_ERROR,
             "pid": os.getpid(),
             "flights": result,
@@ -1011,6 +1073,7 @@ def health():
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
             "poll_interval_seconds": POLL_INTERVAL,
+            "adaptive_poll_interval_ms": _adaptive_poll_interval_ms(),
             "tracked_count": len(TRACKED),
             "queue_count": len(QUEUE),
             "pid": os.getpid(),
@@ -1073,17 +1136,25 @@ def get_all_etas():
         body = request.get_json(silent=True) or {}
         codes = body.get("codes", []) or []
         cleaned = [_clean_code(c) for c in codes if isinstance(c, str) and _clean_code(c)]
-        force_refresh = bool(body.get("force_refresh") or body.get("client_time_millis"))
+        force_refresh = bool(body.get("force_refresh"))
+        raw_min_refresh = body.get("min_refresh_ms") or body.get("requested_min_refresh_ms")
+        try:
+            min_refresh_ms = int(raw_min_refresh) if raw_min_refresh is not None else None
+        except (TypeError, ValueError):
+            min_refresh_ms = None
+        if min_refresh_ms is not None:
+            min_refresh_ms = max(5_000, min(min_refresh_ms, ADAPTIVE_POLL_FAR_MS))
+
         if cleaned:
             now_ms = int(time.time() * 1000)
             with _lock:
                 new_codes = [c for c in cleaned if c not in TRACKED]
                 QUEUE.update(cleaned)
-            # Bản cũ chỉ poll khi có mã mới. Vì vậy mã đã theo dõi có thể chỉ trả cache cũ,
-            # làm bản đồ đứng im. Bản này poll lại khi app hỏi refresh / dữ liệu stale.
-            if new_codes or force_refresh or _server_needs_poll_for_codes(cleaned, now_ms):
+            # Không coi client_time_millis là force_refresh nữa. App gửi min_refresh_ms theo mức gần/xa;
+            # server chỉ poll khi dữ liệu đã stale theo ngưỡng đó để tránh quá tải server miễn phí.
+            if new_codes or force_refresh or _server_needs_poll_for_codes(cleaned, now_ms, min_refresh_ms):
                 _try_immediate_poll(
-                    f"etas refresh new={new_codes} force={force_refresh} codes={cleaned}",
+                    f"etas refresh new={new_codes} force={force_refresh} min={min_refresh_ms} codes={cleaned}",
                     bypass_cooldown=force_refresh,
                 )
     return jsonify(build_etas_payload())
