@@ -22,6 +22,7 @@ distance_km, on_ground, latitude, longitude, heading, stale_seconds, landed.
 from __future__ import annotations
 
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from FlightRadar24 import FlightRadar24API
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
@@ -34,6 +35,18 @@ import threading
 import time
 
 app = Flask(__name__)
+CORS(
+    app,
+    resources={r"/api/*": {
+        "origins": [
+            "https://nhat-ky-don.web.app",
+            "https://nhat-ky-don.firebaseapp.com",
+        ],
+        "allow_headers": ["X-API-Key", "Content-Type", "Cache-Control", "Pragma"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "max_age": 3600,
+    }},
+)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
