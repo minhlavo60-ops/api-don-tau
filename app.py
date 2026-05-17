@@ -14,10 +14,16 @@ Pipeline:
   - Khi flight mất khỏi scan: bump miss_count. FINAL + miss≥2 → LANDED
     (FR24 thường ngừng track sau touchdown). EN_ROUTE + miss≥5 → LOST.
   - v2.1: thêm latitude, longitude, heading để app vẽ bản đồ.
+  - v2.2: lọc theo lịch bay.
+      * QUEUE chứa toàn bộ mã trong lịch bay → server bám đến cùng,
+        kể cả khi FR24 không trả destination (N/A) hoặc trả nhầm.
+      * SCHEDULE_HINTS giữ SIBT cho mỗi mã. Khi FR24 chưa thấy chuyến,
+        server vẫn trả state SCHEDULED + ETA = SIBT để app vẽ card.
+      * `_process_match` không drop chuyến nếu code đã được lịch bay
+        bảo lãnh (trusted=True).
 
 API giữ tương thích bản cũ: /api/etas, /api/track/<code>, /api/get_eta/<code>.
-Response v2.1 thêm: state, confidence, altitude_ft, ground_speed_kt,
-distance_km, on_ground, latitude, longitude, heading, stale_seconds, landed.
+Response v2.2 thêm: scheduled, sibt_millis (cho state SCHEDULED).
 """
 from __future__ import annotations
 
@@ -128,6 +134,12 @@ LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "12"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
 
+# Lịch bay: giữ mã trong SCHEDULE_HINTS bao lâu sau SIBT trước khi prune.
+# Sau khi tàu thực sự hạ cánh, FR24 sẽ chiếm ưu tiên; sau đó vẫn giữ thêm
+# vài giờ để app còn xem được state PARKED kèm thông tin lịch bay.
+SCHEDULE_RETAIN_PAST_MS = int(os.environ.get("SCHEDULE_RETAIN_PAST_MS", str(6 * 3600 * 1000)))
+SCHEDULE_RETAIN_FUTURE_MS = int(os.environ.get("SCHEDULE_RETAIN_FUTURE_MS", str(36 * 3600 * 1000)))
+
 # ===========================================================
 # STATE TOÀN CỤC
 # ===========================================================
@@ -139,6 +151,8 @@ _poller_started_lock = threading.Lock()
 
 QUEUE: set = set()
 TRACKED: dict = {}
+# code (normalized) → {sibt_millis, origin, aircraft, route, date_key, registered_at_ms}
+SCHEDULE_HINTS: dict = {}
 LAST_POLL_MS: Optional[int] = None
 LAST_IMMEDIATE_POLL_MS = 0
 LAST_ERROR: Optional[str] = None
@@ -148,7 +162,7 @@ LAST_POLL_DURATION_MS: Optional[int] = None
 @dataclass
 class FlightEntry:
     """Trạng thái 1 mã đang theo dõi."""
-    state: str = "PENDING"               # PENDING/EN_ROUTE/APPROACH/FINAL/LANDED/LOST
+    state: str = "PENDING"               # PENDING/SCHEDULED/EN_ROUTE/APPROACH/FINAL/LANDED/TAXIING/PARKED/LOST
     eta_millis: Optional[int] = None
     confidence: str = "MEDIUM"           # HIGH/MEDIUM/LOW
     altitude_ft: Optional[int] = None
@@ -223,7 +237,7 @@ def _physics_eta_ms(distance_km: Optional[float], gs_kt: Optional[int], now_ms: 
 # ===========================================================
 
 def _is_parked_on_ground(gs_kt: Optional[int], dist_km: Optional[float]) -> bool:
-    """Tàu được xem là đã vào bến/dừng khi ground speed rất thấp gần DAD."""
+    """Tàu được xem là đã vào bến/dừng khi ground speed rất thấp gần sân bay."""
     if gs_kt is None or dist_km is None:
         return False
     return gs_kt <= PARKED_GS_KT and dist_km <= PARKED_DIST_KM
@@ -331,27 +345,53 @@ def _clean_code(value) -> str:
 def _code_aliases(value) -> set[str]:
     """
     Tạo alias IATA/ICAO thường gặp để tránh mất match giữa lịch bay và FR24.
-    Ví dụ: VN134 ↔ HVN134, VJ962 ↔ VJC962.
+    Ví dụ: VN134 ↔ HVN134, VJ962 ↔ VJC962. Cũng xử lý leading-zero như VN0123 ↔ VN123.
     """
     base = _normalize_code(value)
     if not base:
         return set()
     aliases = {base}
+
+    # Xử lý leading-zero: tách prefix chữ + suffix số, strip zero ở đầu suffix
+    prefix_chars = []
+    i = 0
+    while i < len(base) and base[i].isalpha():
+        prefix_chars.append(base[i])
+        i += 1
+    if prefix_chars and i < len(base):
+        prefix = "".join(prefix_chars)
+        suffix = base[i:]
+        if suffix.isdigit():
+            stripped = suffix.lstrip("0") or "0"
+            aliases.add(prefix + stripped)
+            # Cũng thêm padded variants cho trường hợp FR24 trả "VN0123"
+            for pad in (3, 4):
+                if len(stripped) < pad:
+                    aliases.add(prefix + stripped.zfill(pad))
+
+    # Alias IATA ↔ ICAO cho các hãng VN phổ biến
     airline_aliases = {
-        "VN": "HVN",
-        "HVN": "VN",
-        "VJ": "VJC",
-        "VJC": "VJ",
-        "QH": "BAV",
-        "BAV": "QH",
-        "VU": "VAG",
-        "VAG": "VU",
+        "VN": "HVN", "HVN": "VN",     # Vietnam Airlines
+        "VJ": "VJC", "VJC": "VJ",     # Vietjet
+        "QH": "BAV", "BAV": "QH",     # Bamboo
+        "VU": "VAG", "VAG": "VU",     # Vietravel
+        "BL": "PIC", "PIC": "BL",     # Pacific Airlines (cũ: Jetstar)
     }
-    for prefix, alt_prefix in airline_aliases.items():
-        if base.startswith(prefix) and len(base) > len(prefix):
-            suffix = base[len(prefix):]
-            if suffix.isdigit():
-                aliases.add(alt_prefix + suffix)
+    # Tạo alias cho mọi mã đã có trong set (kể cả leading-zero variants)
+    for alias in list(aliases):
+        # Tách prefix chữ
+        j = 0
+        while j < len(alias) and alias[j].isalpha():
+            j += 1
+        if j == 0 or j == len(alias):
+            continue
+        prefix = alias[:j]
+        suffix = alias[j:]
+        if not suffix.isdigit():
+            continue
+        alt = airline_aliases.get(prefix)
+        if alt:
+            aliases.add(alt + suffix)
     return aliases
 
 
@@ -424,6 +464,98 @@ def _adaptive_poll_interval_ms(now_ms: Optional[int] = None) -> int:
         return min(POLL_INTERVAL * 1000, ADAPTIVE_POLL_FAR_MS)
     desired = min(_desired_refresh_interval_ms(entry, now_ms) for entry in active_entries)
     return min(POLL_INTERVAL * 1000, desired)
+
+
+# ===========================================================
+# SCHEDULE HINTS (lịch bay)
+# ===========================================================
+
+def _prune_old_schedule_hints(now_ms: Optional[int] = None) -> int:
+    """Xóa hint quá cũ hoặc quá xa tương lai. Trả về số entry đã prune."""
+    now_ms = now_ms or int(time.time() * 1000)
+    removed = 0
+    with _lock:
+        stale_codes = []
+        for code, hint in SCHEDULE_HINTS.items():
+            sibt = hint.get("sibt_millis")
+            if not isinstance(sibt, int):
+                stale_codes.append(code)
+                continue
+            if sibt < now_ms - SCHEDULE_RETAIN_PAST_MS:
+                stale_codes.append(code)
+            elif sibt > now_ms + SCHEDULE_RETAIN_FUTURE_MS:
+                stale_codes.append(code)
+        for code in stale_codes:
+            SCHEDULE_HINTS.pop(code, None)
+            removed += 1
+    return removed
+
+
+def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> int:
+    """Lưu SIBT/origin/aircraft cho từng mã. Trả về số entry đã ghi."""
+    if not isinstance(schedule_payload, dict):
+        return 0
+    now_ms = now_ms or int(time.time() * 1000)
+    written = 0
+    with _lock:
+        for raw_code, hint in schedule_payload.items():
+            code = _clean_code(raw_code)
+            if not code or not isinstance(hint, dict):
+                continue
+            sibt_millis = hint.get("sibt_millis")
+            if sibt_millis is None:
+                continue
+            try:
+                sibt_millis = int(sibt_millis)
+            except (TypeError, ValueError):
+                continue
+            # Bỏ qua hint quá cũ ngay khi nhận
+            if sibt_millis < now_ms - SCHEDULE_RETAIN_PAST_MS:
+                continue
+            if sibt_millis > now_ms + SCHEDULE_RETAIN_FUTURE_MS:
+                continue
+            SCHEDULE_HINTS[code] = {
+                "sibt_millis": sibt_millis,
+                "origin": str(hint.get("origin", "") or "").upper(),
+                "aircraft": str(hint.get("aircraft", "") or "").upper(),
+                "route": str(hint.get("route", "") or "").upper(),
+                "date_key": str(hint.get("date_key", "") or ""),
+                "registered_at_ms": now_ms,
+            }
+            written += 1
+    _prune_old_schedule_hints(now_ms)
+    return written
+
+
+def _schedule_public_entry(code: str, hint: dict, now_ms: int) -> dict:
+    """Tạo entry public state=SCHEDULED cho app, khi server chưa có live data."""
+    sibt = hint.get("sibt_millis")
+    return {
+        "state": "SCHEDULED",
+        "eta_millis": sibt,
+        "confidence": "LOW",
+        "altitude_ft": None,
+        "ground_speed_kt": None,
+        "vertical_speed": None,
+        "distance_km": None,
+        "on_ground": False,
+        "latitude": None,
+        "longitude": None,
+        "heading": None,
+        "updated_at": 0,
+        "stale_seconds": None,
+        "stale": False,
+        "landed": False,
+        "taxiing": False,
+        "parked": False,
+        "miss_count": 0,
+        "scheduled": True,
+        "sibt_millis": sibt,
+        "origin_iata": hint.get("origin", ""),
+        "aircraft_type": hint.get("aircraft", ""),
+        "route": hint.get("route", ""),
+        "date_key": hint.get("date_key", ""),
+    }
 
 
 # ===========================================================
@@ -501,9 +633,20 @@ def _extract_eta_from_details(details: dict):
 # XỬ LÝ TỪNG MÃ
 # ===========================================================
 
-def _process_match(code: str, flight, details: Optional[dict],
-                   old: Optional[FlightEntry], now_ms: int) -> Optional[FlightEntry]:
-    """Mã được tìm thấy trong scan. Trả về entry mới, hoặc None nếu drop."""
+def _process_match(
+    code: str,
+    flight,
+    details: Optional[dict],
+    old: Optional[FlightEntry],
+    now_ms: int,
+    trusted: bool = False,
+) -> Optional[FlightEntry]:
+    """Mã được tìm thấy trong scan. Trả về entry mới, hoặc None nếu drop.
+
+    `trusted=True` khi code đã được lịch bay/người dùng bảo lãnh (lấy từ QUEUE).
+    Khi đó không drop dù FR24 trả dest khác DAD — vì FR24 đôi khi cache stale
+    hoặc chưa cập nhật destination cho chuyến mới khởi hành.
+    """
     sensors = _extract_sensors(flight)
 
     fr24_eta_ms = None
@@ -513,10 +656,12 @@ def _process_match(code: str, flight, details: Optional[dict],
 
     if details:
         fr24_eta_ms, real_arrival_ms, fr24_live, dest_iata = _extract_eta_from_details(details)
-        # Destination rõ ràng KHÔNG phải DAD → drop khỏi TRACKED
         if dest_iata and dest_iata != TARGET_AIRPORT:
-            log.info("Drop %s: destination=%s ≠ %s", code, dest_iata, TARGET_AIRPORT)
-            return None
+            if trusted:
+                log.info("Keep %s despite FR24 dest=%s (trusted by schedule)", code, dest_iata)
+            else:
+                log.info("Drop %s: destination=%s ≠ %s", code, dest_iata, TARGET_AIRPORT)
+                return None
 
     if not _validate_eta(fr24_eta_ms, now_ms):
         fr24_eta_ms = None
@@ -555,9 +700,15 @@ def _process_match(code: str, flight, details: Optional[dict],
         raw_eta = _blend_eta(state, fr24_eta_ms, physics_eta_ms)
         if raw_eta is None or not _validate_eta(raw_eta, now_ms):
             # Cycle này không có ETA hợp lệ. Giữ ETA cũ nếu có, đánh dấu LOW.
+            # Nếu trước đó cũng chưa có ETA mà lịch bay có SIBT, dùng SIBT làm fallback.
+            fallback_eta = old.eta_millis if old else None
+            if fallback_eta is None:
+                hint = SCHEDULE_HINTS.get(code)
+                if hint and isinstance(hint.get("sibt_millis"), int):
+                    fallback_eta = hint["sibt_millis"]
             return FlightEntry(
                 state=state,
-                eta_millis=old.eta_millis if old else None,
+                eta_millis=fallback_eta,
                 confidence="LOW",
                 altitude_ft=sensors["alt_ft"],
                 ground_speed_kt=sensors["gs_kt"],
@@ -624,12 +775,29 @@ def _process_match(code: str, flight, details: Optional[dict],
 
 
 def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optional[FlightEntry]:
-    """Mã KHÔNG xuất hiện trong scan cycle này. Giữ vị trí cuối để map vẫn vẽ được."""
+    """Mã KHÔNG xuất hiện trong scan cycle này. Giữ vị trí cuối để map vẫn vẽ được.
+
+    Nếu chưa có entry cũ và lịch bay có SIBT cho mã này → tạo entry SCHEDULED.
+    """
     if old is None:
+        # Chưa từng thấy live. Nếu lịch bay có SIBT thì tạo placeholder.
+        hint = SCHEDULE_HINTS.get(code)
+        if hint and isinstance(hint.get("sibt_millis"), int):
+            return FlightEntry(
+                state="SCHEDULED",
+                eta_millis=hint["sibt_millis"],
+                confidence="LOW",
+                miss_count=0,
+                landed=False,
+            )
         return None
 
     # Đã PARKED: trạng thái kết thúc, giữ nguyên.
     if old.state == "PARKED":
+        return old
+
+    # SCHEDULED state có sẵn: giữ nguyên, không tăng miss vì chưa từng có live.
+    if old.state == "SCHEDULED":
         return old
 
     miss_count = old.miss_count + 1
@@ -801,14 +969,23 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
 
     Khác với _do_poll(): hàm này không cần QUEUE có sẵn. Nó tự tìm ứng viên DAD,
     lấy details, tính ETA/vị trí, rồi tùy add_to_queue để đưa vào QUEUE/TRACKED.
+
+    v2.2: nới lọc — nếu candidate trong vùng bao DAD mà chưa có destination
+    rõ ràng, vẫn giữ lại để xác minh qua details. Sau đó:
+      - Có dest=DAD → giữ.
+      - Có dest khác → loại.
+      - Vẫn không có dest sau khi lấy details: chỉ giữ nếu code khớp với
+        SCHEDULE_HINTS (lịch bay đã bảo lãnh).
     """
     max_minutes = max(5, min(int(max_minutes or AUTO_SCAN_DEFAULT_MINUTES), AUTO_SCAN_MAX_MINUTES))
     now_ms = int(time.time() * 1000)
     fr_api = FlightRadar24API()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
 
-    # Candidate nhanh: giữ lại flight có destination=DAD hoặc chưa có destination field.
-    # Không bỏ flight thiếu dest vì FR24 đôi khi chỉ có dest trong get_flight_details().
+    # Snapshot schedule hints để dùng làm whitelist khi FR24 thiếu dest
+    with _lock:
+        schedule_codes = set(SCHEDULE_HINTS.keys())
+
     candidates = []
     for f in flights:
         dest_hint = (getattr(f, "destination_airport_iata", None) or "").upper()
@@ -846,22 +1023,29 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
         if details:
             fr24_eta_ms, _, _, dest_iata = _extract_eta_from_details(details)
         dest_hint = (getattr(flight, "destination_airport_iata", None) or "").upper()
-        if dest_iata and dest_iata != TARGET_AIRPORT:
-            continue
-        if not dest_iata and dest_hint and dest_hint != TARGET_AIRPORT:
-            continue
-        if not dest_iata and not dest_hint:
-            # Không xác định được có về DAD hay không thì bỏ để tránh thêm nhầm.
-            continue
 
         code = _best_flight_code(flight, details)
         if not code:
             continue
 
+        # Lọc dest
+        if dest_iata and dest_iata != TARGET_AIRPORT:
+            continue
+        if not dest_iata and dest_hint and dest_hint != TARGET_AIRPORT:
+            continue
+        if not dest_iata and not dest_hint:
+            # Không xác định được dest. Chỉ giữ nếu lịch bay bảo lãnh.
+            code_aliases = _code_aliases(code)
+            if not (schedule_codes and code_aliases & schedule_codes):
+                continue
+            log.info("Keep %s in scan (no FR24 dest, schedule-vouched)", code)
+
         with _lock:
             old = TRACKED.get(code)
 
-        entry = _process_match(code, flight, details, old, now_ms)
+        # trusted=True nếu code khớp với schedule (đã được bảo lãnh)
+        trusted = bool(schedule_codes and _code_aliases(code) & schedule_codes)
+        entry = _process_match(code, flight, details, old, now_ms, trusted=trusted)
         if entry is None:
             continue
         if not _eta_within_scan_window(entry, now_ms, max_minutes):
@@ -938,8 +1122,8 @@ def _do_poll() -> None:
         number_raw = getattr(f, "number", None)
         callsign_raw = getattr(f, "callsign", None)
         dest = (getattr(f, "destination_airport_iata", None) or "").upper()
-        if dest and dest != TARGET_AIRPORT:
-            continue
+        # KHÔNG skip khi dest khác DAD ở đây — _process_match sẽ check với trusted=True.
+        # FR24 đôi khi cache stale destination khi tàu vừa khởi hành.
 
         candidate_keys = set()
         candidate_keys.update(_code_aliases(number_raw))
@@ -977,7 +1161,9 @@ def _do_poll() -> None:
         for code in queue_snapshot:
             old = TRACKED.get(code)
             if code in targets:
-                new_entry = _process_match(code, targets[code], details_map.get(code), old, now_ms)
+                # trusted=True: code đã trong QUEUE (do user/lịch bay đẩy lên).
+                # Không drop dù FR24 trả dest != DAD vì FR24 hay cache stale.
+                new_entry = _process_match(code, targets[code], details_map.get(code), old, now_ms, trusted=True)
                 if new_entry is None:
                     drops.append(code)
                 else:
@@ -1031,6 +1217,7 @@ def poll_loop() -> None:
     while True:
         try:
             _do_poll()
+            _prune_old_schedule_hints()
         except Exception as e:
             with _lock:
                 LAST_ERROR = str(e)
@@ -1054,15 +1241,36 @@ def require_api_key():
 
 
 def build_etas_payload() -> dict:
+    """Build response cho /api/etas: live data + SCHEDULED placeholder cho mã chưa có live."""
     now_ms = int(time.time() * 1000)
     with _lock:
         result = {}
         for code in QUEUE:
             entry = TRACKED.get(code)
             if entry is None:
-                result[code] = {"state": "PENDING", "status": "pending"}
+                # Chưa có live data. Nếu lịch bay có SIBT thì trả SCHEDULED.
+                hint = SCHEDULE_HINTS.get(code)
+                if hint and isinstance(hint.get("sibt_millis"), int):
+                    result[code] = _schedule_public_entry(code, hint, now_ms)
+                else:
+                    result[code] = {"state": "PENDING", "status": "pending"}
             else:
-                result[code] = entry.to_public(now_ms)
+                public = entry.to_public(now_ms)
+                # Đính kèm hint từ lịch bay (origin/aircraft/sibt) để app có context.
+                hint = SCHEDULE_HINTS.get(code)
+                if hint:
+                    sibt = hint.get("sibt_millis")
+                    if isinstance(sibt, int):
+                        public.setdefault("sibt_millis", sibt)
+                    if hint.get("origin"):
+                        public.setdefault("origin_iata", hint["origin"])
+                    if hint.get("aircraft"):
+                        public.setdefault("aircraft_type", hint["aircraft"])
+                    if hint.get("route"):
+                        public.setdefault("route", hint["route"])
+                    if hint.get("date_key"):
+                        public.setdefault("date_key", hint["date_key"])
+                result[code] = public
         return {
             "status": "success",
             "server_time_millis": now_ms,
@@ -1071,6 +1279,9 @@ def build_etas_payload() -> dict:
             "poll_interval_seconds": POLL_INTERVAL,
             "adaptive_poll_interval_ms": _adaptive_poll_interval_ms(now_ms),
             "last_error": LAST_ERROR,
+            "schedule_count": len(SCHEDULE_HINTS),
+            "queue_count": len(QUEUE),
+            "tracked_count": len(TRACKED),
             "pid": os.getpid(),
             "flights": result,
         }
@@ -1089,6 +1300,7 @@ def health():
             "adaptive_poll_interval_ms": _adaptive_poll_interval_ms(),
             "tracked_count": len(TRACKED),
             "queue_count": len(QUEUE),
+            "schedule_count": len(SCHEDULE_HINTS),
             "pid": os.getpid(),
         })
 
@@ -1158,6 +1370,12 @@ def get_all_etas():
         if min_refresh_ms is not None:
             min_refresh_ms = max(5_000, min(min_refresh_ms, ADAPTIVE_POLL_FAR_MS))
 
+        # Lịch bay: app gửi SIBT/origin/aircraft cho từng mã trong body.schedule.
+        # Server lưu vào SCHEDULE_HINTS để: (1) trả SCHEDULED placeholder cho mã
+        # FR24 chưa thấy, (2) trust dest=N/A khi auto-scan, (3) đính meta cho live.
+        schedule_payload = body.get("schedule")
+        scheduled_written = _register_schedule(schedule_payload) if schedule_payload else 0
+
         if cleaned:
             now_ms = int(time.time() * 1000)
             with _lock:
@@ -1167,10 +1385,77 @@ def get_all_etas():
             # server chỉ poll khi dữ liệu đã stale theo ngưỡng đó để tránh quá tải server miễn phí.
             if new_codes or force_refresh or _server_needs_poll_for_codes(cleaned, now_ms, min_refresh_ms):
                 _try_immediate_poll(
-                    f"etas refresh new={new_codes} force={force_refresh} min={min_refresh_ms} codes={cleaned}",
+                    f"etas refresh new={len(new_codes)} force={force_refresh} min={min_refresh_ms} sched={scheduled_written}",
                     bypass_cooldown=force_refresh,
                 )
     return jsonify(build_etas_payload())
+
+
+@app.route("/api/schedule", methods=["POST"])
+def post_schedule():
+    """Nhận lịch bay từ app: list mã + SIBT cho mỗi mã.
+
+    Body: {
+      "flights": [
+        {"code": "VN132", "sibt_millis": 1747469700000, "origin": "SGN",
+         "aircraft": "A321", "route": "SGN-DAD", "date_key": "2026-05-17"},
+        ...
+      ]
+    }
+    Hoặc: {"schedule": {code: hint, ...}} cũng được chấp nhận.
+
+    Server: lưu vào SCHEDULE_HINTS, đẩy mọi code vào QUEUE, trigger poll ngay.
+    """
+    if (err := require_api_key()):
+        return err
+
+    body = request.get_json(silent=True) or {}
+    flights_payload = body.get("flights")
+    schedule_payload = body.get("schedule")
+
+    # Hỗ trợ cả 2 dạng input
+    hints_dict: dict = {}
+    if isinstance(schedule_payload, dict):
+        hints_dict.update(schedule_payload)
+    if isinstance(flights_payload, list):
+        for item in flights_payload:
+            if not isinstance(item, dict):
+                continue
+            code = _clean_code(item.get("code") or item.get("arrival_flight") or "")
+            if not code:
+                continue
+            hints_dict[code] = {
+                "sibt_millis": item.get("sibt_millis"),
+                "origin": item.get("origin") or item.get("origin_iata") or "",
+                "aircraft": item.get("aircraft") or item.get("aircraft_type") or "",
+                "route": item.get("route") or item.get("arrival_route") or "",
+                "date_key": item.get("date_key") or "",
+            }
+
+    written = _register_schedule(hints_dict)
+    codes = [c for c in hints_dict.keys() if _clean_code(c)]
+
+    if codes:
+        with _lock:
+            new_codes = [c for c in codes if c not in TRACKED]
+            QUEUE.update(codes)
+        if new_codes:
+            _try_immediate_poll(f"schedule new={len(new_codes)}")
+
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        snapshot = {
+            "queue_count": len(QUEUE),
+            "schedule_count": len(SCHEDULE_HINTS),
+            "tracked_count": len(TRACKED),
+        }
+    return jsonify({
+        "status": "success",
+        "registered": written,
+        "received": len(hints_dict),
+        "server_time_millis": now_ms,
+        **snapshot,
+    })
 
 
 @app.route("/api/track/<flight_code>", methods=["POST"])
@@ -1194,6 +1479,7 @@ def remove_track(flight_code):
     with _lock:
         QUEUE.discard(code)
         TRACKED.pop(code, None)
+        SCHEDULE_HINTS.pop(code, None)
     return jsonify({"status": "success", "tracked": sorted(QUEUE)})
 
 
@@ -1214,7 +1500,29 @@ def get_eta(flight_code):
             entry = TRACKED.get(code)
 
     now_ms = int(time.time() * 1000)
-    if entry is None or entry.eta_millis is None:
+    if entry is None:
+        # Không có live data. Nếu lịch bay có SIBT thì trả SCHEDULED.
+        with _lock:
+            hint = SCHEDULE_HINTS.get(code)
+        if hint and isinstance(hint.get("sibt_millis"), int):
+            public = _schedule_public_entry(code, hint, now_ms)
+            public.update({
+                "status": "success",
+                "flight_code": code,
+                "destination": "Da Nang (DAD)",
+                "server_time_millis": now_ms,
+                "pid": os.getpid(),
+            })
+            return jsonify(public)
+        return jsonify({
+            "status": "pending",
+            "flight_code": code,
+            "message": f"Chưa có ETA cho {code}",
+            "server_time_millis": now_ms,
+            "pid": os.getpid(),
+        })
+
+    if entry.eta_millis is None:
         return jsonify({
             "status": "pending",
             "flight_code": code,
@@ -1224,6 +1532,16 @@ def get_eta(flight_code):
         })
 
     public = entry.to_public(now_ms)
+    with _lock:
+        hint = SCHEDULE_HINTS.get(code)
+    if hint:
+        sibt = hint.get("sibt_millis")
+        if isinstance(sibt, int):
+            public.setdefault("sibt_millis", sibt)
+        if hint.get("origin"):
+            public.setdefault("origin_iata", hint["origin"])
+        if hint.get("aircraft"):
+            public.setdefault("aircraft_type", hint["aircraft"])
     public.update({
         "status": "success",
         "flight_code": code,
