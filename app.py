@@ -149,11 +149,13 @@ PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
 # Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
 # 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
-# Khi FR24 mất tín hiệu, "giờ vào bến" = lần cuối còn radar + buffer ước lượng theo state.
-# Tàu đang TAXIING: còn 1-3 phút sẽ tới bến → +2 phút.
-# Tàu vừa LANDED (mới chạm bánh): còn nguyên đoạn taxi → +4 phút.
+# Quy tắc nghiệp vụ mới: khi radar xác nhận tàu đã hạ cánh (marker xanh),
+# lưu mốc hạ cánh. Nếu không có mốc vào bến tốt hơn, lấy hạ cánh + 3 phút
+# làm giờ dừng bến/chốt hồ sơ để không sót chuyến đã có người đón.
+LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", "180000"))
+# Khi FR24 mất tín hiệu trong lúc đang taxi mà chưa có landed_at, dùng buffer cũ làm dự phòng thấp.
 TAXI_BUFFER_MS = int(os.environ.get("TAXI_BUFFER_MS", "120000"))
-LANDED_BUFFER_MS = int(os.environ.get("LANDED_BUFFER_MS", "240000"))
+LANDED_BUFFER_MS = int(os.environ.get("LANDED_BUFFER_MS", "180000"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
 
@@ -167,6 +169,10 @@ SCHEDULE_RETAIN_FUTURE_MS = int(os.environ.get("SCHEDULE_RETAIN_FUTURE_MS", str(
 # Bật mặc định. Nếu chưa cấu hình Firebase Admin, server vẫn chạy radar nhưng không tự ghi Firestore.
 FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "60000"))
+# Fallback nghiệp vụ: nếu một chuyến đã có người đón nhưng radar không sinh PARKED,
+# sau SIBT một khoảng an toàn server sẽ chốt bằng giờ lịch để hồ sơ không treo mãi.
+SCHEDULE_FALLBACK_FINALIZE_GRACE_MS = int(os.environ.get("SCHEDULE_FALLBACK_FINALIZE_GRACE_MS", str(30 * 60 * 1000)))
+FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS", "60000"))
 FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "1"))
 FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEAD", "1"))
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
@@ -193,9 +199,11 @@ LAST_POLL_DURATION_MS: Optional[int] = None
 LAST_FIRESTORE_SCHEDULE_SYNC_MS: Optional[int] = None
 LAST_FIRESTORE_SYNC_ERROR: Optional[str] = None
 LAST_FIRESTORE_PARKED_WRITE_MS: Optional[int] = None
+LAST_FIRESTORE_FALLBACK_WRITE_MS: Optional[int] = None
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
 PARKED_FIRESTORE_SYNCED: set[str] = set()
+SCHEDULE_FALLBACK_FIRESTORE_SYNCED: set[str] = set()
 _FIRESTORE_CLIENT = None
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -403,11 +411,15 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}"
 
     # Phân biệt nguồn để dễ dọn rác và để web hiển thị mức tin cậy.
-    new_source = (
-        "server_radar_signal_lost" if entry.parked_source == "signal_lost"
-        else "server_radar_ground_stop"
-    )
-    new_confidence = "LOW" if entry.parked_source == "signal_lost" else "HIGH"
+    if entry.parked_source == "signal_lost":
+        new_source = "server_radar_signal_lost"
+        new_confidence = "LOW"
+    elif entry.parked_source == "landing_plus_3min":
+        new_source = "server_landing_plus_3min"
+        new_confidence = "MEDIUM"
+    else:
+        new_source = "server_radar_ground_stop"
+        new_confidence = "HIGH"
 
     try:
         ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
@@ -416,7 +428,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         # User đã chốt tay (quick-complete hoặc full flow) hoặc auto-finalize web đã ghi:
         # server không được phép ghi đè vì user là source-of-truth khi đã commit.
         # Chỉ chấp nhận ghi nếu pickup chưa finalized hoặc finalize do chính server radar.
-        if old.get("finalized") and not old.get("autoFinalizedByRadar"):
+        if old.get("finalized") and not (old.get("autoFinalizedByRadar") or old.get("autoFinalizedByLandingFallback")):
             PARKED_FIRESTORE_SYNCED.add(sync_key)
             return False
         # Không ghi đè mốc đáng tin cậy đã có. Riêng dữ liệu cũ do web tự suy từ state PARKED
@@ -434,6 +446,9 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "web_state_parked",
             "web_state_landed_stale",
             "server_radar_signal_lost",
+            "landing_plus_3min",
+            "web_landing_plus_3min",
+            "server_landing_plus_3min",
         }
         if has_old_parked_time and not should_auto_finalize:
             if old_source not in overwritable_sources:
@@ -449,7 +464,14 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         payload = {
             "flightCode": old.get("flightCode") or doc_id,
             "displayFlightCode": old.get("displayFlightCode") or doc_id,
-            "actualParkedByRadar": True,
+            "actualLandedAtMillis": int(entry.landed_at_millis) if entry.landed_at_millis else None,
+            "landedAtMillis": int(entry.landed_at_millis) if entry.landed_at_millis else None,
+            "touchdownMillis": int(entry.landed_at_millis) if entry.landed_at_millis else None,
+            "actualLandedTime": _format_hhmm(entry.landed_at_millis),
+            "actualLandedTimeFull": _format_hhmmss(entry.landed_at_millis),
+            "actualLandedSource": entry.landed_source,
+            "actualParkedByRadar": new_source != "server_landing_plus_3min",
+            "actualParkedByLandingFallback": new_source == "server_landing_plus_3min",
             "actualParkedAtMillis": int(entry.parked_at_millis),
             "actualParkedTime": parked_hhmm,
             "actualParkedTimeFull": parked_hhmmss,
@@ -468,7 +490,10 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         # Nếu chuyến đã có người đón + bến, server có thể chốt hồ sơ tự động bằng giờ vào bến radar.
         # Nếu thiếu người đón/bến thì chỉ lưu actualParked*, để người dùng vào lịch sử sửa/chốt sau.
         # Nếu bản trước đã được auto-finalize bằng mốc LOW do mất tín hiệu, khi có mốc HIGH hơn thì cập nhật lại giờ chốt.
-        should_refresh_auto_finalized_time = bool(old.get("autoFinalizedByRadar") and new_source == "server_radar_ground_stop")
+        should_refresh_auto_finalized_time = bool(
+            (old.get("autoFinalizedByRadar") or old.get("autoFinalizedByLandingFallback"))
+            and new_source == "server_radar_ground_stop"
+        )
         if should_auto_finalize or should_refresh_auto_finalized_time:
             payload.update({
                 "stand": old_stand,
@@ -480,14 +505,15 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                 "completedSource": new_source,
                 "finalized": True,
                 "locked": True,
-                "autoFinalizedByRadar": True,
+                "autoFinalizedByRadar": new_source != "server_landing_plus_3min",
+                "autoFinalizedByLandingFallback": new_source == "server_landing_plus_3min",
                 "autoFinalizedAt": firebase_firestore.SERVER_TIMESTAMP,
                 "lastUpdatedByUid": old_picker_uid or "server-radar",
                 "lastUpdatedByName": "server-radar",
             })
             if should_auto_finalize:
                 payload["history"] = firebase_firestore.ArrayUnion([{
-                    "action": "auto_finalize_by_radar",
+                    "action": "auto_finalize_by_landing_plus_3min" if new_source == "server_landing_plus_3min" else "auto_finalize_by_radar",
                     "pickerUid": old_picker_uid or None,
                     "pickerName": old_picker_name,
                     "stand": old_stand,
@@ -533,6 +559,147 @@ def _sync_parked_entries_to_firestore(entries: dict[str, FlightEntry]) -> int:
     return written
 
 
+def _entry_still_live_for_schedule_fallback(entry) -> bool:
+    """True nếu vẫn nên chờ radar thay vì dùng SIBT fallback."""
+    if not entry:
+        return False
+    if getattr(entry, "parked_at_millis", None) or getattr(entry, "state", "") == "PARKED":
+        return False
+    return getattr(entry, "state", "") in {"EN_ROUTE", "APPROACH", "FINAL", "LANDED", "TAXIING"}
+
+
+def _sync_overdue_schedule_claims_to_firestore(now_ms: Optional[int] = None) -> int:
+    """
+    Chốt dự phòng các chuyến đã có người đón nhưng radar không sinh mốc PARKED.
+
+    Đây là lớp an toàn cho nghiệp vụ lưu hồ sơ: radar/FR24 có thể mất tín hiệu,
+    sai code-share hoặc không trả ground stop. Nếu pickup đã có pickerName và SIBT
+    đã quá grace, server chốt bằng giờ lịch với confidence LOW.
+    """
+    global LAST_FIRESTORE_FALLBACK_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
+    now_ms = int(now_ms or time.time() * 1000)
+    db = _init_firestore_client()
+    if db is None:
+        return 0
+
+    with _lock:
+        hints_snapshot = {code: dict(hint or {}) for code, hint in SCHEDULE_HINTS.items()}
+        tracked_snapshot = dict(TRACKED)
+
+    written = 0
+    for code, hint in hints_snapshot.items():
+        try:
+            sibt = hint.get("sibt_millis")
+            if not isinstance(sibt, int):
+                continue
+            if now_ms < sibt + SCHEDULE_FALLBACK_FINALIZE_GRACE_MS:
+                continue
+            entry = tracked_snapshot.get(code)
+            if _entry_still_live_for_schedule_fallback(entry):
+                continue
+
+            date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(sibt)
+            doc_id = _clean_code(code)
+            if not date_key or not doc_id:
+                continue
+            sync_key = f"{date_key}:{doc_id}:{sibt}:schedule_fallback"
+            if sync_key in SCHEDULE_FALLBACK_FIRESTORE_SYNCED:
+                continue
+
+            ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
+            snap = ref.get()
+            if not snap.exists:
+                continue
+            old = snap.to_dict() or {}
+            if old.get("finalized") or old.get("locked"):
+                SCHEDULE_FALLBACK_FIRESTORE_SYNCED.add(sync_key)
+                continue
+
+            picker_name = str(old.get("pickerName") or "").strip()
+            if not picker_name:
+                continue
+            picker_uid = str(old.get("pickerUid") or "").strip()
+            stand = str(old.get("stand") or hint.get("stand") or "").strip()
+
+            # Nếu đã có mốc radar trong doc nhưng chưa finalized, dùng mốc đó để chốt.
+            # Nếu đã có mốc hạ cánh nhưng chưa có PARKED, chốt dự phòng = hạ cánh + 3 phút.
+            parked_ms = _to_int_ms(old.get("actualParkedAtMillis") or old.get("parkedAtMillis"))
+            source = str(old.get("actualParkedSource") or "").strip()
+            confidence = str(old.get("actualParkedConfidence") or "LOW").strip()
+            if not parked_ms:
+                landed_ms = _to_int_ms(old.get("actualLandedAtMillis") or old.get("landedAtMillis") or old.get("touchdownMillis"))
+                if landed_ms:
+                    parked_ms = int(landed_ms) + LANDING_TO_PARK_FALLBACK_MS
+                    source = "server_landing_plus_3min"
+                    confidence = "MEDIUM"
+                else:
+                    parked_ms = int(sibt)
+                    source = "schedule_overdue_fallback"
+                    confidence = "LOW"
+            if source == "schedule_overdue_fallback" or not old.get("actualParkedAtMillis"):
+                confidence = "MEDIUM" if source == "server_landing_plus_3min" else "LOW"
+
+            hhmm = _format_hhmm(parked_ms)
+            hhmmss = _format_hhmmss(parked_ms)
+            payload = {
+                "flightCode": old.get("flightCode") or doc_id,
+                "displayFlightCode": old.get("displayFlightCode") or doc_id,
+                "pickerUid": picker_uid,
+                "pickerName": picker_name,
+                "stand": stand,
+                "actualParkedByRadar": bool(source and source not in ("schedule_overdue_fallback", "server_landing_plus_3min")),
+                "actualParkedByLandingFallback": source == "server_landing_plus_3min",
+                "actualParkedByScheduleFallback": source == "schedule_overdue_fallback",
+                "actualParkedAtMillis": int(parked_ms),
+                "actualParkedTime": hhmm,
+                "actualParkedTimeFull": hhmmss,
+                "actualParkedSource": source,
+                "actualParkedConfidence": confidence,
+                "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "completedTime": hhmm,
+                "completedTimeFull": hhmmss,
+                "completedAtMillis": int(parked_ms),
+                "completedDateIso": date_key,
+                "completedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "completedSource": source,
+                "finalized": True,
+                "locked": True,
+                "autoFinalizedByScheduleFallback": source == "schedule_overdue_fallback",
+                "autoFinalizedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "lastUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "lastUpdatedByUid": picker_uid or "server-schedule-fallback",
+                "lastUpdatedByName": "server-schedule-fallback",
+                "history": firebase_firestore.ArrayUnion([{
+                    "action": "auto_finalize_by_schedule_fallback",
+                    "pickerUid": picker_uid or None,
+                    "pickerName": picker_name,
+                    "stand": stand or None,
+                    "completedTime": hhmm,
+                    "completedAtMillis": int(parked_ms),
+                    "source": source,
+                    "confidence": confidence,
+                    "changedByUid": "server-schedule-fallback",
+                    "changedByName": "server-schedule-fallback",
+                    "changedAtMillis": now_ms,
+                }])
+            }
+            if hint.get("origin"):
+                payload.setdefault("originIata", hint.get("origin"))
+            if hint.get("aircraft"):
+                payload.setdefault("aircraftType", hint.get("aircraft"))
+
+            ref.set(payload, merge=True)
+            SCHEDULE_FALLBACK_FIRESTORE_SYNCED.add(sync_key)
+            LAST_FIRESTORE_FALLBACK_WRITE_MS = now_ms
+            LAST_FIRESTORE_SYNC_ERROR = None
+            written += 1
+            log.info("Firestore schedule fallback finalize OK: %s/%s at %s", date_key, doc_id, hhmmss)
+        except Exception as e:
+            LAST_FIRESTORE_SYNC_ERROR = str(e)
+            log.warning("Firestore schedule fallback finalize failed %s: %s", code, e)
+    return written
+
+
 @dataclass
 class FlightEntry:
     """Trạng thái 1 mã đang theo dõi."""
@@ -552,6 +719,10 @@ class FlightEntry:
     history: list = field(default_factory=list)
     miss_count: int = 0
     landed: bool = False
+    # Mốc tàu vừa hạ cánh/touchdown. Đây là lớp dự phòng quan trọng:
+    # nếu không lấy được giờ vào bến từ radar, chốt bằng landed_at + 3 phút.
+    landed_at_millis: Optional[int] = None
+    landed_source: Optional[str] = None  # "radar_ground" | "real_arrival" | "final_missed" | "approach_missed"
     # Mốc giờ tàu dừng hẳn/vào bến suy luận từ radar.
     # parked_candidate_since_ms là thời điểm bắt đầu thấy tín hiệu đứng yên;
     # parked_at_millis chỉ được chốt sau khi tín hiệu ổn định PARKED_STABLE_MS
@@ -587,6 +758,14 @@ class FlightEntry:
             "taxiing": self.state == "TAXIING",
             "parked": self.state == "PARKED",
             "miss_count": self.miss_count,
+            # Mốc hạ cánh/touchdown. Frontend dùng mốc này để chốt dự phòng +3 phút
+            # nếu radar không sinh được mốc vào bến thực tế.
+            "actual_landed_at_millis": self.landed_at_millis,
+            "landed_at_millis": self.landed_at_millis,
+            "touchdown_millis": self.landed_at_millis,
+            "actual_landed_time": _format_hhmm(self.landed_at_millis),
+            "actual_landed_time_full": _format_hhmmss(self.landed_at_millis),
+            "actual_landed_source": self.landed_source,
             # Các alias cùng chỉ về một mốc: giờ tàu dừng bến/in-block suy luận từ radar.
             # Giữ nhiều tên field để app cũ/mới đều đọc được.
             "actual_parked_at_millis": self.parked_at_millis,
@@ -607,6 +786,34 @@ class FlightEntry:
             ),
             "parked_candidate_since_ms": self.parked_candidate_since_ms,
         }
+
+
+def _resolve_landed_at_millis(
+    state: str,
+    old: Optional[FlightEntry],
+    now_ms: int,
+    real_arrival_ms: Optional[int] = None,
+    source: str = "radar_ground",
+) -> tuple[Optional[int], Optional[str]]:
+    """Giữ mốc hạ cánh đầu tiên.
+
+    Khi state chuyển sang LANDED/TAXIING/PARKED, đây là mốc "tàu vừa hạ cánh"
+    để frontend/server dùng làm dự phòng: giờ vào bến = landed_at + 3 phút.
+    """
+    if old and old.landed_at_millis:
+        return old.landed_at_millis, old.landed_source or source
+    if state not in ("LANDED", "TAXIING", "PARKED"):
+        return (old.landed_at_millis if old else None), (old.landed_source if old else None)
+    if real_arrival_ms and 0 < int(real_arrival_ms) <= now_ms + 10 * 60 * 1000:
+        return int(real_arrival_ms), "real_arrival"
+    return int(now_ms), source
+
+def _fallback_parked_from_landing(landed_at_millis: Optional[int], now_ms: int) -> Optional[int]:
+    """Trả về mốc vào bến dự phòng = hạ cánh + 3 phút nếu đã tới hạn."""
+    if not landed_at_millis:
+        return None
+    fallback = int(landed_at_millis) + LANDING_TO_PARK_FALLBACK_MS
+    return fallback if now_ms >= fallback else None
 
 
 # ===========================================================
@@ -1103,6 +1310,9 @@ def _process_match(
     parked_at_millis = old.parked_at_millis if old else None
     parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
     parked_source = old.parked_source if old else None
+    landed_at_millis, landed_source = _resolve_landed_at_millis(
+        state, old, now_ms, real_arrival_ms=real_arrival_ms, source="radar_ground"
+    )
 
     if old and old.state == "PARKED":
         # Sticky PARKED: đã dừng/vào bến rồi thì không revert về taxi/airborne.
@@ -1123,6 +1333,15 @@ def _process_match(
             state = "TAXIING"
     else:
         parked_candidate_since_ms = None
+
+    # Lớp dự phòng đơn giản theo yêu cầu nghiệp vụ:
+    # tàu chuyển xanh/hạ cánh -> lưu landed_at; nếu sau 3 phút chưa có PARKED tốt hơn
+    # thì tự coi giờ vào bến = landed_at + 3 phút.
+    landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms)
+    if parked_at_millis is None and landing_fallback_parked:
+        parked_at_millis = landing_fallback_parked
+        parked_source = "landing_plus_3min"
+        state = "PARKED"
 
     distance_rounded = round(sensors["distance_km"], 1) if sensors["distance_km"] is not None else None
 
@@ -1162,6 +1381,8 @@ def _process_match(
                 history=old.history[:] if old else [],
                 miss_count=0,
                 landed=(state in ("LANDED", "TAXIING", "PARKED")),
+                landed_at_millis=landed_at_millis,
+                landed_source=landed_source,
                 parked_at_millis=parked_at_millis,
                 parked_candidate_since_ms=parked_candidate_since_ms,
                 parked_source=parked_source,
@@ -1214,6 +1435,8 @@ def _process_match(
         history=history,
         miss_count=0,
         landed=(state in ("LANDED", "TAXIING", "PARKED")),
+        landed_at_millis=landed_at_millis,
+        landed_source=landed_source,
         parked_at_millis=parked_at_millis,
         parked_candidate_since_ms=parked_candidate_since_ms,
         parked_source=parked_source,
@@ -1248,29 +1471,45 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
 
     miss_count = old.miss_count + 1
 
-    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như tàu đã vào bến.
-    # Chọn parked_at_millis theo độ tin cậy giảm dần:
-    #   1) Mốc PARKED đã được _process_match xác nhận trước đó (hiếm gặp ở nhánh này).
-    #   2) parked_candidate_since_ms — thời điểm bắt đầu thấy tàu đứng yên gần sân bay.
-    #   3) old.updated_at — lần cuối FR24 còn track, dùng làm xấp xỉ "giờ mất tín hiệu".
-    # Mốc 2-3 có sai số vài phút nên đánh dấu source=signal_lost để web/Firestore biết
-    # đây là mốc dự phòng, vẫn cho phép ghi đè nếu sau đó server lấy được mốc tin cậy.
-    if old.state in GROUND_ACTIVE_STATES and miss_count >= LANDED_MISS_TO_PARKED:
+    # Sau touchdown/taxi: ưu tiên chốt bằng landed_at + 3 phút.
+    # Không cần đợi 12/30 phút; mọi chuyến đã có người đón sẽ có mốc hoàn tất ổn định.
+    if old.state in GROUND_ACTIVE_STATES:
+        landed_at = old.landed_at_millis or old.updated_at or now_ms
+        fallback_parked = _fallback_parked_from_landing(landed_at, now_ms)
         if old.parked_at_millis:
             parked_at = old.parked_at_millis
             new_source = old.parked_source or "ground_stop"
-        elif old.parked_candidate_since_ms:
-            # Đã thấy tàu đứng yên gần sân bay — đây chính là lúc bắt đầu vào bến.
-            parked_at = old.parked_candidate_since_ms
-            new_source = "signal_lost"
-        elif old.updated_at:
-            # Mất tín hiệu khi tàu đang chạy. Cộng buffer ước lượng quãng còn lại.
-            buffer_ms = TAXI_BUFFER_MS if old.state == "TAXIING" else LANDED_BUFFER_MS
-            parked_at = min(old.updated_at + buffer_ms, now_ms)
-            new_source = "signal_lost"
+        elif fallback_parked:
+            parked_at = fallback_parked
+            new_source = "landing_plus_3min"
+        elif miss_count >= LANDED_MISS_TO_PARKED:
+            # Nếu polling thưa hoặc clock lệch, vẫn dùng landed_at +3 nhưng không quá now.
+            parked_at = min(int(landed_at) + LANDING_TO_PARK_FALLBACK_MS, now_ms)
+            new_source = "landing_plus_3min"
         else:
-            parked_at = now_ms
-            new_source = "signal_lost"
+            return FlightEntry(
+                state=old.state,
+                eta_millis=old.eta_millis,
+                confidence=old.confidence,
+                altitude_ft=old.altitude_ft,
+                ground_speed_kt=old.ground_speed_kt,
+                vertical_speed=old.vertical_speed,
+                distance_km=old.distance_km,
+                on_ground=old.on_ground,
+                latitude=old.latitude,
+                longitude=old.longitude,
+                heading=old.heading,
+                updated_at=old.updated_at,
+                history=old.history,
+                miss_count=miss_count,
+                landed=True,
+                landed_at_millis=landed_at,
+                landed_source=old.landed_source or "radar_ground",
+                parked_at_millis=old.parked_at_millis,
+                parked_candidate_since_ms=old.parked_candidate_since_ms,
+                parked_source=old.parked_source,
+            )
+
         log.info(
             "%s: %s + missed %d → PARKED (parked_at=%s, source=%s)",
             code, old.state, miss_count, parked_at, new_source,
@@ -1278,7 +1517,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         return FlightEntry(
             state="PARKED",
             eta_millis=old.eta_millis or now_ms,
-            confidence="LOW",
+            confidence="LOW" if new_source != "ground_stop" else "HIGH",
             altitude_ft=old.altitude_ft,
             ground_speed_kt=0 if old.ground_speed_kt is None else old.ground_speed_kt,
             vertical_speed=old.vertical_speed,
@@ -1291,6 +1530,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=True,
+            landed_at_millis=landed_at,
+            landed_source=old.landed_source or "radar_ground",
             parked_at_millis=parked_at,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=new_source,
@@ -1315,6 +1556,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=True,
+            landed_at_millis=old.landed_at_millis or now_ms,
+            landed_source=old.landed_source or "final_missed",
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=old.parked_source,
@@ -1340,6 +1583,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 history=old.history,
                 miss_count=miss_count,
                 landed=True,
+                landed_at_millis=old.landed_at_millis or now_ms,
+                landed_source=old.landed_source or "approach_missed",
                 parked_at_millis=old.parked_at_millis,
                 parked_candidate_since_ms=old.parked_candidate_since_ms,
                 parked_source=old.parked_source,
@@ -1361,6 +1606,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=False,
+            landed_at_millis=old.landed_at_millis,
+            landed_source=old.landed_source,
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=old.parked_source,
@@ -1383,6 +1630,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         history=old.history,
         miss_count=miss_count,
         landed=old.landed,
+        landed_at_millis=old.landed_at_millis,
+        landed_source=old.landed_source,
         parked_at_millis=old.parked_at_millis,
         parked_candidate_since_ms=old.parked_candidate_since_ms,
         parked_source=old.parked_source,
@@ -1678,6 +1927,8 @@ def _do_poll() -> None:
 
     # Online mode: server tự ghi giờ tàu dừng bến vào Firestore, không cần web đang mở.
     _sync_parked_entries_to_firestore(updates)
+    # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
+    _sync_overdue_schedule_claims_to_firestore(now_ms)
 
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
@@ -1774,6 +2025,7 @@ def build_etas_payload() -> dict:
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
             "pid": os.getpid(),
@@ -1799,6 +2051,7 @@ def health():
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
         })
@@ -1820,6 +2073,7 @@ def firestore_sync_now():
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
             "queue_count": len(QUEUE),
