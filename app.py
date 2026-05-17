@@ -143,7 +143,9 @@ MISS_DROP_THRESHOLD = 5      # miss ≥ 5 → LOST (hoặc LANDED nếu trước
 # Không nên để bán kính quá rộng vì tàu có thể dừng tạm trên taxiway/runway.
 PARKED_GS_KT = int(os.environ.get("PARKED_GS_KT", "3"))
 PARKED_DIST_KM = float(os.environ.get("PARKED_DIST_KM", "2.5"))
-PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "180000"))
+# Tàu vẫn còn radar nhưng đứng yên đủ lâu cũng được coi như đã vào bến.
+# 4 phút = 240 s đủ để loại trừ dừng tạm trên taxiway và bắt kịp các trường hợp FR24 không tự tắt.
+PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "12"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
@@ -394,17 +396,31 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if sync_key in PARKED_FIRESTORE_SYNCED:
         return False
 
+    # Phân biệt nguồn để dễ dọn rác và để web hiển thị mức tin cậy.
+    new_source = (
+        "server_radar_signal_lost" if entry.parked_source == "signal_lost"
+        else "server_radar_ground_stop"
+    )
+    new_confidence = "LOW" if entry.parked_source == "signal_lost" else "HIGH"
+
     try:
         ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
         snap = ref.get()
         old = snap.to_dict() or {} if snap.exists else {}
         # Không ghi đè mốc đáng tin cậy đã có. Riêng dữ liệu cũ do web tự suy từ state PARKED
-        # có source 'radar_state_parked' thì cho phép server ghi đè khi đã có mốc ổn định thật.
+        # ('radar_state_parked') hoặc mốc server dự phòng ('server_radar_signal_lost')
+        # thì cho phép ghi đè khi sau đó server có mốc ổn định thật ('server_radar_ground_stop').
         old_source = str(old.get("actualParkedSource") or "")
         has_old_parked_time = bool(old.get("actualParkedAtMillis") or old.get("actualParkedTime"))
-        if has_old_parked_time and old_source != "radar_state_parked":
-            PARKED_FIRESTORE_SYNCED.add(sync_key)
-            return False
+        overwritable_sources = {"radar_state_parked", "server_radar_signal_lost"}
+        if has_old_parked_time:
+            if old_source not in overwritable_sources:
+                PARKED_FIRESTORE_SYNCED.add(sync_key)
+                return False
+            # Mốc cũ là dự phòng. Chỉ ghi đè khi mốc mới có chất lượng cao hơn.
+            if new_source != "server_radar_ground_stop":
+                PARKED_FIRESTORE_SYNCED.add(sync_key)
+                return False
 
         payload = {
             "flightCode": old.get("flightCode") or doc_id,
@@ -413,7 +429,8 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "actualParkedAtMillis": int(entry.parked_at_millis),
             "actualParkedTime": _format_hhmm(entry.parked_at_millis),
             "actualParkedTimeFull": _format_hhmmss(entry.parked_at_millis),
-            "actualParkedSource": "server_radar_ground_stop",
+            "actualParkedSource": new_source,
+            "actualParkedConfidence": new_confidence,
             "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
             "radarState": entry.state,
             "radarGroundSpeedKt": entry.ground_speed_kt,
@@ -474,9 +491,13 @@ class FlightEntry:
     landed: bool = False
     # Mốc giờ tàu dừng hẳn/vào bến suy luận từ radar.
     # parked_candidate_since_ms là thời điểm bắt đầu thấy tín hiệu đứng yên;
-    # parked_at_millis chỉ được chốt sau khi tín hiệu ổn định PARKED_STABLE_MS.
+    # parked_at_millis chỉ được chốt sau khi tín hiệu ổn định PARKED_STABLE_MS
+    # hoặc khi FR24 mất tín hiệu hẳn lúc tàu đang trên mặt đất.
+    # parked_source giúp Firestore/web phân biệt mốc nào do tàu đứng yên ổn định
+    # (ground_stop) vs mốc dự phòng do mất tín hiệu (signal_lost).
     parked_at_millis: Optional[int] = None
     parked_candidate_since_ms: Optional[int] = None
+    parked_source: Optional[str] = None  # "ground_stop" | "signal_lost"
 
     def to_public(self, now_ms: int) -> dict:
         stale_seconds = (now_ms - self.updated_at) // 1000 if self.updated_at else None
@@ -509,7 +530,14 @@ class FlightEntry:
             "stopped_at_millis": self.parked_at_millis,
             "actual_parked_time": _format_hhmm(self.parked_at_millis),
             "actual_parked_time_full": _format_hhmmss(self.parked_at_millis),
-            "actual_parked_source": "radar_ground_stop" if self.parked_at_millis else None,
+            "actual_parked_source": (
+                ("radar_signal_lost" if self.parked_source == "signal_lost" else "radar_ground_stop")
+                if self.parked_at_millis else None
+            ),
+            "actual_parked_confidence": (
+                ("LOW" if self.parked_source == "signal_lost" else "HIGH")
+                if self.parked_at_millis else None
+            ),
             "parked_candidate_since_ms": self.parked_candidate_since_ms,
         }
 
@@ -1006,12 +1034,14 @@ def _process_match(
     parking_signal = _is_parked_on_ground(sensors["gs_kt"], sensors["distance_km"])
     parked_at_millis = old.parked_at_millis if old else None
     parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
+    parked_source = old.parked_source if old else None
 
     if old and old.state == "PARKED":
         # Sticky PARKED: đã dừng/vào bến rồi thì không revert về taxi/airborne.
         # Không tự gán now_ms/updated_at làm giờ dừng bến; chỉ giữ timestamp đã được xác nhận ổn định.
         state = "PARKED"
         parked_at_millis = old.parked_at_millis
+        parked_source = old.parked_source
     elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
         if parked_candidate_since_ms is None:
             parked_candidate_since_ms = now_ms
@@ -1019,6 +1049,7 @@ def _process_match(
             state = "PARKED"
             if parked_at_millis is None:
                 parked_at_millis = parked_candidate_since_ms
+                parked_source = "ground_stop"
         elif state == "PARKED":
             # _classify_state có thể trả PARKED ngay. Hạ xuống TAXIING cho tới khi ổn định.
             state = "TAXIING"
@@ -1065,6 +1096,7 @@ def _process_match(
                 landed=(state in ("LANDED", "TAXIING", "PARKED")),
                 parked_at_millis=parked_at_millis,
                 parked_candidate_since_ms=parked_candidate_since_ms,
+                parked_source=parked_source,
             )
 
         # Reset history khi sang FINAL (dynamics khác hẳn)
@@ -1116,6 +1148,7 @@ def _process_match(
         landed=(state in ("LANDED", "TAXIING", "PARKED")),
         parked_at_millis=parked_at_millis,
         parked_candidate_since_ms=parked_candidate_since_ms,
+        parked_source=parked_source,
     )
 
 
@@ -1147,11 +1180,30 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
 
     miss_count = old.miss_count + 1
 
-    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như kết thúc theo dõi,
-    # nhưng KHÔNG tự tạo giờ dừng bến. Nếu chưa từng thấy đứng yên ổn định,
-    # parked_at_millis phải để None để tránh ghi giờ giả vào Firestore.
+    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như tàu đã vào bến.
+    # Chọn parked_at_millis theo độ tin cậy giảm dần:
+    #   1) Mốc PARKED đã được _process_match xác nhận trước đó (hiếm gặp ở nhánh này).
+    #   2) parked_candidate_since_ms — thời điểm bắt đầu thấy tàu đứng yên gần sân bay.
+    #   3) old.updated_at — lần cuối FR24 còn track, dùng làm xấp xỉ "giờ mất tín hiệu".
+    # Mốc 2-3 có sai số vài phút nên đánh dấu source=signal_lost để web/Firestore biết
+    # đây là mốc dự phòng, vẫn cho phép ghi đè nếu sau đó server lấy được mốc tin cậy.
     if old.state in GROUND_ACTIVE_STATES and miss_count >= LANDED_MISS_TO_PARKED:
-        log.info("%s: %s + missed %d → PARKED (no confirmed parked_at)", code, old.state, miss_count)
+        if old.parked_at_millis:
+            parked_at = old.parked_at_millis
+            new_source = old.parked_source or "ground_stop"
+        elif old.parked_candidate_since_ms:
+            parked_at = old.parked_candidate_since_ms
+            new_source = "signal_lost"
+        elif old.updated_at:
+            parked_at = old.updated_at
+            new_source = "signal_lost"
+        else:
+            parked_at = now_ms
+            new_source = "signal_lost"
+        log.info(
+            "%s: %s + missed %d → PARKED (parked_at=%s, source=%s)",
+            code, old.state, miss_count, parked_at, new_source,
+        )
         return FlightEntry(
             state="PARKED",
             eta_millis=old.eta_millis or now_ms,
@@ -1168,8 +1220,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=True,
-            parked_at_millis=old.parked_at_millis,
+            parked_at_millis=parked_at,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
+            parked_source=new_source,
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
@@ -1193,6 +1246,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             landed=True,
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
+            parked_source=old.parked_source,
         )
 
     # Vượt ngưỡng drop
@@ -1217,6 +1271,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 landed=True,
                 parked_at_millis=old.parked_at_millis,
                 parked_candidate_since_ms=old.parked_candidate_since_ms,
+                parked_source=old.parked_source,
             )
         log.info("%s: %s + missed %d → LOST", code, old.state, miss_count)
         return FlightEntry(
@@ -1237,6 +1292,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             landed=False,
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
+            parked_source=old.parked_source,
         )
 
     # Chưa tới ngưỡng — chỉ bump counter, giữ data cũ
@@ -1258,6 +1314,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         landed=old.landed,
         parked_at_millis=old.parked_at_millis,
         parked_candidate_since_ms=old.parked_candidate_since_ms,
+        parked_source=old.parked_source,
     )
 
 
