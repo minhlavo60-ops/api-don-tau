@@ -223,6 +223,53 @@ def _format_hhmmss(ms: Optional[int]) -> Optional[str]:
     return datetime.fromtimestamp(ms / 1000, VN_TZ).strftime("%H:%M:%S")
 
 
+def _to_int_ms(value) -> Optional[int]:
+    """Ép timestamp từ Firestore/API về epoch milliseconds.
+
+    Hỗ trợ:
+      - int/float dạng milliseconds
+      - int/float dạng seconds
+      - chuỗi số
+      - Firestore Timestamp / datetime có method timestamp()
+
+    Hàm này dùng cho các luồng auto-finalize khi đọc lại mốc
+    actualParkedAtMillis / actualLandedAtMillis từ Firestore.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        n = int(value)
+        if n <= 0:
+            return None
+        # Epoch giây thường nhỏ hơn 1e12; app/server dùng milliseconds.
+        return n * 1000 if n < 1_000_000_000_000 else n
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            n = float(raw)
+            if n <= 0:
+                return None
+            n = int(n)
+            return n * 1000 if n < 1_000_000_000_000 else n
+        except Exception:
+            return None
+
+    try:
+        if hasattr(value, "timestamp"):
+            return int(value.timestamp() * 1000)
+    except Exception:
+        return None
+
+    return None
+
+
 def _date_key_from_millis(ms: Optional[int] = None) -> str:
     """Date key yyyy-mm-dd theo múi giờ Việt Nam."""
     dt = datetime.fromtimestamp((ms or int(time.time() * 1000)) / 1000, VN_TZ)
