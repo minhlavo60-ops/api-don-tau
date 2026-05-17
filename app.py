@@ -146,7 +146,14 @@ PARKED_DIST_KM = float(os.environ.get("PARKED_DIST_KM", "2.5"))
 # Tàu vẫn còn radar nhưng đứng yên đủ lâu cũng được coi như đã vào bến.
 # 4 phút = 240 s đủ để loại trừ dừng tạm trên taxiway và bắt kịp các trường hợp FR24 không tự tắt.
 PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
-LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "12"))
+# Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
+# 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
+LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
+# Khi FR24 mất tín hiệu, "giờ vào bến" = lần cuối còn radar + buffer ước lượng theo state.
+# Tàu đang TAXIING: còn 1-3 phút sẽ tới bến → +2 phút.
+# Tàu vừa LANDED (mới chạm bánh): còn nguyên đoạn taxi → +4 phút.
+TAXI_BUFFER_MS = int(os.environ.get("TAXI_BUFFER_MS", "120000"))
+LANDED_BUFFER_MS = int(os.environ.get("LANDED_BUFFER_MS", "240000"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
 
@@ -327,6 +334,7 @@ def _flight_plan_doc_to_schedule_payload(date_key: str, data: dict) -> dict:
             "origin": str(item.get("origin") or item.get("origin_iata") or _extract_origin_from_route(route) or "").upper(),
             "aircraft": str(item.get("aircraftType") or item.get("aircraft") or item.get("aircraft_type") or "").upper(),
             "route": route,
+            "stand": str(item.get("plannedStand") or item.get("stand") or item.get("planned_stand") or "").strip(),
             "date_key": date_key,
         }
     return result
@@ -393,8 +401,6 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         return False
 
     sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}"
-    if sync_key in PARKED_FIRESTORE_SYNCED:
-        return False
 
     # Phân biệt nguồn để dễ dọn rác và để web hiển thị mức tin cậy.
     new_source = (
@@ -407,13 +413,29 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
         snap = ref.get()
         old = snap.to_dict() or {} if snap.exists else {}
+        # User đã chốt tay (quick-complete hoặc full flow) hoặc auto-finalize web đã ghi:
+        # server không được phép ghi đè vì user là source-of-truth khi đã commit.
+        # Chỉ chấp nhận ghi nếu pickup chưa finalized hoặc finalize do chính server radar.
+        if old.get("finalized") and not old.get("autoFinalizedByRadar"):
+            PARKED_FIRESTORE_SYNCED.add(sync_key)
+            return False
         # Không ghi đè mốc đáng tin cậy đã có. Riêng dữ liệu cũ do web tự suy từ state PARKED
-        # ('radar_state_parked') hoặc mốc server dự phòng ('server_radar_signal_lost')
-        # thì cho phép ghi đè khi sau đó server có mốc ổn định thật ('server_radar_ground_stop').
+        # ('radar_state_parked'/'web_state_parked'/'web_state_landed_stale') hoặc mốc server
+        # dự phòng ('server_radar_signal_lost') thì cho phép ghi đè khi sau đó server có mốc
+        # ổn định thật ('server_radar_ground_stop').
+        old_picker_name = str(old.get("pickerName") or "").strip()
+        old_picker_uid = str(old.get("pickerUid") or "").strip()
+        old_stand = str(old.get("stand") or hint.get("stand") or "").strip()
+        should_auto_finalize = bool(old_picker_name and old_stand and not old.get("finalized") and not old.get("locked"))
         old_source = str(old.get("actualParkedSource") or "")
         has_old_parked_time = bool(old.get("actualParkedAtMillis") or old.get("actualParkedTime"))
-        overwritable_sources = {"radar_state_parked", "server_radar_signal_lost"}
-        if has_old_parked_time:
+        overwritable_sources = {
+            "radar_state_parked",
+            "web_state_parked",
+            "web_state_landed_stale",
+            "server_radar_signal_lost",
+        }
+        if has_old_parked_time and not should_auto_finalize:
             if old_source not in overwritable_sources:
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
@@ -422,13 +444,15 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
 
+        parked_hhmm = _format_hhmm(entry.parked_at_millis)
+        parked_hhmmss = _format_hhmmss(entry.parked_at_millis)
         payload = {
             "flightCode": old.get("flightCode") or doc_id,
             "displayFlightCode": old.get("displayFlightCode") or doc_id,
             "actualParkedByRadar": True,
             "actualParkedAtMillis": int(entry.parked_at_millis),
-            "actualParkedTime": _format_hhmm(entry.parked_at_millis),
-            "actualParkedTimeFull": _format_hhmmss(entry.parked_at_millis),
+            "actualParkedTime": parked_hhmm,
+            "actualParkedTimeFull": parked_hhmmss,
             "actualParkedSource": new_source,
             "actualParkedConfidence": new_confidence,
             "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
@@ -440,6 +464,45 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "lastUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
             "lastUpdatedByName": "server-radar",
         }
+
+        # Nếu chuyến đã có người đón + bến, server có thể chốt hồ sơ tự động bằng giờ vào bến radar.
+        # Nếu thiếu người đón/bến thì chỉ lưu actualParked*, để người dùng vào lịch sử sửa/chốt sau.
+        # Nếu bản trước đã được auto-finalize bằng mốc LOW do mất tín hiệu, khi có mốc HIGH hơn thì cập nhật lại giờ chốt.
+        should_refresh_auto_finalized_time = bool(old.get("autoFinalizedByRadar") and new_source == "server_radar_ground_stop")
+        if should_auto_finalize or should_refresh_auto_finalized_time:
+            payload.update({
+                "stand": old_stand,
+                "completedTime": parked_hhmm,
+                "completedTimeFull": parked_hhmmss,
+                "completedAtMillis": int(entry.parked_at_millis),
+                "completedDateIso": date_key,
+                "completedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "completedSource": new_source,
+                "finalized": True,
+                "locked": True,
+                "autoFinalizedByRadar": True,
+                "autoFinalizedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "lastUpdatedByUid": old_picker_uid or "server-radar",
+                "lastUpdatedByName": "server-radar",
+            })
+            if should_auto_finalize:
+                payload["history"] = firebase_firestore.ArrayUnion([{
+                    "action": "auto_finalize_by_radar",
+                    "pickerUid": old_picker_uid or None,
+                    "pickerName": old_picker_name,
+                    "stand": old_stand,
+                    "completedTime": parked_hhmm,
+                    "completedAtMillis": int(entry.parked_at_millis),
+                    "source": new_source,
+                    "confidence": new_confidence,
+                    "changedByUid": "server-radar",
+                    "changedByName": "server-radar",
+                    "changedAtMillis": int(time.time() * 1000),
+                }])
+        elif old_picker_name and not (old.get("finalized") or old.get("locked")):
+            payload["autoFinalizePending"] = True
+            payload["autoFinalizePendingReason"] = "missing_stand" if not old_stand else "missing_required_data"
+
         if hint.get("origin"):
             payload.setdefault("originIata", hint.get("origin"))
         if hint.get("aircraft"):
@@ -514,6 +577,10 @@ class FlightEntry:
             "longitude": self.longitude,
             "heading": self.heading,
             "updated_at": self.updated_at,
+            # Alias rõ ràng cho frontend: tránh frontend fallback sang serverNow khiến marker cũ tưởng như mới.
+            "updated_at_millis": self.updated_at,
+            "server_seen_millis": self.updated_at,
+            "last_seen_millis": self.updated_at,
             "stale_seconds": stale_seconds,
             "stale": stale_seconds is not None and stale_seconds > 600,
             "landed": self.state in ("LANDED", "TAXIING", "PARKED") or self.landed,
@@ -858,6 +925,7 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
                 "origin": str(hint.get("origin", "") or "").upper(),
                 "aircraft": str(hint.get("aircraft", "") or "").upper(),
                 "route": str(hint.get("route", "") or "").upper(),
+                "stand": str(hint.get("stand", "") or "").strip(),
                 "date_key": str(hint.get("date_key", "") or ""),
                 "registered_at_ms": now_ms,
             }
@@ -1192,10 +1260,13 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_at = old.parked_at_millis
             new_source = old.parked_source or "ground_stop"
         elif old.parked_candidate_since_ms:
+            # Đã thấy tàu đứng yên gần sân bay — đây chính là lúc bắt đầu vào bến.
             parked_at = old.parked_candidate_since_ms
             new_source = "signal_lost"
         elif old.updated_at:
-            parked_at = old.updated_at
+            # Mất tín hiệu khi tàu đang chạy. Cộng buffer ước lượng quãng còn lại.
+            buffer_ms = TAXI_BUFFER_MS if old.state == "TAXIING" else LANDED_BUFFER_MS
+            parked_at = min(old.updated_at + buffer_ms, now_ms)
             new_source = "signal_lost"
         else:
             parked_at = now_ms
@@ -1952,6 +2023,7 @@ def post_schedule():
                 "origin": item.get("origin") or item.get("origin_iata") or "",
                 "aircraft": item.get("aircraft") or item.get("aircraft_type") or "",
                 "route": item.get("route") or item.get("arrival_route") or "",
+                "stand": item.get("stand") or item.get("plannedStand") or item.get("planned_stand") or "",
                 "date_key": item.get("date_key") or "",
             }
 
