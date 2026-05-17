@@ -35,12 +35,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
+import base64
 import hmac
+import json
 import logging
 import math
 import os
 import threading
 import time
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore as firebase_firestore
+except Exception:  # firebase-admin là dependency tùy chọn; server vẫn chạy radar nếu chưa cấu hình.
+    firebase_admin = None
+    credentials = None
+    firebase_firestore = None
 
 app = Flask(__name__)
 CORS(
@@ -133,7 +143,7 @@ MISS_DROP_THRESHOLD = 5      # miss ≥ 5 → LOST (hoặc LANDED nếu trước
 # Không nên để bán kính quá rộng vì tàu có thể dừng tạm trên taxiway/runway.
 PARKED_GS_KT = int(os.environ.get("PARKED_GS_KT", "3"))
 PARKED_DIST_KM = float(os.environ.get("PARKED_DIST_KM", "2.5"))
-PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "90000"))
+PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "180000"))
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "12"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
@@ -143,6 +153,16 @@ TERMINAL_STATES = {"PARKED", "LOST"}
 # vài giờ để app còn xem được state PARKED kèm thông tin lịch bay.
 SCHEDULE_RETAIN_PAST_MS = int(os.environ.get("SCHEDULE_RETAIN_PAST_MS", str(6 * 3600 * 1000)))
 SCHEDULE_RETAIN_FUTURE_MS = int(os.environ.get("SCHEDULE_RETAIN_FUTURE_MS", str(36 * 3600 * 1000)))
+
+# Firestore online mode: server tự đọc lịch bay đã nạp và tự ghi mốc giờ dừng bến.
+# Bật mặc định. Nếu chưa cấu hình Firebase Admin, server vẫn chạy radar nhưng không tự ghi Firestore.
+FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "60000"))
+FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "1"))
+FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEAD", "1"))
+FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
 
 # ===========================================================
 # STATE TOÀN CỤC
@@ -161,6 +181,13 @@ LAST_POLL_MS: Optional[int] = None
 LAST_IMMEDIATE_POLL_MS = 0
 LAST_ERROR: Optional[str] = None
 LAST_POLL_DURATION_MS: Optional[int] = None
+LAST_FIRESTORE_SCHEDULE_SYNC_MS: Optional[int] = None
+LAST_FIRESTORE_SYNC_ERROR: Optional[str] = None
+LAST_FIRESTORE_PARKED_WRITE_MS: Optional[int] = None
+FIRESTORE_STATUS = "not_configured"
+FIRESTORE_SCHEDULE_DATES: list[str] = []
+PARKED_FIRESTORE_SYNCED: set[str] = set()
+_FIRESTORE_CLIENT = None
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -170,6 +197,260 @@ def _format_hhmm(ms: Optional[int]) -> Optional[str]:
     if not isinstance(ms, int) or ms <= 0:
         return None
     return datetime.fromtimestamp(ms / 1000, VN_TZ).strftime("%H:%M")
+
+
+def _format_hhmmss(ms: Optional[int]) -> Optional[str]:
+    """Format epoch milliseconds sang giờ Việt Nam HH:MM:SS."""
+    if not isinstance(ms, int) or ms <= 0:
+        return None
+    return datetime.fromtimestamp(ms / 1000, VN_TZ).strftime("%H:%M:%S")
+
+
+def _date_key_from_millis(ms: Optional[int] = None) -> str:
+    """Date key yyyy-mm-dd theo múi giờ Việt Nam."""
+    dt = datetime.fromtimestamp((ms or int(time.time() * 1000)) / 1000, VN_TZ)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _date_key_with_offset(days: int = 0, base_ms: Optional[int] = None) -> str:
+    """Date key VN với offset ngày, không cần import timedelta bằng cách cộng millis."""
+    base = base_ms or int(time.time() * 1000)
+    return _date_key_from_millis(base + days * 24 * 3600 * 1000)
+
+
+def _parse_sibt_to_millis(value, date_key: str) -> Optional[int]:
+    """Parse giờ lịch bay/SIBT từ Firestore flightPlans sang epoch ms VN."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and value > 0:
+        # Hỗ trợ cả epoch giây và milliseconds nếu app/server từng lưu dạng số.
+        raw = int(value)
+        return raw * 1000 if raw < 1_000_000_000_000 else raw
+    raw = str(value or "").strip()
+    if not raw or raw in ("--", "-", "N/A", "NA"):
+        return None
+    # Nhận 07:05, 7:05, 0705, 705.
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    hour = minute = None
+    if ":" in raw or "h" in raw.lower() or "." in raw:
+        import re
+        m = re.search(r"(\d{1,2})\s*[:h.]\s*(\d{1,2})", raw.lower())
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+    elif len(digits) == 3:
+        hour, minute = int(digits[:1]), int(digits[1:])
+    elif len(digits) == 4:
+        hour, minute = int(digits[:2]), int(digits[2:])
+    elif len(digits) in (1, 2):
+        hour, minute = int(digits), 0
+    if hour is None or minute is None or hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    try:
+        y, m, d = [int(part) for part in str(date_key).split("-")]
+        dt = datetime(y, m, d, hour, minute, 0, tzinfo=VN_TZ)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _extract_origin_from_route(route: str) -> str:
+    """Lấy origin từ route kiểu HAN-DAD-DAD-HAN hoặc SGN-DAD."""
+    raw = str(route or "").strip().upper()
+    if not raw:
+        return ""
+    first = raw.split("-")[0].strip()
+    return first if 2 <= len(first) <= 4 else ""
+
+
+def _init_firestore_client():
+    """Khởi tạo Firebase Admin SDK nếu có credentials. Trả về client hoặc None."""
+    global _FIRESTORE_CLIENT, FIRESTORE_STATUS, LAST_FIRESTORE_SYNC_ERROR
+    if _FIRESTORE_CLIENT is not None:
+        return _FIRESTORE_CLIENT
+    if not FIRESTORE_SYNC_ENABLED:
+        FIRESTORE_STATUS = "disabled"
+        return None
+    if firebase_admin is None or firebase_firestore is None:
+        FIRESTORE_STATUS = "missing_firebase_admin"
+        LAST_FIRESTORE_SYNC_ERROR = "Chưa cài firebase-admin trong requirements.txt"
+        return None
+    try:
+        if not firebase_admin._apps:
+            cred_obj = None
+            if FIREBASE_SERVICE_ACCOUNT_JSON:
+                cred_obj = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
+            elif FIREBASE_SERVICE_ACCOUNT_B64:
+                decoded = base64.b64decode(FIREBASE_SERVICE_ACCOUNT_B64).decode("utf-8")
+                cred_obj = credentials.Certificate(json.loads(decoded))
+            elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+                cred_obj = credentials.ApplicationDefault()
+            else:
+                # Trên Google Cloud có thể dùng ADC; trên Render thường cần JSON/B64.
+                cred_obj = credentials.ApplicationDefault()
+
+            options = {"projectId": FIRESTORE_PROJECT_ID} if FIRESTORE_PROJECT_ID else None
+            firebase_admin.initialize_app(cred_obj, options=options)
+        _FIRESTORE_CLIENT = firebase_firestore.client()
+        FIRESTORE_STATUS = "ready"
+        LAST_FIRESTORE_SYNC_ERROR = None
+        return _FIRESTORE_CLIENT
+    except Exception as e:
+        FIRESTORE_STATUS = "error"
+        LAST_FIRESTORE_SYNC_ERROR = str(e)
+        log.warning("Firestore init failed: %s", e)
+        return None
+
+
+def _flight_plan_doc_to_schedule_payload(date_key: str, data: dict) -> dict:
+    """Chuyển flightPlans/{date_key}.flights[] thành payload cho SCHEDULE_HINTS."""
+    result: dict = {}
+    flights = data.get("flights") if isinstance(data, dict) else None
+    if not isinstance(flights, list):
+        return result
+    for item in flights:
+        if not isinstance(item, dict):
+            continue
+        code = _clean_code(item.get("arrivalFlight") or item.get("code") or item.get("flight") or item.get("arrival_flight") or "")
+        if not code:
+            continue
+        sibt = (
+            item.get("sibt_millis") or item.get("sibtMillis") or
+            _parse_sibt_to_millis(item.get("sibt") or item.get("plannedTime") or item.get("time"), date_key)
+        )
+        if not sibt:
+            continue
+        route = str(item.get("arrivalRoute") or item.get("route") or item.get("arrival_route") or "").upper()
+        result[code] = {
+            "sibt_millis": sibt,
+            "origin": str(item.get("origin") or item.get("origin_iata") or _extract_origin_from_route(route) or "").upper(),
+            "aircraft": str(item.get("aircraftType") or item.get("aircraft") or item.get("aircraft_type") or "").upper(),
+            "route": route,
+            "date_key": date_key,
+        }
+    return result
+
+
+def _refresh_schedule_from_firestore(force: bool = False) -> int:
+    """Server tự đọc flightPlans trong Firestore để không phụ thuộc người dùng mở web."""
+    global LAST_FIRESTORE_SCHEDULE_SYNC_MS, LAST_FIRESTORE_SYNC_ERROR, FIRESTORE_SCHEDULE_DATES
+    now_ms = int(time.time() * 1000)
+    if not force and LAST_FIRESTORE_SCHEDULE_SYNC_MS and now_ms - LAST_FIRESTORE_SCHEDULE_SYNC_MS < FIRESTORE_SCHEDULE_SYNC_MS:
+        return 0
+    db = _init_firestore_client()
+    if db is None:
+        LAST_FIRESTORE_SCHEDULE_SYNC_MS = now_ms
+        return 0
+
+    date_keys = [
+        _date_key_with_offset(offset, now_ms)
+        for offset in range(-max(0, FIRESTORE_SCHEDULE_DAYS_BACK), max(0, FIRESTORE_SCHEDULE_DAYS_AHEAD) + 1)
+    ]
+    total_written = 0
+    loaded_dates: list[str] = []
+    try:
+        for date_key in date_keys:
+            snap = db.collection("flightPlans").document(date_key).get()
+            if not snap.exists:
+                continue
+            payload = _flight_plan_doc_to_schedule_payload(date_key, snap.to_dict() or {})
+            if not payload:
+                continue
+            written = _register_schedule(payload, now_ms)
+            codes = [_clean_code(c) for c in payload.keys() if _clean_code(c)]
+            with _lock:
+                QUEUE.update(codes)
+            total_written += written
+            loaded_dates.append(date_key)
+        LAST_FIRESTORE_SCHEDULE_SYNC_MS = now_ms
+        LAST_FIRESTORE_SYNC_ERROR = None
+        FIRESTORE_SCHEDULE_DATES = loaded_dates
+        if loaded_dates:
+            log.info("Firestore schedule sync: dates=%s registered=%d", ",".join(loaded_dates), total_written)
+        return total_written
+    except Exception as e:
+        LAST_FIRESTORE_SCHEDULE_SYNC_MS = now_ms
+        LAST_FIRESTORE_SYNC_ERROR = str(e)
+        log.warning("Firestore schedule sync failed: %s", e)
+        return 0
+
+
+def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> bool:
+    """Ghi giờ dừng bến vào pickups/{date}/flights/{code} bằng server, không cần web đang mở."""
+    global LAST_FIRESTORE_PARKED_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
+    if not entry or entry.state != "PARKED" or not entry.parked_at_millis:
+        return False
+    db = _init_firestore_client()
+    if db is None:
+        return False
+
+    with _lock:
+        hint = SCHEDULE_HINTS.get(code) or {}
+    date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(entry.parked_at_millis)
+    doc_id = _clean_code(code)
+    if not date_key or not doc_id:
+        return False
+
+    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}"
+    if sync_key in PARKED_FIRESTORE_SYNCED:
+        return False
+
+    try:
+        ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
+        snap = ref.get()
+        old = snap.to_dict() or {} if snap.exists else {}
+        # Không ghi đè mốc đáng tin cậy đã có. Riêng dữ liệu cũ do web tự suy từ state PARKED
+        # có source 'radar_state_parked' thì cho phép server ghi đè khi đã có mốc ổn định thật.
+        old_source = str(old.get("actualParkedSource") or "")
+        has_old_parked_time = bool(old.get("actualParkedAtMillis") or old.get("actualParkedTime"))
+        if has_old_parked_time and old_source != "radar_state_parked":
+            PARKED_FIRESTORE_SYNCED.add(sync_key)
+            return False
+
+        payload = {
+            "flightCode": old.get("flightCode") or doc_id,
+            "displayFlightCode": old.get("displayFlightCode") or doc_id,
+            "actualParkedByRadar": True,
+            "actualParkedAtMillis": int(entry.parked_at_millis),
+            "actualParkedTime": _format_hhmm(entry.parked_at_millis),
+            "actualParkedTimeFull": _format_hhmmss(entry.parked_at_millis),
+            "actualParkedSource": "server_radar_ground_stop",
+            "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "radarState": entry.state,
+            "radarGroundSpeedKt": entry.ground_speed_kt,
+            "radarDistanceKm": entry.distance_km,
+            "radarAltitudeFt": entry.altitude_ft,
+            "radarUpdatedAtMillis": entry.updated_at,
+            "lastUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "lastUpdatedByName": "server-radar",
+        }
+        if hint.get("origin"):
+            payload.setdefault("originIata", hint.get("origin"))
+        if hint.get("aircraft"):
+            payload.setdefault("aircraftType", hint.get("aircraft"))
+        ref.set(payload, merge=True)
+        PARKED_FIRESTORE_SYNCED.add(sync_key)
+        LAST_FIRESTORE_PARKED_WRITE_MS = int(time.time() * 1000)
+        LAST_FIRESTORE_SYNC_ERROR = None
+        log.info("Firestore parked write OK: %s/%s at %s", date_key, doc_id, payload["actualParkedTimeFull"])
+        return True
+    except Exception as e:
+        LAST_FIRESTORE_SYNC_ERROR = str(e)
+        log.warning("Firestore parked write failed %s/%s: %s", date_key, doc_id, e)
+        return False
+
+
+def _sync_parked_entries_to_firestore(entries: dict[str, FlightEntry]) -> int:
+    """Ghi mọi entry PARKED mới vào Firestore."""
+    if not entries:
+        return 0
+    written = 0
+    for code, entry in list(entries.items()):
+        try:
+            if _sync_single_parked_entry_to_firestore(code, entry):
+                written += 1
+        except Exception as e:
+            log.warning("Unexpected parked sync error for %s: %s", code, e)
+    return written
 
 
 @dataclass
@@ -227,7 +508,7 @@ class FlightEntry:
             "stand_arrival_millis": self.parked_at_millis,
             "stopped_at_millis": self.parked_at_millis,
             "actual_parked_time": _format_hhmm(self.parked_at_millis),
-            "actual_parked_time_full": _format_hhmm(self.parked_at_millis),
+            "actual_parked_time_full": _format_hhmmss(self.parked_at_millis),
             "actual_parked_source": "radar_ground_stop" if self.parked_at_millis else None,
             "parked_candidate_since_ms": self.parked_candidate_since_ms,
         }
@@ -728,8 +1009,9 @@ def _process_match(
 
     if old and old.state == "PARKED":
         # Sticky PARKED: đã dừng/vào bến rồi thì không revert về taxi/airborne.
+        # Không tự gán now_ms/updated_at làm giờ dừng bến; chỉ giữ timestamp đã được xác nhận ổn định.
         state = "PARKED"
-        parked_at_millis = old.parked_at_millis or old.updated_at or now_ms
+        parked_at_millis = old.parked_at_millis
     elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
         if parked_candidate_since_ms is None:
             parked_candidate_since_ms = now_ms
@@ -865,10 +1147,11 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
 
     miss_count = old.miss_count + 1
 
-    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như đã vào bến/dừng.
+    # Sau touchdown/taxi nếu FR24 mất track quá lâu thì coi như kết thúc theo dõi,
+    # nhưng KHÔNG tự tạo giờ dừng bến. Nếu chưa từng thấy đứng yên ổn định,
+    # parked_at_millis phải để None để tránh ghi giờ giả vào Firestore.
     if old.state in GROUND_ACTIVE_STATES and miss_count >= LANDED_MISS_TO_PARKED:
-        parked_at = old.parked_at_millis or old.parked_candidate_since_ms or now_ms
-        log.info("%s: %s + missed %d → PARKED (parked_at=%s)", code, old.state, miss_count, parked_at)
+        log.info("%s: %s + missed %d → PARKED (no confirmed parked_at)", code, old.state, miss_count)
         return FlightEntry(
             state="PARKED",
             eta_millis=old.eta_millis or now_ms,
@@ -885,7 +1168,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=True,
-            parked_at_millis=parked_at,
+            parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
         )
 
@@ -1265,6 +1548,9 @@ def _do_poll() -> None:
         len(flights), len(queue_snapshot), matched, len(drops), duration_ms,
     )
 
+    # Online mode: server tự ghi giờ tàu dừng bến vào Firestore, không cần web đang mở.
+    _sync_parked_entries_to_firestore(updates)
+
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
     global LAST_IMMEDIATE_POLL_MS, LAST_ERROR
@@ -1290,6 +1576,7 @@ def poll_loop() -> None:
     time.sleep(2)
     while True:
         try:
+            _refresh_schedule_from_firestore(force=False)
             _do_poll()
             _prune_old_schedule_hints()
         except Exception as e:
@@ -1356,6 +1643,11 @@ def build_etas_payload() -> dict:
             "schedule_count": len(SCHEDULE_HINTS),
             "queue_count": len(QUEUE),
             "tracked_count": len(TRACKED),
+            "firestore_status": FIRESTORE_STATUS,
+            "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
             "pid": os.getpid(),
             "flights": result,
         }
@@ -1376,7 +1668,106 @@ def health():
             "queue_count": len(QUEUE),
             "schedule_count": len(SCHEDULE_HINTS),
             "pid": os.getpid(),
+            "firestore_status": FIRESTORE_STATUS,
+            "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
         })
+
+
+
+@app.route("/api/firestore_sync", methods=["POST"])
+def firestore_sync_now():
+    """Ép server đọc lại flightPlans từ Firestore ngay. Dùng để debug/admin."""
+    if (err := require_api_key()):
+        return err
+    written = _refresh_schedule_from_firestore(force=True)
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        return jsonify({
+            "status": "success" if FIRESTORE_STATUS in ("ready", "disabled", "missing_firebase_admin") else "error",
+            "server_time_millis": now_ms,
+            "registered": written,
+            "firestore_status": FIRESTORE_STATUS,
+            "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
+            "queue_count": len(QUEUE),
+            "schedule_count": len(SCHEDULE_HINTS),
+            "tracked_count": len(TRACKED),
+            "pid": os.getpid(),
+        })
+
+@app.route("/api/cleanup_bad_parked_times", methods=["POST"])
+def cleanup_bad_parked_times():
+    """Xóa các mốc Dừng bến bị web cũ tự ghi nhầm.
+
+    Body tối thiểu: {"date_key":"2026-05-17"}
+    Mặc định chỉ xóa document có actualParkedSource == "radar_state_parked".
+    Có thể truyền thêm actual_parked_time để lọc hẹp, ví dụ "17:53".
+    """
+    if (err := require_api_key()):
+        return err
+    db = _init_firestore_client()
+    if db is None:
+        return jsonify({
+            "status": "error",
+            "message": "Firestore chưa sẵn sàng. Kiểm tra FIREBASE_SERVICE_ACCOUNT_JSON/B64.",
+            "firestore_status": FIRESTORE_STATUS,
+            "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+        }), 500
+
+    body = request.get_json(silent=True) or {}
+    date_key = str(body.get("date_key") or body.get("date") or "").strip()
+    source = str(body.get("source") or "radar_state_parked").strip()
+    exact_time = str(body.get("actual_parked_time") or body.get("time") or "").strip()
+    dry_run = bool(body.get("dry_run", False))
+    if not date_key:
+        return jsonify({"status": "error", "message": "Thiếu date_key, ví dụ 2026-05-17"}), 400
+
+    col = db.collection("pickups").document(date_key).collection("flights")
+    docs = list(col.stream())
+    matched = []
+    for snap in docs:
+        data = snap.to_dict() or {}
+        if source and str(data.get("actualParkedSource") or "") != source:
+            continue
+        if exact_time and str(data.get("actualParkedTime") or "") != exact_time:
+            continue
+        if not (data.get("actualParkedAtMillis") or data.get("actualParkedTime") or data.get("actualParkedSource")):
+            continue
+        matched.append(snap)
+
+    if not dry_run:
+        for snap in matched:
+            snap.reference.update({
+                "actualParkedByRadar": firebase_firestore.DELETE_FIELD,
+                "actualParkedAtMillis": firebase_firestore.DELETE_FIELD,
+                "actualParkedTime": firebase_firestore.DELETE_FIELD,
+                "actualParkedTimeFull": firebase_firestore.DELETE_FIELD,
+                "actualParkedSource": firebase_firestore.DELETE_FIELD,
+                "actualParkedUpdatedAt": firebase_firestore.DELETE_FIELD,
+                "radarState": firebase_firestore.DELETE_FIELD,
+                "radarGroundSpeedKt": firebase_firestore.DELETE_FIELD,
+                "radarDistanceKm": firebase_firestore.DELETE_FIELD,
+                "radarAltitudeFt": firebase_firestore.DELETE_FIELD,
+                "radarUpdatedAtMillis": firebase_firestore.DELETE_FIELD,
+                "lastUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "lastUpdatedByName": "server-cleanup",
+            })
+
+    return jsonify({
+        "status": "success",
+        "date_key": date_key,
+        "source": source,
+        "actual_parked_time": exact_time or None,
+        "dry_run": dry_run,
+        "matched": len(matched),
+        "updated": 0 if dry_run else len(matched),
+        "codes": [snap.id for snap in matched[:200]],
+    })
 
 
 
@@ -1431,6 +1822,7 @@ def scan_arrivals():
 def get_all_etas():
     if (err := require_api_key()):
         return err
+    _refresh_schedule_from_firestore(force=False)
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         codes = body.get("codes", []) or []
@@ -1640,6 +2032,8 @@ def _start_poller():
     t.start()
 
 
+# Khởi tạo Firestore sớm để log trạng thái ngay khi deploy. Poller vẫn sẽ retry nếu credentials chưa sẵn sàng.
+_init_firestore_client()
 _start_poller()
 
 
