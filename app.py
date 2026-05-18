@@ -1035,12 +1035,51 @@ def _code_aliases(value) -> set[str]:
                     aliases.add(prefix + stripped.zfill(pad))
 
     # Alias IATA ↔ ICAO cho các hãng VN phổ biến
-    airline_aliases = {
-        "VN": "HVN", "HVN": "VN",     # Vietnam Airlines
-        "VJ": "VJC", "VJC": "VJ",     # Vietjet
-        "QH": "BAV", "BAV": "QH",     # Bamboo
-        "VU": "VAG", "VAG": "VU",     # Vietravel
-        "BL": "PIC", "PIC": "BL",     # Pacific Airlines (cũ: Jetstar)
+       airline_aliases = {
+        # Việt Nam (6)
+        "VN": "HVN", "HVN": "VN",
+        "VJ": "VJC", "VJC": "VJ",
+        "QH": "BAV", "BAV": "QH",
+        "VU": "VAG", "VAG": "VU",
+        "BL": "PIC", "PIC": "BL",
+        "9G": "PQA", "PQA": "9G",      # Phú Quốc Airlines (Sun Group)
+        # Hàn Quốc (7)
+        "KE": "KAL", "KAL": "KE",
+        "OZ": "AAR", "AAR": "OZ",
+        "7C": "JJA", "JJA": "7C",
+        "LJ": "JNA", "JNA": "LJ",
+        "BX": "ABL", "ABL": "BX",
+        "RS": "ASV", "ASV": "RS",
+        "TW": "TWB", "TWB": "TW",
+        # Hong Kong / Macau (3)
+        "HX": "CRK", "CRK": "HX",
+        "UO": "HKE", "HKE": "UO",
+        "NX": "AMU", "AMU": "NX",
+        # Đài Loan (4)
+        "JX": "SJX", "SJX": "JX",
+        "CI": "CAL", "CAL": "CI",
+        "BR": "EVA", "EVA": "BR",
+        "IT": "TTW", "TTW": "IT",
+        # Thái Lan (3)
+        "FD": "AIQ", "AIQ": "FD",
+        "VZ": "TVJ", "TVJ": "VZ",
+        "WE": "THD", "THD": "WE",
+        # Malaysia / Singapore / Phil / Indo (8)
+        "AK": "AXM", "AXM": "AK",
+        "MH": "MAS", "MAS": "MH",
+        "OD": "BTK", "BTK": "OD",
+        "SQ": "SIA", "SIA": "SQ",
+        "TR": "TGW", "TGW": "TR",
+        "PR": "PAL", "PAL": "PR",
+        "5J": "CEB", "CEB": "5J",
+        "Z2": "APG", "APG": "Z2",
+        # Trung Đông (1)
+        "EK": "UAE", "UAE": "EK",
+        # Đông Dương lân cận (2)
+        "8M": "MMA", "MMA": "8M",
+        "K6": "KHV", "KHV": "K6",
+        # Trung Á — charter Kazakhstan (1)
+        "DV": "VSV", "VSV": "DV",
     }
     # Tạo alias cho mọi mã đã có trong set (kể cả leading-zero variants)
     for alias in list(aliases):
