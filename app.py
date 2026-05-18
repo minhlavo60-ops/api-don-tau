@@ -60,7 +60,7 @@ CORS(
             "https://nhat-ky-don.web.app",
             "https://nhat-ky-don.firebaseapp.com",
         ],
-        "allow_headers": ["X-API-Key", "Content-Type", "Cache-Control", "Pragma"],
+        "allow_headers": ["X-API-Key", "X-Import-Secret", "Content-Type", "Cache-Control", "Pragma"],
         "methods": ["GET", "POST", "OPTIONS"],
         "max_age": 3600,
     }},
@@ -178,6 +178,11 @@ FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEA
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
+
+# Gmail auto-import: mã bí mật Apps Script phải gửi trong header X-Import-Secret.
+# Khuyến nghị vẫn đặt biến môi trường GMAIL_IMPORT_SECRET trên Render bằng đúng mã dưới đây.
+GMAIL_IMPORT_SECRET = os.environ.get("GMAIL_IMPORT_SECRET", "dad_gmail_import_2026_pcQyLzatiQyeYTr2jZTnvcWgYOtOgXgY").strip()
+GMAIL_IMPORT_MIN_FLIGHTS = int(os.environ.get("GMAIL_IMPORT_MIN_FLIGHTS", "5"))
 
 # ===========================================================
 # STATE TOÀN CỤC
@@ -2447,6 +2452,389 @@ def get_eta(flight_code):
     })
     return jsonify(public)
 
+
+
+# ===========================================================
+# GMAIL AUTO IMPORT FLIGHT PLAN
+# ===========================================================
+
+def _compact_text(value) -> str:
+    """Gộp khoảng trắng/xuống dòng trong text lấy từ Word."""
+    import re
+    return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
+
+
+def _compact_flight_code(value) -> str:
+    """Giữ mã bay dạng gọn: 'VN 07187' -> 'VN07187'."""
+    return "".join(ch for ch in str(value or "").upper().strip() if ch.isalnum())
+
+
+def _canonical_flight_code(value) -> str:
+    """
+    Chuẩn hóa mã bay để khớp radar:
+      TW025  -> TW25
+      VN07187 -> VN7187
+      VJ0521 -> VJ521
+    """
+    import re
+    raw = _compact_flight_code(value)
+    m = re.match(r"^([A-Z]+)0+(\d+)$", raw)
+    if not m:
+        return raw
+    return f"{m.group(1)}{int(m.group(2))}"
+
+
+def _extract_date_key_from_texts(*texts) -> Optional[str]:
+    """Lấy ngày từ tên file/tiêu đề: 18.05.2026 hoặc 18.5.2026 -> 2026-05-18."""
+    import re
+    for text in texts:
+        raw = str(text or "")
+        m = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", raw)
+        if not m:
+            continue
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            dt = datetime(year, month, day, tzinfo=VN_TZ)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return None
+
+
+def _looks_like_flight_code(value: str) -> bool:
+    """Kiểm tra chuỗi có giống mã chuyến bay không."""
+    import re
+    return bool(re.match(r"^[A-Z]{1,4}\d{1,5}[A-Z]?$", str(value or "").strip().upper()))
+
+
+def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict]:
+    """
+    Parse file lịch bay .docx dạng bảng 12 cột:
+      STT · Loại tàu · Số hiệu đến · Đi · Tuyến đến · Tuyến đi · SIBT · SOBT · EIBT · ? · APRK · RMK
+
+    Có thêm lớp fallback nhẹ cho trường hợp Word bị merge cột hoặc có cột trống.
+    """
+    from io import BytesIO
+    from docx import Document
+
+    doc = Document(BytesIO(file_bytes))
+    flights: list[dict] = []
+    seen_codes: set[str] = set()
+
+    def add_row(cells: list[str]) -> None:
+        while cells and not cells[-1]:
+            cells.pop()
+        if len(cells) < 7:
+            return
+
+        joined_lower = " ".join(cells).lower()
+        if "số hiệu" in joined_lower or "sibt" in joined_lower or "aprk" in joined_lower:
+            return
+        if cells[0].strip().lower() in ("stt", "no", "n/o", "tt"):
+            return
+
+        # Format chuẩn của lịch AMO: 12 cột.
+        aircraft_type = cells[1] if len(cells) > 1 else ""
+        arrival_raw = cells[2] if len(cells) > 2 else ""
+        departure_raw = cells[3] if len(cells) > 3 else ""
+        arrival_route = cells[4] if len(cells) > 4 else ""
+        departure_route = cells[5] if len(cells) > 5 else ""
+        sibt = cells[6] if len(cells) > 6 else ""
+        sobt = cells[7] if len(cells) > 7 else ""
+        eibt = cells[8] if len(cells) > 8 else ""
+        planned_stand = cells[10] if len(cells) > 10 else (cells[9] if len(cells) > 9 else "")
+        rmk = cells[11] if len(cells) > 11 else ""
+
+        arrival_display = _compact_flight_code(arrival_raw)
+        arrival_code = _canonical_flight_code(arrival_raw)
+        departure_code = _canonical_flight_code(departure_raw)
+
+        # Fallback nếu cột bị lệch: tìm mã bay + giờ trong dòng.
+        if not _looks_like_flight_code(arrival_code):
+            possible_codes = [_canonical_flight_code(c) for c in cells if _looks_like_flight_code(_canonical_flight_code(c))]
+            possible_times = [c for c in cells if _parse_sibt_to_millis(c, date_key)]
+            if possible_codes and possible_times:
+                arrival_code = possible_codes[0]
+                arrival_display = _compact_flight_code(possible_codes[0])
+                sibt = possible_times[0]
+            else:
+                return
+
+        if not arrival_code or not _looks_like_flight_code(arrival_code):
+            return
+
+        sibt_ms = _parse_sibt_to_millis(sibt, date_key)
+        if not sibt_ms:
+            return
+
+        # Chống trùng mã trong cùng file.
+        if arrival_code in seen_codes:
+            return
+        seen_codes.add(arrival_code)
+
+        flights.append({
+            "stt": _compact_text(cells[0]) if cells else "",
+            "aircraftType": _compact_text(aircraft_type).upper(),
+            "arrivalFlight": arrival_code,
+            "displayArrivalFlight": arrival_display or arrival_code,
+            "rawArrivalFlight": arrival_display or arrival_code,
+            "departureFlight": departure_code,
+            "arrivalRoute": _compact_text(arrival_route).upper(),
+            "departureRoute": _compact_text(departure_route).upper(),
+            "sibt": _compact_text(sibt),
+            "sibtMillis": int(sibt_ms),
+            "plannedTime": _compact_text(sibt),
+            "sobt": _compact_text(sobt),
+            "eibt": _compact_text(eibt),
+            "plannedStand": _compact_text(planned_stand),
+            "stand": _compact_text(planned_stand),
+            "rmk": _compact_text(rmk),
+        })
+
+    for table in doc.tables:
+        for row in table.rows:
+            add_row([_compact_text(cell.text) for cell in row.cells])
+
+    flights.sort(key=lambda item: item.get("sibtMillis") or _parse_sibt_to_millis(item.get("sibt"), date_key) or 0)
+    return flights
+
+
+def _gmail_import_id(message_id: str, filename: str) -> str:
+    import hashlib
+    raw = f"{message_id}|{filename}".encode("utf-8", errors="ignore")
+    return hashlib.sha1(raw).hexdigest()
+
+
+@app.route("/api/import-flight-plan-from-gmail", methods=["POST", "OPTIONS"])
+def import_flight_plan_from_gmail():
+    """
+    Nhận file .docx từ Google Apps Script:
+    {
+      messageId, threadId, subject, from, receivedAt,
+      filename, mimeType, fileBase64
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not GMAIL_IMPORT_SECRET:
+        return jsonify({
+            "status": "error",
+            "message": "Server chưa cấu hình GMAIL_IMPORT_SECRET trên Render."
+        }), 500
+
+    incoming_secret = request.headers.get("X-Import-Secret", "")
+    if not hmac.compare_digest(str(incoming_secret), str(GMAIL_IMPORT_SECRET)):
+        return jsonify({
+            "status": "error",
+            "message": "Sai X-Import-Secret."
+        }), 401
+
+    body = request.get_json(silent=True) or {}
+
+    message_id = str(body.get("messageId") or "").strip()
+    thread_id = str(body.get("threadId") or "").strip()
+    subject = str(body.get("subject") or "").strip()
+    sender = str(body.get("from") or "").strip()
+    received_at = str(body.get("receivedAt") or "").strip()
+    filename = str(body.get("filename") or "").strip()
+    file_b64 = str(body.get("fileBase64") or "").strip()
+    force = bool(body.get("force"))
+
+    if not filename.lower().endswith(".docx"):
+        return jsonify({
+            "status": "error",
+            "message": "Chỉ hỗ trợ file .docx ở bước này.",
+            "filename": filename,
+        }), 400
+
+    date_key = str(body.get("dateKey") or "").strip() or _extract_date_key_from_texts(filename, subject)
+    if not date_key:
+        return jsonify({
+            "status": "error",
+            "message": "Không xác định được ngày lịch bay từ tên file hoặc tiêu đề.",
+            "filename": filename,
+            "subject": subject,
+        }), 400
+
+    if not file_b64:
+        return jsonify({
+            "status": "error",
+            "message": "Thiếu fileBase64."
+        }), 400
+
+    db = _init_firestore_client()
+    if db is None:
+        return jsonify({
+            "status": "error",
+            "message": "Firestore chưa sẵn sàng trên server.",
+            "firestore_status": FIRESTORE_STATUS,
+            "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+        }), 500
+
+    import_id = _gmail_import_id(message_id or subject, filename)
+    log_ref = db.collection("gmailImportLogs").document(import_id)
+
+    old_log = log_ref.get()
+    if old_log.exists and not force:
+        old_data = old_log.to_dict() or {}
+        if old_data.get("status") == "success":
+            return jsonify({
+                "status": "skipped",
+                "message": "Email/file này đã import thành công trước đó.",
+                "date_key": old_data.get("dateKey") or date_key,
+                "count": old_data.get("count"),
+                "filename": filename,
+                "import_id": import_id,
+            })
+
+    try:
+        file_bytes = base64.b64decode(file_b64)
+        flights = _parse_docx_flight_plan_bytes(file_bytes, date_key)
+    except Exception as e:
+        log.exception("Parse Gmail flight plan failed")
+        log_ref.set({
+            "status": "error",
+            "stage": "parse_docx",
+            "message": str(e),
+            "dateKey": date_key,
+            "filename": filename,
+            "subject": subject,
+            "from": sender,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Parse file .docx lỗi: {e}",
+            "date_key": date_key,
+            "filename": filename,
+        }), 422
+
+    if len(flights) < GMAIL_IMPORT_MIN_FLIGHTS and not force:
+        log_ref.set({
+            "status": "error",
+            "stage": "validate_count",
+            "message": f"Parse được quá ít chuyến: {len(flights)}",
+            "dateKey": date_key,
+            "count": len(flights),
+            "filename": filename,
+            "subject": subject,
+            "from": sender,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Parse được quá ít chuyến: {len(flights)}. Không ghi đè lịch.",
+            "date_key": date_key,
+            "count": len(flights),
+        }), 422
+
+    plan_ref = db.collection("flightPlans").document(date_key)
+    existing_snap = plan_ref.get()
+    existing_count = 0
+    if existing_snap.exists:
+        old_plan = existing_snap.to_dict() or {}
+        old_flights = old_plan.get("flights") if isinstance(old_plan.get("flights"), list) else []
+        existing_count = len(old_flights)
+
+    # Chống trường hợp file lỗi format làm ghi đè lịch đầy đủ bằng lịch rỗng/quá ít.
+    if existing_count >= 10 and len(flights) < existing_count * 0.6 and not force:
+        log_ref.set({
+            "status": "error",
+            "stage": "validate_existing_count",
+            "message": f"Lịch mới chỉ có {len(flights)} chuyến, thấp hơn nhiều so với lịch cũ {existing_count} chuyến.",
+            "dateKey": date_key,
+            "count": len(flights),
+            "existingCount": existing_count,
+            "filename": filename,
+            "subject": subject,
+            "from": sender,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Lịch mới chỉ có {len(flights)} chuyến, thấp hơn nhiều so với lịch cũ {existing_count} chuyến. Không ghi đè.",
+            "date_key": date_key,
+            "count": len(flights),
+            "existing_count": existing_count,
+        }), 422
+
+    payload = {
+        "flights": flights,
+        "count": len(flights),
+        "uploadedBy": "gmail-auto-import",
+        "uploadedByName": "Gmail tự động",
+        "uploadedAt": firebase_firestore.SERVER_TIMESTAMP,
+        "source": "gmail",
+        "sourceEmailSubject": subject,
+        "sourceEmailFrom": sender,
+        "sourceEmailReceivedAt": received_at,
+        "sourceMessageId": message_id,
+        "sourceThreadId": thread_id,
+        "sourceFilename": filename,
+        "importedAt": firebase_firestore.SERVER_TIMESTAMP,
+        "importId": import_id,
+    }
+
+    try:
+        plan_ref.set(payload, merge=True)
+
+        log_ref.set({
+            "status": "success",
+            "dateKey": date_key,
+            "count": len(flights),
+            "existingCount": existing_count,
+            "filename": filename,
+            "subject": subject,
+            "from": sender,
+            "messageId": message_id,
+            "threadId": thread_id,
+            "receivedAt": received_at,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        # Đăng ký ngay vào radar server, không cần chờ chu kỳ sync Firestore.
+        schedule_payload = _flight_plan_doc_to_schedule_payload(date_key, {"flights": flights})
+        registered = _register_schedule(schedule_payload)
+
+        codes = [_clean_code(code) for code in schedule_payload.keys() if _clean_code(code)]
+        if codes:
+            with _lock:
+                new_codes = [code for code in codes if code not in TRACKED]
+                QUEUE.update(codes)
+            if new_codes:
+                _try_immediate_poll(f"gmail import {date_key} new={len(new_codes)}")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Đã import {len(flights)} chuyến từ Gmail.",
+            "date_key": date_key,
+            "count": len(flights),
+            "registered": registered,
+            "filename": filename,
+            "import_id": import_id,
+            "firestore_status": FIRESTORE_STATUS,
+        })
+
+    except Exception as e:
+        log.exception("Write Gmail flight plan to Firestore failed")
+        log_ref.set({
+            "status": "error",
+            "stage": "write_firestore",
+            "message": str(e),
+            "dateKey": date_key,
+            "count": len(flights),
+            "filename": filename,
+            "subject": subject,
+            "from": sender,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Ghi Firestore lỗi: {e}",
+            "date_key": date_key,
+            "count": len(flights),
+        }), 500
 
 # ===========================================================
 # STARTUP
