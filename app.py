@@ -21,6 +21,10 @@ Pipeline:
         server vẫn trả state SCHEDULED + ETA = SIBT để app vẽ card.
       * `_process_match` không drop chuyến nếu code đã được lịch bay
         bảo lãnh (trusted=True).
+  - v2.4: 3-tầng phòng thủ chống auto-park nhầm khi tàu còn ở origin.
+      * Tầng 1: _classify_state gate by distance — on_ground+far → EN_ROUTE
+      * Tầng 2: _resolve_landed_at_millis gate by distance
+      * Tầng 3: Firestore write sanity check (lat/lng + SIBT window)
 
 API giữ tương thích bản cũ: /api/etas, /api/track/<code>, /api/get_eta/<code>.
 Response v2.3 thêm: scheduled, sibt_millis (cho state SCHEDULED) và actual_parked_* / in_block_* cho giờ tàu dừng bến.
@@ -164,6 +168,12 @@ TERMINAL_STATES = {"PARKED", "LOST"}
 # vài giờ để app còn xem được state PARKED kèm thông tin lịch bay.
 SCHEDULE_RETAIN_PAST_MS = int(os.environ.get("SCHEDULE_RETAIN_PAST_MS", str(6 * 3600 * 1000)))
 SCHEDULE_RETAIN_FUTURE_MS = int(os.environ.get("SCHEDULE_RETAIN_FUTURE_MS", str(36 * 3600 * 1000)))
+
+# Sanity check khi ghi Firestore (Tầng 3 phòng thủ):
+# Cấm ghi parked_at trước SIBT quá nhiều (tàu không thể hạ sớm 1 tiếng so với lịch).
+PARKED_SANITY_BEFORE_SIBT_MS = int(os.environ.get("PARKED_SANITY_BEFORE_SIBT_MS", str(60 * 60 * 1000)))
+# Cấm ghi parked_at sau SIBT quá xa (tàu delay không quá 12 tiếng — hết ca trực).
+PARKED_SANITY_AFTER_SIBT_MS = int(os.environ.get("PARKED_SANITY_AFTER_SIBT_MS", str(12 * 3600 * 1000)))
 
 # Firestore online mode: server tự đọc lịch bay đã nạp và tự ghi mốc giờ dừng bến.
 # Bật mặc định. Nếu chưa cấu hình Firebase Admin, server vẫn chạy radar nhưng không tự ghi Firestore.
@@ -331,6 +341,56 @@ def _extract_origin_from_route(route: str) -> str:
     return first if 2 <= len(first) <= 4 else ""
 
 
+# ===========================================================
+# HÌNH HỌC & VẬT LÝ (đưa lên đây để dùng được trong Firestore sanity check)
+# ===========================================================
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Khoảng cách great-circle giữa 2 điểm (km)."""
+    R = 6371.0
+    rlat1, rlng1, rlat2, rlng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+    dlat = rlat2 - rlat1
+    dlng = rlng2 - rlng1
+    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlng / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _physics_eta_ms(distance_km: Optional[float], gs_kt: Optional[int], now_ms: int) -> Optional[int]:
+    """ETA = distance / ground_speed + buffer descent 1 phút.
+
+    Không dùng được nếu thiếu data hoặc tốc độ quá thấp (taxi/đứng yên).
+    """
+    if distance_km is None or not gs_kt or gs_kt < 50:
+        return None
+    gs_kmh = gs_kt * 1.852
+    hours = distance_km / gs_kmh
+    eta_ms = now_ms + int(hours * 3600 * 1000)
+    if distance_km > 5:
+        eta_ms += 60_000  # buffer 1 phút cho descent/alignment cuối
+    return eta_ms
+
+
+# ===========================================================
+# GATE "TÀU Ở DAD" (Tầng phòng thủ chung)
+# ===========================================================
+
+def _is_at_dad_airport(dist_km: Optional[float]) -> bool:
+    """
+    GATE DUY NHẤT cho mọi state liên quan "đã tới DAD".
+
+    Trả True chỉ khi có lat/lng cụ thể và cách DAD <= FINAL_DIST_KM (20km).
+    Thiếu dữ liệu vị trí → False (fail-safe: không suy đoán).
+
+    Contract: bất kỳ logic nào suy luận "tàu đã hạ DAD" PHẢI gọi hàm này.
+    Vi phạm = bug sẽ tự lộ qua các tầng phòng thủ ở Firestore write.
+    """
+    return dist_km is not None and dist_km <= FINAL_DIST_KM
+
+
+# ===========================================================
+# FIRESTORE
+# ===========================================================
+
 def _init_firestore_client():
     """Khởi tạo Firebase Admin SDK nếu có credentials. Trả về client hoặc None."""
     global _FIRESTORE_CLIENT, FIRESTORE_STATUS, LAST_FIRESTORE_SYNC_ERROR
@@ -455,6 +515,49 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
 
     with _lock:
         hint = SCHEDULE_HINTS.get(code) or {}
+
+    # ====== TẦNG 3 SANITY GATES ======
+    # Nếu logic upstream (Tầng 1 + 2) có bug regression, tầng này vẫn từ chối ghi sai.
+    # Mọi refuse ở đây đều log ERROR để có thể trace ngược lên nguyên nhân.
+
+    # Gate A: bằng chứng vị trí. parked_at chỉ có nghĩa khi tàu thật sự ở DAD.
+    if entry.latitude is None or entry.longitude is None:
+        log.error(
+            "REFUSE parked write %s: missing lat/lng (state=%s parked_at=%s source=%s)",
+            code, entry.state, entry.parked_at_millis, entry.parked_source,
+        )
+        return False
+    try:
+        plane_dist = _haversine_km(float(entry.latitude), float(entry.longitude), DAD_LAT, DAD_LNG)
+    except (TypeError, ValueError):
+        log.error("REFUSE parked write %s: lat/lng invalid (%s, %s)", code, entry.latitude, entry.longitude)
+        return False
+    if plane_dist > FINAL_DIST_KM:
+        log.error(
+            "REFUSE parked write %s: %.1f km from DAD > %s km (lat=%s lng=%s source=%s)",
+            code, plane_dist, FINAL_DIST_KM, entry.latitude, entry.longitude, entry.parked_source,
+        )
+        return False
+
+    # Gate B: kiểm tra với SIBT. Tàu không thể vào bến trước SIBT > 60 phút hoặc sau SIBT > 12 giờ.
+    sibt = hint.get("sibt_millis")
+    if isinstance(sibt, int):
+        if entry.parked_at_millis < sibt - PARKED_SANITY_BEFORE_SIBT_MS:
+            log.error(
+                "REFUSE parked write %s: parked_at=%s is %dmin before SIBT=%s",
+                code, entry.parked_at_millis,
+                (sibt - entry.parked_at_millis) // 60000, sibt,
+            )
+            return False
+        if entry.parked_at_millis > sibt + PARKED_SANITY_AFTER_SIBT_MS:
+            log.error(
+                "REFUSE parked write %s: parked_at=%s is %dh after SIBT=%s",
+                code, entry.parked_at_millis,
+                (entry.parked_at_millis - sibt) // (3600_000), sibt,
+            )
+            return False
+    # ====================================================================
+
     date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(entry.parked_at_millis)
     doc_id = _clean_code(code)
     if not date_key or not doc_id:
@@ -846,55 +949,48 @@ def _resolve_landed_at_millis(
     now_ms: int,
     real_arrival_ms: Optional[int] = None,
     source: str = "radar_ground",
+    dist_km: Optional[float] = None,
 ) -> tuple[Optional[int], Optional[str]]:
-    """Giữ mốc hạ cánh đầu tiên.
+    """Giữ mốc hạ cánh đầu tiên — TẦNG 2 phòng thủ.
 
     Khi state chuyển sang LANDED/TAXIING/PARKED, đây là mốc "tàu vừa hạ cánh"
     để frontend/server dùng làm dự phòng: giờ vào bến = landed_at + 3 phút.
+
+    Cổng vị trí: nếu không có bằng chứng tàu ở DAD (<20km), KHÔNG ghi mốc.
+    Tránh trường hợp _classify_state lọt qua TAXIING cho tàu ở origin.
     """
     if old and old.landed_at_millis:
         return old.landed_at_millis, old.landed_source or source
     if state not in ("LANDED", "TAXIING", "PARKED"):
         return (old.landed_at_millis if old else None), (old.landed_source if old else None)
+    # real_arrival từ FR24 là sự kiện touchdown được FR24 xác nhận. Vẫn cần bằng chứng vị trí.
     if real_arrival_ms and 0 < int(real_arrival_ms) <= now_ms + 10 * 60 * 1000:
-        return int(real_arrival_ms), "real_arrival"
+        if _is_at_dad_airport(dist_km):
+            return int(real_arrival_ms), "real_arrival"
+        log.warning(
+            "Refuse landed_at via real_arrival for state=%s: dist=%s km not at DAD",
+            state, dist_km,
+        )
+        return (old.landed_at_millis if old else None), (old.landed_source if old else None)
+    if not _is_at_dad_airport(dist_km):
+        log.warning(
+            "Refuse landed_at: dist=%s km > %s (state=%s source=%s)",
+            dist_km, FINAL_DIST_KM, state, source,
+        )
+        return (old.landed_at_millis if old else None), (old.landed_source if old else None)
     return int(now_ms), source
 
+
 def _fallback_parked_from_landing(landed_at_millis: Optional[int], now_ms: int) -> Optional[int]:
-    """Trả về mốc vào bến dự phòng = hạ cánh + 3 phút nếu đã tới hạn."""
+    """Trả về mốc vào bến dự phòng = hạ cánh + 3 phút nếu đã tới hạn.
+
+    Hàm này tin landed_at_millis vô điều kiện — vì vậy upstream (Tầng 1 + 2)
+    PHẢI đảm bảo landed_at_millis chỉ được set khi tàu thật sự ở DAD.
+    """
     if not landed_at_millis:
         return None
     fallback = int(landed_at_millis) + LANDING_TO_PARK_FALLBACK_MS
     return fallback if now_ms >= fallback else None
-
-
-# ===========================================================
-# HÌNH HỌC & VẬT LÝ
-# ===========================================================
-
-def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Khoảng cách great-circle giữa 2 điểm (km)."""
-    R = 6371.0
-    rlat1, rlng1, rlat2, rlng2 = map(math.radians, [lat1, lng1, lat2, lng2])
-    dlat = rlat2 - rlat1
-    dlng = rlng2 - rlng1
-    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlng / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _physics_eta_ms(distance_km: Optional[float], gs_kt: Optional[int], now_ms: int) -> Optional[int]:
-    """ETA = distance / ground_speed + buffer descent 1 phút.
-
-    Không dùng được nếu thiếu data hoặc tốc độ quá thấp (taxi/đứng yên).
-    """
-    if distance_km is None or not gs_kt or gs_kt < 50:
-        return None
-    gs_kmh = gs_kt * 1.852
-    hours = distance_km / gs_kmh
-    eta_ms = now_ms + int(hours * 3600 * 1000)
-    if distance_km > 5:
-        eta_ms += 60_000  # buffer 1 phút cho descent/alignment cuối
-    return eta_ms
 
 
 # ===========================================================
@@ -917,21 +1013,37 @@ def _classify_state(
     fr24_live: bool,
     now_ms: int,
 ) -> str:
-    # Sau touchdown vẫn tiếp tục theo dõi. Không dùng LANDED làm state kết thúc nữa.
-    if on_ground:
-        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "TAXIING"
+    """TẦNG 1 phòng thủ: phân loại trạng thái có check vị trí.
 
+    Tàu trên mặt đất nhưng còn xa DAD → đang ở origin/sân khác → vẫn EN_ROUTE.
+    Chỉ chuyển sang TAXIING/LANDED/PARKED khi có bằng chứng vị trí gần DAD
+    (hoặc _is_parked_on_ground = đứng yên cực gần sân, 2.5km).
+    """
+    at_dad = _is_at_dad_airport(dist_km)
+    parked_signal = _is_parked_on_ground(gs_kt, dist_km)
+
+    # On-ground nhưng xa DAD = đang ở origin/sân khác. KHÔNG được coi là hạ DAD.
+    if on_ground and not at_dad and not parked_signal:
+        return "EN_ROUTE"
+    if on_ground:
+        return "PARKED" if parked_signal else "TAXIING"
+
+    # FR24 báo real_arrival nhưng tàu còn xa → cache stale, không tin.
     if real_arrival_ms is not None and real_arrival_ms <= now_ms:
-        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "LANDED"
+        if not at_dad and not parked_signal:
+            return "EN_ROUTE"
+        return "PARKED" if parked_signal else "LANDED"
 
     if not fr24_live:
-        # FR24 có thể tắt live ngay sau touchdown. Chưa xem là PARKED nếu không có speed thấp.
-        return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "LANDED"
+        # Mất tín hiệu FR24. Chỉ coi là hạ cánh nếu vị trí cuối cùng ở DAD.
+        if not at_dad and not parked_signal:
+            return "EN_ROUTE"
+        return "PARKED" if parked_signal else "LANDED"
 
-    # Physical detection phòng khi on_ground không ổn định
-    if alt_ft is not None and gs_kt is not None:
+    # Physical detection: alt thấp + speed thấp → vừa touchdown. Cần ở gần DAD.
+    if alt_ft is not None and gs_kt is not None and at_dad:
         if alt_ft <= DAD_FIELD_ELEV_FT + TOUCHDOWN_ALT_AGL_FT and gs_kt < TOUCHDOWN_GS_KT:
-            return "PARKED" if _is_parked_on_ground(gs_kt, dist_km) else "TAXIING"
+            return "PARKED" if parked_signal else "TAXIING"
 
     # Thiếu data → mặc định EN_ROUTE để app vẫn nhận ETA từ FR24
     if alt_ft is None or dist_km is None:
@@ -1404,7 +1516,10 @@ def _process_match(
     parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
     parked_source = old.parked_source if old else None
     landed_at_millis, landed_source = _resolve_landed_at_millis(
-        state, old, now_ms, real_arrival_ms=real_arrival_ms, source="radar_ground"
+        state, old, now_ms,
+        real_arrival_ms=real_arrival_ms,
+        source="radar_ground",
+        dist_km=sensors["distance_km"],
     )
 
     if old and old.state == "PARKED":
@@ -1430,6 +1545,8 @@ def _process_match(
     # Lớp dự phòng đơn giản theo yêu cầu nghiệp vụ:
     # tàu chuyển xanh/hạ cánh -> lưu landed_at; nếu sau 3 phút chưa có PARKED tốt hơn
     # thì tự coi giờ vào bến = landed_at + 3 phút.
+    # CHÚ Ý: Tầng 2 (_resolve_landed_at_millis) đảm bảo landed_at chỉ được set khi tàu ở DAD,
+    # nên fallback này tự động an toàn — không thể trigger cho tàu ở origin.
     landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms)
     if parked_at_millis is None and landing_fallback_parked:
         parked_at_millis = landing_fallback_parked
