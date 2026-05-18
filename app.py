@@ -1034,8 +1034,10 @@ def _code_aliases(value) -> set[str]:
                 if len(stripped) < pad:
                     aliases.add(prefix + stripped.zfill(pad))
 
-    # Alias IATA ↔ ICAO cho các hãng VN phổ biến
-       airline_aliases = {
+    # Alias IATA ↔ ICAO. Phải đồng bộ với pairs trong flightCodeAliases() ở index.html.
+    # Thiếu ở bất kỳ đầu nào → server không match được callsign FR24 với mã lịch bay
+    # → state SCHEDULED → map client filter loại bỏ → tàu chỉ hiện trong list.
+    airline_aliases = {
         # Việt Nam (6)
         "VN": "HVN", "HVN": "VN",
         "VJ": "VJC", "VJC": "VJ",
