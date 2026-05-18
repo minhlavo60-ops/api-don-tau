@@ -168,13 +168,18 @@ SCHEDULE_RETAIN_FUTURE_MS = int(os.environ.get("SCHEDULE_RETAIN_FUTURE_MS", str(
 # Firestore online mode: server tự đọc lịch bay đã nạp và tự ghi mốc giờ dừng bến.
 # Bật mặc định. Nếu chưa cấu hình Firebase Admin, server vẫn chạy radar nhưng không tự ghi Firestore.
 FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
-FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "60000"))
+FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "900000"))  # 15 phút để giảm Firestore reads
 # Fallback nghiệp vụ: nếu một chuyến đã có người đón nhưng radar không sinh PARKED,
 # sau SIBT một khoảng an toàn server sẽ chốt bằng giờ lịch để hồ sơ không treo mãi.
 SCHEDULE_FALLBACK_FINALIZE_GRACE_MS = int(os.environ.get("SCHEDULE_FALLBACK_FINALIZE_GRACE_MS", str(30 * 60 * 1000)))
-FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS", "60000"))
-FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "1"))
+FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS", "600000"))  # 10 phút
+FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "0"))
 FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEAD", "1"))
+
+# Tiết kiệm quota FlightRadar/API: không gọi radar cho chuyến còn quá xa giờ lịch.
+# App vẫn thấy chuyến ở trạng thái SCHEDULED; server chỉ bắt đầu poll khi gần SIBT.
+RADAR_POLL_BEFORE_SIBT_MS = int(os.environ.get("RADAR_POLL_BEFORE_SIBT_MS", str(90 * 60 * 1000)))
+RADAR_POLL_AFTER_SIBT_MS = int(os.environ.get("RADAR_POLL_AFTER_SIBT_MS", str(6 * 3600 * 1000)))
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
@@ -1879,18 +1884,79 @@ def _safe_get_details(fr_api, flight):
         return None
 
 
+def _should_poll_code_now(code: str, old: Optional[FlightEntry], now_ms: int) -> bool:
+    """Có nên gọi FlightRadar cho mã này trong chu kỳ hiện tại không.
+
+    Mục tiêu: tiết kiệm quota. Chuyến còn quá xa SIBT chỉ giữ SCHEDULED,
+    không gọi FR24 details. Khi đã từng có live/đang taxi/đang final thì tiếp tục bám
+    tới khi PARKED/LOST để server vẫn tự chốt giờ vào bến nếu app đã tắt.
+    """
+    if old and old.state in TERMINAL_STATES:
+        return False
+
+    if old and old.state in {"EN_ROUTE", "APPROACH", "FINAL", "LANDED", "TAXIING"}:
+        return True
+
+    with _lock:
+        hint = SCHEDULE_HINTS.get(code) or {}
+    sibt = hint.get("sibt_millis")
+    if isinstance(sibt, int):
+        if now_ms < sibt - RADAR_POLL_BEFORE_SIBT_MS:
+            return False
+        if now_ms > sibt + RADAR_POLL_AFTER_SIBT_MS and not old:
+            return False
+
+    # Mã không có lịch/SIBT thường là do người dùng track tay: vẫn cho poll.
+    return True
+
+
 def _do_poll() -> None:
-    """1 chu kỳ poll: scan bounds + parallel get_flight_details + update TRACKED."""
+    """1 chu kỳ poll: scan bounds + parallel get_flight_details + update TRACKED.
+
+    Tối ưu quota:
+      - Nếu mọi chuyến còn xa SIBT, không gọi FlightRadar; chỉ giữ SCHEDULED.
+      - Chỉ poll các mã đã tới cửa thời gian hoặc đã từng live/đang taxi/final.
+      - Firestore chỉ ghi khi server chốt PARKED/fallback, không ghi vị trí/ETA từng phút.
+    """
     global LAST_POLL_MS, LAST_ERROR, LAST_POLL_DURATION_MS
 
     started = time.time()
+    now_ms = int(started * 1000)
 
     with _lock:
         queue_snapshot = set(QUEUE)
+        old_by_code = {code: TRACKED.get(code) for code in queue_snapshot}
 
     if not queue_snapshot:
-        LAST_POLL_MS = int(started * 1000)
+        LAST_POLL_MS = now_ms
         LAST_POLL_DURATION_MS = 0
+        # Vẫn chạy fallback định kỳ để không treo hồ sơ nếu có dữ liệu pickup/lịch.
+        _sync_overdue_schedule_claims_to_firestore(now_ms)
+        return
+
+    pollable_snapshot = {
+        code for code in queue_snapshot
+        if _should_poll_code_now(code, old_by_code.get(code), now_ms)
+    }
+
+    # Nếu chưa có chuyến nào tới cửa radar, không gọi FlightRadar.
+    if not pollable_snapshot:
+        updates = {}
+        with _lock:
+            for code in queue_snapshot:
+                entry = _process_miss(code, TRACKED.get(code), now_ms)
+                if entry is not None:
+                    updates[code] = entry
+            for code, entry in updates.items():
+                TRACKED[code] = entry
+            LAST_POLL_MS = now_ms
+            LAST_ERROR = None
+        LAST_POLL_DURATION_MS = int((time.time() - started) * 1000)
+        log.info(
+            "Poll skipped FR24: queue=%d, pollable=0, scheduled_updates=%d, took=%dms",
+            len(queue_snapshot), len(updates), LAST_POLL_DURATION_MS,
+        )
+        _sync_overdue_schedule_claims_to_firestore(now_ms)
         return
 
     fr_api = FlightRadar24API()
@@ -1899,7 +1965,7 @@ def _do_poll() -> None:
     # Match codes ổn định. Không dùng trực tiếp number/callsign làm key,
     # vì FR24 có lúc trả "VJ 962", có lúc "VJ962", có lúc callsign khác.
     queue_by_norm = {}
-    for code in queue_snapshot:
+    for code in pollable_snapshot:
         for alias in _code_aliases(code):
             queue_by_norm[alias] = code
 
@@ -1907,7 +1973,6 @@ def _do_poll() -> None:
     for f in flights:
         number_raw = getattr(f, "number", None)
         callsign_raw = getattr(f, "callsign", None)
-        dest = (getattr(f, "destination_airport_iata", None) or "").upper()
         # KHÔNG skip khi dest khác DAD ở đây — _process_match sẽ check với trusted=True.
         # FR24 đôi khi cache stale destination khi tàu vừa khởi hành.
 
@@ -1921,7 +1986,7 @@ def _do_poll() -> None:
                 targets[requested_code] = f
                 break
 
-    # Parallel fetch details (5 worker, timeout 8s/call)
+    # Parallel fetch details (5 worker, timeout 8s/call) — chỉ cho mã đã tới cửa poll.
     details_map = {}
     if targets:
         with ThreadPoolExecutor(max_workers=DETAIL_POOL_SIZE) as ex:
@@ -1946,6 +2011,14 @@ def _do_poll() -> None:
     with _lock:
         for code in queue_snapshot:
             old = TRACKED.get(code)
+
+            if code not in pollable_snapshot:
+                # Chuyến còn xa: giữ SCHEDULED/entry cũ, không tăng miss live.
+                new_entry = _process_miss(code, old, now_ms)
+                if new_entry is not None:
+                    updates[code] = new_entry
+                continue
+
             if code in targets:
                 # trusted=True: code đã trong QUEUE (do user/lịch bay đẩy lên).
                 # Không drop dù FR24 trả dest != DAD vì FR24 hay cache stale.
@@ -1970,18 +2043,17 @@ def _do_poll() -> None:
     duration_ms = int((time.time() - started) * 1000)
     LAST_POLL_DURATION_MS = duration_ms
 
-    matched = sum(1 for c in queue_snapshot
+    matched = sum(1 for c in pollable_snapshot
                   if c in updates and updates[c].state not in ("LOST",))
     log.info(
-        "Poll: bounds=%d, queue=%d, matched=%d, drops=%d, took=%dms",
-        len(flights), len(queue_snapshot), matched, len(drops), duration_ms,
+        "Poll: bounds=%d, queue=%d, pollable=%d, matched=%d, drops=%d, took=%dms",
+        len(flights), len(queue_snapshot), len(pollable_snapshot), matched, len(drops), duration_ms,
     )
 
     # Online mode: server tự ghi giờ tàu dừng bến vào Firestore, không cần web đang mở.
     _sync_parked_entries_to_firestore(updates)
     # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
     _sync_overdue_schedule_claims_to_firestore(now_ms)
-
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
     global LAST_IMMEDIATE_POLL_MS, LAST_ERROR
@@ -2341,7 +2413,7 @@ def post_schedule():
             new_codes = [c for c in codes if c not in TRACKED]
             QUEUE.update(codes)
         if new_codes:
-            _try_immediate_poll(f"schedule new={len(new_codes)}")
+            log.info("Schedule registered new=%d; immediate poll disabled to save quota", len(new_codes))
 
     now_ms = int(time.time() * 1000)
     with _lock:
@@ -2803,7 +2875,7 @@ def import_flight_plan_from_gmail():
                 new_codes = [code for code in codes if code not in TRACKED]
                 QUEUE.update(codes)
             if new_codes:
-                _try_immediate_poll(f"gmail import {date_key} new={len(new_codes)}")
+                log.info("Gmail import registered new=%d; immediate poll disabled to save quota", len(new_codes))
 
         return jsonify({
             "status": "success",
