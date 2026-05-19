@@ -76,10 +76,10 @@ log = logging.getLogger(__name__)
 # CẤU HÌNH
 # ===========================================================
 
-ETA_API_KEY = os.environ.get(
-    "ETA_API_KEY",
-    "0982e7c09397ca3ed579775a9a29ff208a1715d0526fbb65b67a61c1cb126923",
-)
+# Đọc thuần từ env. Không fallback hardcode để tránh key bị lộ qua source code.
+# Set bằng: Render Dashboard → Service → Environment → ETA_API_KEY = <key>
+# Nếu env trống → require_api_key() trả 500, app từ chối phục vụ (an toàn).
+ETA_API_KEY = os.environ.get("ETA_API_KEY", "")
 
 # Bounds bao quanh các route đến DAD (north,south,west,east).
 # Mở rộng đông tới 123° để bắt route từ Manila/Đài Loan, nam tới 1°
