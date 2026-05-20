@@ -163,6 +163,15 @@ LANDED_BUFFER_MS = int(os.environ.get("LANDED_BUFFER_MS", "180000"))
 GROUND_ACTIVE_STATES = {"LANDED", "TAXIING"}
 TERMINAL_STATES = {"PARKED", "LOST"}
 
+# Không giữ trạng thái kết thúc trong RAM quá lâu.
+# Lịch sử đúng đã nằm ở Firestore; nếu giữ PARKED nhiều giờ, số hiệu lặp hằng ngày
+# như VJ636/9G2966 sẽ bị dính state "Vào bến" của chuyến cũ khi chuyến mới đang bay.
+TRACKED_TERMINAL_RETAIN_MS = int(os.environ.get("TRACKED_TERMINAL_RETAIN_MS", str(2 * 3600 * 1000)))
+
+# Khi một mã đã PARKED nhưng FR24 lại thấy mã đó đang bay/ở xa DAD sau một khoảng đủ dài,
+# coi đó là chuyến mới cùng số hiệu và reset state cũ.
+PARKED_REUSE_RESET_MS = int(os.environ.get("PARKED_REUSE_RESET_MS", str(45 * 60 * 1000)))
+
 # Lịch bay: giữ mã trong SCHEDULE_HINTS bao lâu sau SIBT trước khi prune.
 # Sau khi tàu thực sự hạ cánh, FR24 sẽ chiếm ưu tiên; sau đó vẫn giữ thêm
 # vài giờ để app còn xem được state PARKED kèm thông tin lịch bay.
@@ -181,7 +190,8 @@ FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip(
 FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "60000"))
 # Fallback nghiệp vụ: nếu một chuyến đã có người đón nhưng radar không sinh PARKED,
 # sau SIBT một khoảng an toàn server sẽ chốt bằng giờ lịch để hồ sơ không treo mãi.
-SCHEDULE_FALLBACK_FINALIZE_GRACE_MS = int(os.environ.get("SCHEDULE_FALLBACK_FINALIZE_GRACE_MS", str(30 * 60 * 1000)))
+# Để ổn định khi giao ngày/delay muộn, mặc định chờ 90 phút thay vì 30 phút.
+SCHEDULE_FALLBACK_FINALIZE_GRACE_MS = int(os.environ.get("SCHEDULE_FALLBACK_FINALIZE_GRACE_MS", str(90 * 60 * 1000)))
 FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS", "60000"))
 FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "1"))
 FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEAD", "1"))
@@ -207,6 +217,9 @@ QUEUE: set = set()
 TRACKED: dict = {}
 # code (normalized) → {sibt_millis, origin, aircraft, route, date_key, registered_at_ms}
 SCHEDULE_HINTS: dict = {}
+# code (normalized) → list[{sibt_millis, origin, aircraft, route, date_key, registered_at_ms}]
+# Dùng để xử lý mã chuyến bay lặp lại qua giao ngày (ví dụ TW13 hôm qua và hôm nay).
+SCHEDULE_HINT_VARIANTS: dict = {}
 LAST_POLL_MS: Optional[int] = None
 LAST_IMMEDIATE_POLL_MS = 0
 LAST_ERROR: Optional[str] = None
@@ -460,6 +473,50 @@ def _flight_plan_doc_to_schedule_payload(date_key: str, data: dict) -> dict:
     return result
 
 
+
+def _select_schedule_hint_for_event(code: str, event_ms: Optional[int]) -> dict:
+    """Chọn hint đúng ngày cho một mốc radar cụ thể.
+
+    SCHEDULE_HINTS chỉ giữ 1 bản public theo code, nên khi cùng số hiệu xuất hiện
+    ở cả hôm qua/hôm nay, parked_at 00:22 có thể bị gắn nhầm vào lịch hôm nay.
+    Hàm này dò toàn bộ variants và chọn SIBT gần mốc radar nhất trong cửa sổ sanity.
+    """
+    clean = _clean_code(code)
+    if not clean:
+        return {}
+    with _lock:
+        variants = [dict(h or {}) for h in SCHEDULE_HINT_VARIANTS.get(clean, [])]
+        fallback = dict(SCHEDULE_HINTS.get(clean) or {})
+    if not variants:
+        return fallback
+    if not isinstance(event_ms, int) or event_ms <= 0:
+        return fallback or variants[0]
+
+    valid: list[tuple[int, dict]] = []
+    for hint in variants:
+        sibt = hint.get("sibt_millis")
+        if not isinstance(sibt, int):
+            continue
+        if event_ms < sibt - PARKED_SANITY_BEFORE_SIBT_MS:
+            continue
+        if event_ms > sibt + PARKED_SANITY_AFTER_SIBT_MS:
+            continue
+        valid.append((abs(event_ms - sibt), hint))
+    if valid:
+        valid.sort(key=lambda pair: pair[0])
+        return valid[0][1]
+
+    # Nếu không hint nào lọt sanity window, chọn cái gần nhất để log/refuse rõ ràng hơn.
+    ranked = []
+    for hint in variants:
+        sibt = hint.get("sibt_millis")
+        if isinstance(sibt, int):
+            ranked.append((abs(event_ms - sibt), hint))
+    if ranked:
+        ranked.sort(key=lambda pair: pair[0])
+        return ranked[0][1]
+    return fallback
+
 def _refresh_schedule_from_firestore(force: bool = False) -> int:
     """Server tự đọc flightPlans trong Firestore để không phụ thuộc người dùng mở web."""
     global LAST_FIRESTORE_SCHEDULE_SYNC_MS, LAST_FIRESTORE_SYNC_ERROR, FIRESTORE_SCHEDULE_DATES
@@ -513,8 +570,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if db is None:
         return False
 
-    with _lock:
-        hint = SCHEDULE_HINTS.get(code) or {}
+    hint = _select_schedule_hint_for_event(code, int(entry.parked_at_millis) if entry.parked_at_millis else None)
 
     # ====== TẦNG 3 SANITY GATES ======
     # Nếu logic upstream (Tầng 1 + 2) có bug regression, tầng này vẫn từ chối ghi sai.
@@ -1004,6 +1060,56 @@ def _is_parked_on_ground(gs_kt: Optional[int], dist_km: Optional[float]) -> bool
     return gs_kt <= PARKED_GS_KT and dist_km <= PARKED_DIST_KM
 
 
+def _terminal_age_ms(entry: Optional["FlightEntry"], now_ms: int) -> int:
+    """Tuổi của entry đã kết thúc, ưu tiên mốc parked/updated."""
+    if not entry:
+        return 0
+    base = entry.parked_at_millis or entry.updated_at or entry.eta_millis or now_ms
+    try:
+        return max(0, int(now_ms) - int(base))
+    except Exception:
+        return 0
+
+
+def _is_reused_code_live_after_parked(old: Optional["FlightEntry"], sensors: dict, now_ms: int) -> bool:
+    """Phát hiện số hiệu đã được dùng lại cho chuyến mới.
+
+    Bug cũ: TRACKED lưu theo flight_code. Khi VJ636/9G2966 của hôm trước đã PARKED,
+    hôm sau FR24 thấy lại cùng mã đang bay thì sticky PARKED làm app vẫn báo "Vào bến".
+
+    Quy tắc mới:
+      - chỉ xét khi old.state == PARKED;
+      - old PARKED đã qua PARKED_REUSE_RESET_MS;
+      - tín hiệu hiện tại KHÔNG phải đang đứng/vào bến ở DAD;
+      - và có dấu hiệu live mới: đang bay, còn xa DAD, hoặc còn tốc độ bay.
+    """
+    if not old or old.state != "PARKED":
+        return False
+    if _terminal_age_ms(old, now_ms) < PARKED_REUSE_RESET_MS:
+        return False
+
+    dist_km = sensors.get("distance_km")
+    gs_kt = sensors.get("gs_kt")
+    alt_ft = sensors.get("alt_ft")
+    on_ground = bool(sensors.get("on_ground"))
+
+    at_dad = _is_at_dad_airport(dist_km)
+    parked_signal = _is_parked_on_ground(gs_kt, dist_km)
+    if at_dad or parked_signal:
+        return False
+
+    # Chuyến mới thường đang bay/còn xa sân, hoặc có speed/altitude rõ ràng.
+    if on_ground:
+        return False
+    if isinstance(dist_km, (int, float)) and dist_km > FINAL_DIST_KM:
+        return True
+    if isinstance(gs_kt, (int, float)) and gs_kt > TOUCHDOWN_GS_KT:
+        return True
+    if isinstance(alt_ft, (int, float)) and alt_ft > FINAL_ALT_FT:
+        return True
+    return False
+
+
 def _classify_state(
     on_ground: bool,
     alt_ft: Optional[int],
@@ -1288,6 +1394,20 @@ def _adaptive_poll_interval_ms(now_ms: Optional[int] = None) -> int:
 # SCHEDULE HINTS (lịch bay)
 # ===========================================================
 
+def _prune_old_tracked_entries(now_ms: Optional[int] = None) -> int:
+    """Dọn TRACKED terminal/stale trong RAM; lịch sử đã nằm ở Firestore."""
+    now_ms = now_ms or int(time.time() * 1000)
+    removed = 0
+    with _lock:
+        for code, entry in list(TRACKED.items()):
+            if not entry:
+                continue
+            if entry.state in TERMINAL_STATES and _terminal_age_ms(entry, now_ms) > TRACKED_TERMINAL_RETAIN_MS:
+                TRACKED.pop(code, None)
+                removed += 1
+    return removed
+
+
 def _prune_old_schedule_hints(now_ms: Optional[int] = None) -> int:
     """Xóa hint quá cũ hoặc quá xa tương lai. Trả về số entry đã prune."""
     now_ms = now_ms or int(time.time() * 1000)
@@ -1306,6 +1426,25 @@ def _prune_old_schedule_hints(now_ms: Optional[int] = None) -> int:
         for code in stale_codes:
             SCHEDULE_HINTS.pop(code, None)
             removed += 1
+
+        for code, variants in list(SCHEDULE_HINT_VARIANTS.items()):
+            kept = []
+            for hint in variants or []:
+                sibt = hint.get("sibt_millis") if isinstance(hint, dict) else None
+                if not isinstance(sibt, int):
+                    continue
+                if sibt < now_ms - SCHEDULE_RETAIN_PAST_MS:
+                    removed += 1
+                    continue
+                if sibt > now_ms + SCHEDULE_RETAIN_FUTURE_MS:
+                    removed += 1
+                    continue
+                kept.append(hint)
+            if kept:
+                # Sắp xếp cũ → mới để việc debug dễ đọc.
+                SCHEDULE_HINT_VARIANTS[code] = sorted(kept, key=lambda h: h.get("sibt_millis") or 0)
+            else:
+                SCHEDULE_HINT_VARIANTS.pop(code, None)
     return removed
 
 
@@ -1332,7 +1471,7 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
                 continue
             if sibt_millis > now_ms + SCHEDULE_RETAIN_FUTURE_MS:
                 continue
-            SCHEDULE_HINTS[code] = {
+            normalized_hint = {
                 "sibt_millis": sibt_millis,
                 "origin": str(hint.get("origin", "") or "").upper(),
                 "aircraft": str(hint.get("aircraft", "") or "").upper(),
@@ -1341,6 +1480,23 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
                 "date_key": str(hint.get("date_key", "") or ""),
                 "registered_at_ms": now_ms,
             }
+
+            # Giữ đủ biến thể theo ngày để radar 00:xx không bị gán nhầm sang
+            # chuyến cùng số hiệu của ngày mới.
+            variants = SCHEDULE_HINT_VARIANTS.setdefault(code, [])
+            replaced = False
+            for idx, old_hint in enumerate(list(variants)):
+                if str(old_hint.get("date_key") or "") == normalized_hint["date_key"]:
+                    variants[idx] = normalized_hint
+                    replaced = True
+                    break
+            if not replaced:
+                variants.append(normalized_hint)
+            SCHEDULE_HINT_VARIANTS[code] = sorted(variants, key=lambda h: h.get("sibt_millis") or 0)
+
+            # Public/current hint vẫn giữ hành vi cũ để API không đổi contract;
+            # các luồng ghi Firestore sẽ dùng _select_schedule_hint_for_event().
+            SCHEDULE_HINTS[code] = normalized_hint
             written += 1
     _prune_old_schedule_hints(now_ms)
     return written
@@ -1476,6 +1632,12 @@ def _process_match(
     hoặc chưa cập nhật destination cho chuyến mới khởi hành.
     """
     sensors = _extract_sensors(flight)
+
+    # Nếu mã chuyến đã PARKED từ trước nhưng FR24 hiện lại cùng mã đang bay/còn xa DAD,
+    # đó là chuyến mới dùng lại số hiệu. Reset entry cũ để không dính "Vào bến" giả.
+    if _is_reused_code_live_after_parked(old, sensors, now_ms):
+        log.info("%s: reset stale PARKED entry; same flight code is live again", code)
+        old = None
 
     fr24_eta_ms = None
     real_arrival_ms = None
@@ -1671,8 +1833,12 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             )
         return None
 
-    # Đã PARKED: trạng thái kết thúc, giữ nguyên.
+    # Đã PARKED: chỉ giữ trong RAM một khoảng ngắn để app kịp đồng bộ Firestore.
+    # Sau đó drop khỏi TRACKED để tránh số hiệu lặp ngày hôm sau bị báo "Vào bến" giả.
     if old.state == "PARKED":
+        if _terminal_age_ms(old, now_ms) > TRACKED_TERMINAL_RETAIN_MS:
+            log.info("%s: drop stale PARKED entry from RAM after %d minutes", code, _terminal_age_ms(old, now_ms) // 60000)
+            return None
         return old
 
     # SCHEDULED state có sẵn: giữ nguyên, không tăng miss vì chưa từng có live.
@@ -2168,6 +2334,7 @@ def poll_loop() -> None:
             _refresh_schedule_from_firestore(force=False)
             _do_poll()
             _prune_old_schedule_hints()
+            _prune_old_tracked_entries()
         except Exception as e:
             with _lock:
                 LAST_ERROR = str(e)
