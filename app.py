@@ -462,6 +462,9 @@ def _flight_plan_doc_to_schedule_payload(date_key: str, data: dict) -> dict:
         if not sibt:
             continue
         route = str(item.get("arrivalRoute") or item.get("route") or item.get("arrival_route") or "").upper()
+        explicit_aliases = item.get("codeAliases") or item.get("code_aliases") or []
+        if not isinstance(explicit_aliases, list):
+            explicit_aliases = []
         result[code] = {
             "sibt_millis": sibt,
             "origin": str(item.get("origin") or item.get("origin_iata") or _extract_origin_from_route(route) or "").upper(),
@@ -469,6 +472,7 @@ def _flight_plan_doc_to_schedule_payload(date_key: str, data: dict) -> dict:
             "route": route,
             "stand": str(item.get("plannedStand") or item.get("stand") or item.get("planned_stand") or "").strip(),
             "date_key": date_key,
+            "code_aliases": sorted(_code_aliases(code).union({_clean_code(a) for a in explicit_aliases if _clean_code(a)})),
         }
     return result
 
@@ -1225,6 +1229,39 @@ def _clean_code(value) -> str:
     return _normalize_code(value)
 
 
+def _flight_code_ocr_aliases(value) -> set[str]:
+    """Tạo biến thể OCR nhẹ cho phần tiền tố hãng bay: B↔8, O↔0, I/L↔1, S↔5.
+
+    Chỉ thay trong prefix, không động vào phần số hiệu để tránh nổ alias.
+    """
+    import re
+    base = _normalize_code(value)
+    if not base:
+        return set()
+    aliases = {base}
+    m = re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})(\d{1,5}[A-Z]?)$", base)
+    if not m:
+        return aliases
+    prefix, suffix = m.group(1), m.group(2)
+    # Chỉ sửa OCR trên prefix IATA 2 ký tự. Không sửa ICAO/callsign dài như TWB13, CHTAG15.
+    if len(prefix) == 2:
+        swaps = {
+            "8": ("B",), "B": ("8",),
+            "0": ("O",), "O": ("0",),
+            "1": ("I", "L"), "I": ("1",), "L": ("1",),
+            "5": ("S",), "S": ("5",),
+        }
+        for idx, ch in enumerate(prefix):
+            for alt in swaps.get(ch, ()):  # một lỗi OCR/lần là đủ cho lịch bay
+                aliases.add(prefix[:idx] + alt + prefix[idx + 1:] + suffix)
+    # Case thực tế: 8M454 ↔ BM454. Vẫn giữ cả 8M/MMA để không làm hỏng hãng bay hợp lệ.
+    if base.startswith("8M"):
+        aliases.add("BM" + base[2:])
+    if base.startswith("BM"):
+        aliases.add("8M" + base[2:])
+    return aliases
+
+
 def _code_aliases(value) -> set[str]:
     """
     Tạo alias IATA/ICAO thường gặp để tránh mất match giữa lịch bay và FR24.
@@ -1233,24 +1270,22 @@ def _code_aliases(value) -> set[str]:
     base = _normalize_code(value)
     if not base:
         return set()
-    aliases = {base}
+    aliases = set(_flight_code_ocr_aliases(base))
 
-    # Xử lý leading-zero: tách prefix chữ + suffix số, strip zero ở đầu suffix
-    prefix_chars = []
-    i = 0
-    while i < len(base) and base[i].isalpha():
-        prefix_chars.append(base[i])
-        i += 1
-    if prefix_chars and i < len(base):
-        prefix = "".join(prefix_chars)
-        suffix = base[i:]
-        if suffix.isdigit():
-            stripped = suffix.lstrip("0") or "0"
-            aliases.add(prefix + stripped)
-            # Cũng thêm padded variants cho trường hợp FR24 trả "VN0123"
-            for pad in (3, 4):
-                if len(stripped) < pad:
-                    aliases.add(prefix + stripped.zfill(pad))
+    import re
+
+    # Xử lý leading-zero: tách prefix hãng + suffix số, strip zero ở đầu suffix.
+    # Hỗ trợ cả hãng bắt đầu bằng số như 8M/9G/7C/5J/Z2/3U.
+    m_zero = re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})(\d+)$", base)
+    if m_zero:
+        prefix = m_zero.group(1)
+        suffix = m_zero.group(2)
+        stripped = suffix.lstrip("0") or "0"
+        aliases.update(_flight_code_ocr_aliases(prefix + stripped))
+        # Cũng thêm padded variants cho trường hợp FR24 trả "VN0123".
+        for pad in (3, 4):
+            if len(stripped) < pad:
+                aliases.update(_flight_code_ocr_aliases(prefix + stripped.zfill(pad)))
 
     # Alias IATA ↔ ICAO. Phải đồng bộ với pairs trong flightCodeAliases() ở index.html.
     # Thiếu ở bất kỳ đầu nào → server không match được callsign FR24 với mã lịch bay
@@ -1301,21 +1336,20 @@ def _code_aliases(value) -> set[str]:
         # Trung Á — charter Kazakhstan (1)
         "DV": "VSV", "VSV": "DV",
     }
-    # Tạo alias cho mọi mã đã có trong set (kể cả leading-zero variants)
+    # Tạo alias cho mọi mã đã có trong set (kể cả leading-zero variants).
+    # Hỗ trợ IATA có số ở prefix: 8M454 ↔ MMA454, 9G2962 ↔ PQA2962...
     for alias in list(aliases):
-        # Tách prefix chữ
-        j = 0
-        while j < len(alias) and alias[j].isalpha():
-            j += 1
-        if j == 0 or j == len(alias):
+        m_alias = re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})(\d+)$", alias)
+        if not m_alias:
             continue
-        prefix = alias[:j]
-        suffix = alias[j:]
-        if not suffix.isdigit():
-            continue
+        prefix, suffix = m_alias.group(1), m_alias.group(2)
         alt = airline_aliases.get(prefix)
         if alt:
-            aliases.add(alt + suffix)
+            aliases.update(_flight_code_ocr_aliases(alt + suffix))
+
+    # Một lượt cuối để OCR alias cũng được hưởng leading-zero/ICAO nếu vừa phát sinh.
+    for alias in list(aliases):
+        aliases.update(_flight_code_ocr_aliases(alias))
     return aliases
 
 
@@ -1478,6 +1512,10 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
                 "route": str(hint.get("route", "") or "").upper(),
                 "stand": str(hint.get("stand", "") or "").strip(),
                 "date_key": str(hint.get("date_key", "") or ""),
+                "code_aliases": sorted(_code_aliases(code).union({
+                    _clean_code(a) for a in (hint.get("code_aliases") or hint.get("codeAliases") or [])
+                    if _clean_code(a)
+                })),
                 "registered_at_ms": now_ms,
             }
 
@@ -2656,6 +2694,7 @@ def post_schedule():
                 "route": item.get("route") or item.get("arrival_route") or "",
                 "stand": item.get("stand") or item.get("plannedStand") or item.get("planned_stand") or "",
                 "date_key": item.get("date_key") or "",
+                "code_aliases": item.get("code_aliases") or item.get("codeAliases") or [],
             }
 
     written = _register_schedule(hints_dict)
@@ -2803,7 +2842,7 @@ def _canonical_flight_code(value) -> str:
     """
     import re
     raw = _compact_flight_code(value)
-    m = re.match(r"^([A-Z]+)0+(\d+)$", raw)
+    m = re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})0+(\d+)$", raw)
     if not m:
         return raw
     return f"{m.group(1)}{int(m.group(2))}"
@@ -2826,10 +2865,37 @@ def _extract_date_key_from_texts(*texts) -> Optional[str]:
     return None
 
 
-def _looks_like_flight_code(value: str) -> bool:
-    """Kiểm tra chuỗi có giống mã chuyến bay không."""
+def _looks_like_aircraft_type(value: str) -> bool:
+    """Nhận diện loại tàu bay để không nhầm A321/E90/B38M thành số hiệu chuyến."""
     import re
-    return bool(re.match(r"^[A-Z]{1,4}\d{1,5}[A-Z]?$", str(value or "").strip().upper()))
+    code = _compact_flight_code(value)
+    return bool(re.match(
+        r"^(A\d{3}[A-Z]?|A\d{2}N|A32[01]N?|A33[03]|"
+        r"B\d{3,4}[A-Z]?|B38M|B39M|B77W|B78X|B789|"
+        r"E\d{2,3}|E90|32Q|ATR\d*|GJ\d+|HDJT)$",
+        code,
+    ))
+
+
+def _looks_like_flight_code(value: str) -> bool:
+    """Kiểm tra chuỗi có giống mã chuyến bay không.
+
+    Hỗ trợ cả IATA bắt đầu bằng số như 9G2962, 7C2211, 5J5756, 3U3905, 8M454.
+    """
+    import re
+    code = _canonical_flight_code(value)
+    if not code or _looks_like_aircraft_type(code):
+        return False
+    return bool(re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})\d{1,5}[A-Z]?$", code))
+
+
+def _route_arrives_target(value: str, target: str = TARGET_AIRPORT) -> bool:
+    """True nếu A.ROUTE có dạng ORG-DAD hoặc ...-DAD."""
+    route = _compact_text(value).upper().replace("–", "-").replace("—", "-").replace("→", "-").replace(" ", "")
+    if not route or "-" not in route:
+        return False
+    parts = [p for p in route.split("-") if p]
+    return len(parts) >= 2 and parts[-1] == target
 
 
 def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict]:
@@ -2858,6 +2924,12 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
         if cells[0].strip().lower() in ("stt", "no", "n/o", "tt"):
             return
 
+        # Chỉ lấy bảng lịch bay chuẩn. Các bảng đầu file có A.FltDate/AIBT hoặc dòng chỉ chuyến đi
+        # phải bị loại, nếu không app sẽ đưa sai số hiệu lên radar.
+        import re
+        if not cells or not re.match(r"^\d+$", _compact_text(cells[0])):
+            return
+
         # Format chuẩn của lịch AMO: 12 cột.
         aircraft_type = cells[1] if len(cells) > 1 else ""
         arrival_raw = cells[2] if len(cells) > 2 else ""
@@ -2870,20 +2942,14 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
         planned_stand = cells[10] if len(cells) > 10 else (cells[9] if len(cells) > 9 else "")
         rmk = cells[11] if len(cells) > 11 else ""
 
+        # Bắt buộc là chuyến ĐẾN DAD: A.ROUTE phải kết thúc -DAD.
+        # Nhờ vậy không nhầm cột A/C=E90 hoặc các dòng departure-only thành số hiệu radar.
+        if not _route_arrives_target(arrival_route):
+            return
+
         arrival_display = _compact_flight_code(arrival_raw)
         arrival_code = _canonical_flight_code(arrival_raw)
         departure_code = _canonical_flight_code(departure_raw)
-
-        # Fallback nếu cột bị lệch: tìm mã bay + giờ trong dòng.
-        if not _looks_like_flight_code(arrival_code):
-            possible_codes = [_canonical_flight_code(c) for c in cells if _looks_like_flight_code(_canonical_flight_code(c))]
-            possible_times = [c for c in cells if _parse_sibt_to_millis(c, date_key)]
-            if possible_codes and possible_times:
-                arrival_code = possible_codes[0]
-                arrival_display = _compact_flight_code(possible_codes[0])
-                sibt = possible_times[0]
-            else:
-                return
 
         if not arrival_code or not _looks_like_flight_code(arrival_code):
             return
@@ -2904,6 +2970,8 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
             "displayArrivalFlight": arrival_display or arrival_code,
             "rawArrivalFlight": arrival_display or arrival_code,
             "departureFlight": departure_code,
+            "codeAliases": sorted(_code_aliases(arrival_code)),
+            "departureCodeAliases": sorted(_code_aliases(departure_code)) if departure_code else [],
             "arrivalRoute": _compact_text(arrival_route).upper(),
             "departureRoute": _compact_text(departure_route).upper(),
             "sibt": _compact_text(sibt),
