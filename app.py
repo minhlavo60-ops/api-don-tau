@@ -2387,6 +2387,34 @@ def poll_loop() -> None:
 # ===========================================================
 
 def require_api_key():
+    """Auth dual-path trong giai đoạn chuyển từ X-API-Key sang Firebase ID token.
+
+    Ưu tiên: Authorization: Bearer <Firebase ID token>.
+      - Có header này → verify strict bằng firebase_admin. Sai = 401 luôn,
+        KHÔNG lùi sang X-API-Key để tránh attacker biết key cũ vẫn vào được.
+    Fallback: X-API-Key (chỉ khi không có Bearer header).
+      - Nhánh này tồn tại để PWA cũ chưa cập nhật vẫn chạy được trong vài ngày.
+      - Sẽ xóa sau khi mọi client đã chuyển sang Bearer token.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        if not token:
+            return jsonify({"status": "error", "message": "Token rỗng"}), 401
+        # Tái dùng init của Firestore: cùng service account credentials.
+        _init_firestore_client()
+        if firebase_admin is None or not firebase_admin._apps:
+            log.error("Firebase Admin chưa init — không verify được ID token")
+            return jsonify({"status": "error", "message": "Server chưa sẵn sàng xác thực"}), 500
+        try:
+            from firebase_admin import auth as fb_auth
+            fb_auth.verify_id_token(token)
+            return None
+        except Exception as e:
+            log.warning("ID token verify failed: %s", e)
+            return jsonify({"status": "error", "message": "Token không hợp lệ"}), 401
+
+    # Legacy path — sẽ gỡ sau khi PWA đã rollout xong.
     client_key = request.headers.get("X-API-Key", "")
     if not ETA_API_KEY:
         return jsonify({"status": "error", "message": "Server chưa cấu hình ETA_API_KEY"}), 500
