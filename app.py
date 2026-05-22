@@ -64,7 +64,7 @@ CORS(
             "https://nhat-ky-don.web.app",
             "https://nhat-ky-don.firebaseapp.com",
         ],
-        "allow_headers": ["X-API-Key", "X-Import-Secret", "Content-Type", "Cache-Control", "Pragma"],
+        "allow_headers": ["Authorization", "X-API-Key", "X-Import-Secret", "Content-Type", "Cache-Control", "Pragma"],
         "methods": ["GET", "POST", "OPTIONS"],
         "max_age": 3600,
     }},
