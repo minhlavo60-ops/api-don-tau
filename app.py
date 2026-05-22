@@ -1355,15 +1355,15 @@ def _code_aliases(value) -> set[str]:
         if alt:
             aliases.update(_flight_code_ocr_aliases(alt + suffix))
 
-    # Charter prefix "CH": lịch nội bộ ghi "CH" + ICAO callsign cho chuyến charter
-    # (vd CHMJJ721) nhưng FR24 trả callsign gốc (MJJ721). Sinh alias 2 chiều.
-    # Chỉ áp dụng khi phần còn lại đúng 3 chữ + số để tránh strip nhầm mã ICAO
-    # 3 ký tự bắt đầu bằng "CH" (CHH = Hainan).
+    # Charter prefix "CH": lịch nội bộ ghi "CH" + ICAO callsign cho chuyến charter.
+    # Hỗ trợ 3 dạng đã gặp: CHMJJ721 (3 chữ + số), CHBLCAT62 (5 chữ + số),
+    # CHOOLET (chữ thuần không số). Sinh alias 2 chiều cho radar match được.
+    # Yêu cầu ≥3 chữ sau CH để tránh strip nhầm mã ICAO bắt đầu bằng "CH" (CHH = Hainan).
     for alias in list(aliases):
-        strip_m = re.match(r"^CH([A-Z]{3}\d{1,5}[A-Z]?)$", alias)
+        strip_m = re.match(r"^CH([A-Z]{3,7}(?:\d{1,5}[A-Z]?)?)$", alias)
         if strip_m:
             aliases.update(_flight_code_ocr_aliases(strip_m.group(1)))
-        if re.match(r"^[A-Z]{3}\d{1,5}[A-Z]?$", alias):
+        if re.match(r"^[A-Z]{3,7}(?:\d{1,5}[A-Z]?)?$", alias):
             aliases.update(_flight_code_ocr_aliases("CH" + alias))
 
     # Một lượt cuối để OCR alias cũng được hưởng leading-zero/ICAO nếu vừa phát sinh.
