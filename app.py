@@ -168,6 +168,14 @@ TERMINAL_STATES = {"PARKED", "LOST"}
 # như VJ636/9G2966 sẽ bị dính state "Vào bến" của chuyến cũ khi chuyến mới đang bay.
 TRACKED_TERMINAL_RETAIN_MS = int(os.environ.get("TRACKED_TERMINAL_RETAIN_MS", str(2 * 3600 * 1000)))
 
+# Sau khi tàu PARKED bao lâu thì ẩn marker khỏi feed /api/etas (set lat/lng = None).
+# Why: client cũ vẫn có thể nhận flight PARKED với lat/lng còn nguyên → vẽ marker "treo"
+# nhiều phút sau khi tàu đã hoàn toàn dừng. Cắt phần lat/lng khi quá ngưỡng để map sạch ngay.
+# Entry vẫn còn trong TRACKED để client tra cứu mốc giờ + đồng bộ Firestore, chỉ là không vẽ.
+PARKED_MAP_HIDE_AFTER_MS = int(os.environ.get("PARKED_MAP_HIDE_AFTER_MS", str(5 * 60 * 1000)))
+# Tương tự cho LANDED/TAXIING bị stuck (FR24 cache stale báo tàu vẫn taxi lâu sau touchdown thật).
+LANDED_MAP_HIDE_AFTER_MS = int(os.environ.get("LANDED_MAP_HIDE_AFTER_MS", str(15 * 60 * 1000)))
+
 # Khi một mã đã PARKED nhưng FR24 lại thấy mã đó đang bay/ở xa DAD sau một khoảng đủ dài,
 # coi đó là chuyến mới cùng số hiệu và reset state cũ.
 PARKED_REUSE_RESET_MS = int(os.environ.get("PARKED_REUSE_RESET_MS", str(45 * 60 * 1000)))
@@ -2453,6 +2461,19 @@ def build_etas_payload() -> dict:
                         public.setdefault("route", hint["route"])
                     if hint.get("date_key"):
                         public.setdefault("date_key", hint["date_key"])
+                # Cắt lat/lng cho chuyến đã chốt từ lâu để client không vẽ marker treo trên map.
+                # Mốc giờ + state vẫn được giữ để app tra cứu / đồng bộ Firestore.
+                hide_marker = False
+                if entry.state == "PARKED" and entry.parked_at_millis:
+                    if now_ms - entry.parked_at_millis > PARKED_MAP_HIDE_AFTER_MS:
+                        hide_marker = True
+                elif entry.state in GROUND_ACTIVE_STATES and entry.landed_at_millis:
+                    if now_ms - entry.landed_at_millis > LANDED_MAP_HIDE_AFTER_MS:
+                        hide_marker = True
+                if hide_marker:
+                    public["latitude"] = None
+                    public["longitude"] = None
+                    public["map_hidden"] = True
                 result[code] = public
         return {
             "status": "success",
