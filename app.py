@@ -906,14 +906,16 @@ def _sync_overdue_schedule_claims_to_firestore(now_ms: Optional[int] = None) -> 
             stand = str(old.get("stand") or hint.get("stand") or "").strip()
 
             # Nếu đã có mốc radar trong doc nhưng chưa finalized, dùng mốc đó để chốt.
-            # Nếu đã có mốc hạ cánh nhưng chưa có PARKED, chốt dự phòng = hạ cánh + 3 phút.
+            # Nếu đã có mốc hạ cánh nhưng chưa có PARKED, chốt dự phòng = hạ cánh + N phút
+            # (N theo loại tàu từ hint: 5 phút narrow body, 7 phút wide body).
             parked_ms = _to_int_ms(old.get("actualParkedAtMillis") or old.get("parkedAtMillis"))
             source = str(old.get("actualParkedSource") or "").strip()
             confidence = str(old.get("actualParkedConfidence") or "LOW").strip()
             if not parked_ms:
                 landed_ms = _to_int_ms(old.get("actualLandedAtMillis") or old.get("landedAtMillis") or old.get("touchdownMillis"))
                 if landed_ms:
-                    parked_ms = int(landed_ms) + LANDING_TO_PARK_FALLBACK_MS
+                    aircraft_from_hint = str(hint.get("aircraft") or old.get("aircraftType") or "").upper().strip()
+                    parked_ms = int(landed_ms) + _taxi_buffer_ms_for(aircraft_from_hint)
                     source = "server_landing_plus_3min"
                     confidence = "MEDIUM"
                 else:
