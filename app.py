@@ -148,15 +148,29 @@ MISS_DROP_THRESHOLD = 5      # miss ≥ 5 → LOST (hoặc LANDED nếu trước
 PARKED_GS_KT = int(os.environ.get("PARKED_GS_KT", "3"))
 PARKED_DIST_KM = float(os.environ.get("PARKED_DIST_KM", "2.5"))
 # Tàu vẫn còn radar nhưng đứng yên đủ lâu cũng được coi như đã vào bến.
-# 4 phút = 240 s đủ để loại trừ dừng tạm trên taxiway và bắt kịp các trường hợp FR24 không tự tắt.
+# 4 phút an toàn cho case tàu dừng hẳn trên taxiway 2-3 phút rồi lăn tiếp
+# (anchor 80m chỉ catch được tàu "lăn chậm có dịch chuyển", không catch "dừng hẳn rồi lăn").
+# Nếu sau này thêm stand-snap (chỉ chốt PARKED khi gần bến < 40m), có thể giảm xuống 180s.
 PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
+# Khi parking_signal True, chốt anchor (lat, lng). Nếu tàu dịch chuyển khỏi anchor quá
+# ngưỡng này, reset candidate vì đó là dừng tạm rồi lăn tiếp, không phải vào bến.
+# 80m vừa đủ chứa biến động GPS + dịch chuyển nhỏ trong stand, không nuốt mất dừng tạm
+# trên taxiway intersection (thường cách bến vài trăm mét).
+PARKED_ANCHOR_DRIFT_M = float(os.environ.get("PARKED_ANCHOR_DRIFT_M", "80.0"))
 # Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
 # 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
-# Quy tắc nghiệp vụ mới: khi radar xác nhận tàu đã hạ cánh (marker xanh),
-# lưu mốc hạ cánh. Nếu không có mốc vào bến tốt hơn, lấy hạ cánh + 3 phút
-# làm giờ dừng bến/chốt hồ sơ để không sót chuyến đã có người đón.
-LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", "180000"))
+# Quy tắc nghiệp vụ: khi radar xác nhận tàu đã hạ cánh, lưu mốc hạ.
+# Nếu không có mốc vào bến tốt hơn, lấy hạ cánh + N phút làm giờ vào bến dự phòng.
+# N được chọn theo loại tàu (narrow body 5 phút, wide body 7 phút) để khớp taxi-in
+# thực tế ở DAD: runway → apron 4-6 phút NB, 6-8 phút WB.
+# Tên source vẫn giữ "landing_plus_3min" để không phá lịch sử Firestore.
+LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", "300000"))
+LANDING_TO_PARK_FALLBACK_WIDEBODY_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_WIDEBODY_MS", "420000"))
+# Khi radar còn live, KHÔNG vội chốt fallback. Đợi đủ N phút sau touchdown để ground_stop
+# có cơ hội chạy. Nếu sau ngưỡng này vẫn chưa có parked, mới fire fallback (trường hợp
+# FR24 cache stale báo TAXIING dù tàu đã đứng yên).
+LANDED_MIN_AGE_BEFORE_FALLBACK_MS = int(os.environ.get("LANDED_MIN_AGE_BEFORE_FALLBACK_MS", "480000"))
 # Khi FR24 mất tín hiệu trong lúc đang taxi mà chưa có landed_at, dùng buffer cũ làm dự phòng thấp.
 TAXI_BUFFER_MS = int(os.environ.get("TAXI_BUFFER_MS", "120000"))
 LANDED_BUFFER_MS = int(os.environ.get("LANDED_BUFFER_MS", "180000"))
@@ -389,6 +403,40 @@ def _physics_eta_ms(distance_km: Optional[float], gs_kt: Optional[int], now_ms: 
     if distance_km > 5:
         eta_ms += 60_000  # buffer 1 phút cho descent/alignment cuối
     return eta_ms
+
+
+# Prefix ICAO của các tàu thân rộng thường gặp ở DAD. Wide body taxi-in chậm hơn
+# narrow body 1-2 phút do kích thước + thường được dắt vào bến.
+WIDE_BODY_PREFIXES = ("A33", "A34", "A35", "A38", "B74", "B76", "B77", "B78")
+
+
+def _is_wide_body(aircraft_type: Optional[str]) -> bool:
+    if not aircraft_type:
+        return False
+    code = str(aircraft_type).upper().strip()
+    return any(code.startswith(p) for p in WIDE_BODY_PREFIXES)
+
+
+def _aircraft_type_for_code(code: str, details: Optional[dict] = None) -> str:
+    """Lấy aircraft type từ FR24 details trước, fallback sang SCHEDULE_HINTS.
+
+    Dùng để chọn taxi buffer khi fallback landing+N. Khi _process_miss được gọi
+    (radar mất tín hiệu), details=None nên phải dựa vào lịch bay.
+    """
+    if details:
+        try:
+            ac = (((details.get("aircraft") or {}).get("model") or {}).get("code") or "")
+        except AttributeError:
+            ac = ""
+        if ac:
+            return str(ac).upper().strip()
+    hint = SCHEDULE_HINTS.get(code) or {}
+    return str(hint.get("aircraft") or "").upper().strip()
+
+
+def _taxi_buffer_ms_for(aircraft_type: Optional[str]) -> int:
+    """N của fallback landing+N theo loại tàu."""
+    return LANDING_TO_PARK_FALLBACK_WIDEBODY_MS if _is_wide_body(aircraft_type) else LANDING_TO_PARK_FALLBACK_MS
 
 
 # ===========================================================
@@ -684,6 +732,16 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
 
         parked_hhmm = _format_hhmm(entry.parked_at_millis)
         parked_hhmmss = _format_hhmmss(entry.parked_at_millis)
+        # Lưu lat/lng tại thời điểm chốt PARKED + delta taxi-in để học per-stand
+        # coords/taxi-time về sau. Chỉ thêm khi có vị trí thật (HIGH confidence).
+        parked_lat = entry.latitude if isinstance(entry.latitude, (int, float)) else None
+        parked_lng = entry.longitude if isinstance(entry.longitude, (int, float)) else None
+        taxi_delta_ms = None
+        if entry.landed_at_millis and entry.parked_at_millis:
+            try:
+                taxi_delta_ms = max(0, int(entry.parked_at_millis) - int(entry.landed_at_millis))
+            except (TypeError, ValueError):
+                taxi_delta_ms = None
         payload = {
             "flightCode": old.get("flightCode") or doc_id,
             "displayFlightCode": old.get("displayFlightCode") or doc_id,
@@ -701,6 +759,9 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "actualParkedSource": new_source,
             "actualParkedConfidence": new_confidence,
             "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "actualParkedLat": parked_lat,
+            "actualParkedLng": parked_lng,
+            "taxiInDurationMs": taxi_delta_ms,
             "radarState": entry.state,
             "radarGroundSpeedKt": entry.ground_speed_kt,
             "radarDistanceKm": entry.distance_km,
@@ -954,7 +1015,13 @@ class FlightEntry:
     # (ground_stop) vs mốc dự phòng do mất tín hiệu (signal_lost).
     parked_at_millis: Optional[int] = None
     parked_candidate_since_ms: Optional[int] = None
-    parked_source: Optional[str] = None  # "ground_stop" | "signal_lost"
+    parked_source: Optional[str] = None  # "ground_stop" | "signal_lost" | "landing_plus_3min"
+    # Position anchor: tọa độ lúc parking_signal lần đầu True.
+    # Mỗi cycle so sánh với vị trí hiện tại — nếu drift > PARKED_ANCHOR_DRIFT_M
+    # (80m) thì tàu đang dừng tạm trên taxiway rồi lăn tiếp, reset candidate.
+    # Cách này tách "dừng cuối cùng tại bến" khỏi "dừng tạm chờ giao thông".
+    parked_anchor_lat: Optional[float] = None
+    parked_anchor_lng: Optional[float] = None
 
     def to_public(self, now_ms: int) -> dict:
         stale_seconds = (now_ms - self.updated_at) // 1000 if self.updated_at else None
@@ -1000,14 +1067,20 @@ class FlightEntry:
             "actual_parked_time": _format_hhmm(self.parked_at_millis),
             "actual_parked_time_full": _format_hhmmss(self.parked_at_millis),
             "actual_parked_source": (
-                ("radar_signal_lost" if self.parked_source == "signal_lost" else "radar_ground_stop")
+                ("radar_signal_lost" if self.parked_source == "signal_lost"
+                 else ("landing_plus_3min" if self.parked_source == "landing_plus_3min"
+                       else "radar_ground_stop"))
                 if self.parked_at_millis else None
             ),
             "actual_parked_confidence": (
-                ("LOW" if self.parked_source == "signal_lost" else "HIGH")
+                ("LOW" if self.parked_source == "signal_lost"
+                 else ("MEDIUM" if self.parked_source == "landing_plus_3min"
+                       else "HIGH"))
                 if self.parked_at_millis else None
             ),
             "parked_candidate_since_ms": self.parked_candidate_since_ms,
+            "parked_anchor_lat": self.parked_anchor_lat,
+            "parked_anchor_lng": self.parked_anchor_lng,
         }
 
 
@@ -1049,15 +1122,23 @@ def _resolve_landed_at_millis(
     return int(now_ms), source
 
 
-def _fallback_parked_from_landing(landed_at_millis: Optional[int], now_ms: int) -> Optional[int]:
-    """Trả về mốc vào bến dự phòng = hạ cánh + 3 phút nếu đã tới hạn.
+def _fallback_parked_from_landing(
+    landed_at_millis: Optional[int],
+    now_ms: int,
+    buffer_ms: Optional[int] = None,
+) -> Optional[int]:
+    """Trả về mốc vào bến dự phòng = hạ cánh + N phút nếu đã tới hạn.
+
+    N mặc định là LANDING_TO_PARK_FALLBACK_MS (5 phút), có thể override
+    bằng buffer_ms cho wide body (7 phút) hoặc per-stand calibration sau này.
 
     Hàm này tin landed_at_millis vô điều kiện — vì vậy upstream (Tầng 1 + 2)
     PHẢI đảm bảo landed_at_millis chỉ được set khi tàu thật sự ở DAD.
     """
     if not landed_at_millis:
         return None
-    fallback = int(landed_at_millis) + LANDING_TO_PARK_FALLBACK_MS
+    buffer = int(buffer_ms) if buffer_ms is not None and buffer_ms > 0 else LANDING_TO_PARK_FALLBACK_MS
+    fallback = int(landed_at_millis) + buffer
     return fallback if now_ms >= fallback else None
 
 
@@ -1729,10 +1810,15 @@ def _process_match(
 
     # Chốt giờ dừng bến/in-block từ radar.
     # Không chốt ngay khi thấy gs thấp, vì tàu có thể dừng tạm trên taxiway.
-    # Chỉ chốt PARKED sau khi tín hiệu đứng yên ổn định PARKED_STABLE_MS.
+    # Cần đủ 2 điều kiện song song:
+    #   1. Ground speed thấp + ở DAD (parking_signal) ổn định PARKED_STABLE_MS
+    #   2. Position không dịch chuyển khỏi anchor quá PARKED_ANCHOR_DRIFT_M (80m)
+    # Điều kiện (2) là cốt lõi để phân biệt "dừng cuối cùng ở bến" với "dừng tạm trên taxiway".
     parking_signal = _is_parked_on_ground(sensors["gs_kt"], sensors["distance_km"])
     parked_at_millis = old.parked_at_millis if old else None
     parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
+    parked_anchor_lat = old.parked_anchor_lat if old else None
+    parked_anchor_lng = old.parked_anchor_lng if old else None
     parked_source = old.parked_source if old else None
     landed_at_millis, landed_source = _resolve_landed_at_millis(
         state, old, now_ms,
@@ -1747,9 +1833,31 @@ def _process_match(
         state = "PARKED"
         parked_at_millis = old.parked_at_millis
         parked_source = old.parked_source
+        parked_anchor_lat = old.parked_anchor_lat
+        parked_anchor_lng = old.parked_anchor_lng
     elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
+        cur_lat = sensors["lat"]
+        cur_lng = sensors["lng"]
         if parked_candidate_since_ms is None:
+            # Lần đầu thấy parking_signal: bắt đầu candidate + chốt anchor
             parked_candidate_since_ms = now_ms
+            parked_anchor_lat = cur_lat
+            parked_anchor_lng = cur_lng
+        elif (
+            cur_lat is not None and cur_lng is not None
+            and parked_anchor_lat is not None and parked_anchor_lng is not None
+        ):
+            # Cycle tiếp: kiểm tra drift so với anchor
+            drift_m = _haversine_km(cur_lat, cur_lng, parked_anchor_lat, parked_anchor_lng) * 1000
+            if drift_m > PARKED_ANCHOR_DRIFT_M:
+                log.info(
+                    "%s: parked candidate reset (drift=%.0fm > %.0fm) — dừng tạm rồi lăn tiếp",
+                    code, drift_m, PARKED_ANCHOR_DRIFT_M,
+                )
+                parked_candidate_since_ms = now_ms
+                parked_anchor_lat = cur_lat
+                parked_anchor_lng = cur_lng
+
         if now_ms - parked_candidate_since_ms >= PARKED_STABLE_MS:
             state = "PARKED"
             if parked_at_millis is None:
@@ -1759,17 +1867,34 @@ def _process_match(
             # _classify_state có thể trả PARKED ngay. Hạ xuống TAXIING cho tới khi ổn định.
             state = "TAXIING"
     else:
+        # Mất parking signal (hoặc state đã rời ground_active): reset candidate + anchor
         parked_candidate_since_ms = None
+        parked_anchor_lat = None
+        parked_anchor_lng = None
 
-    # Lớp dự phòng đơn giản theo yêu cầu nghiệp vụ:
-    # tàu chuyển xanh/hạ cánh -> lưu landed_at; nếu sau 3 phút chưa có PARKED tốt hơn
-    # thì tự coi giờ vào bến = landed_at + 3 phút.
-    # CHÚ Ý: Tầng 2 (_resolve_landed_at_millis) đảm bảo landed_at chỉ được set khi tàu ở DAD,
-    # nên fallback này tự động an toàn — không thể trigger cho tàu ở origin.
-    landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms)
-    if parked_at_millis is None and landing_fallback_parked:
+    # Fallback landing+N: chỉ kích hoạt khi đã qua đủ lâu sau touchdown.
+    # Mục tiêu: KHÔNG vội chốt khi radar còn live và ground_stop có thể chạy.
+    # Chỉ fire khi:
+    #   - Đã qua taxi buffer (5min NB, 7min WB) tính từ landed_at, VÀ
+    #   - Đã qua LANDED_MIN_AGE_BEFORE_FALLBACK_MS (8 phút) — cho radar đủ cơ hội phát PARKED
+    # Cách này xử lý trường hợp FR24 cache stale báo TAXIING dù tàu đã đứng yên.
+    # CHÚ Ý: Tầng 2 (_resolve_landed_at_millis) đảm bảo landed_at chỉ được set khi tàu ở DAD.
+    aircraft_type = _aircraft_type_for_code(code, details)
+    taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
+    landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms, taxi_buffer_ms)
+    if (
+        parked_at_millis is None
+        and landing_fallback_parked is not None
+        and landed_at_millis is not None
+        and (now_ms - int(landed_at_millis)) >= LANDED_MIN_AGE_BEFORE_FALLBACK_MS
+    ):
+        log.info(
+            "%s: fallback landing+%dmin fire (aircraft=%s, age_after_landing=%dmin)",
+            code, taxi_buffer_ms // 60_000, aircraft_type or "?",
+            (now_ms - int(landed_at_millis)) // 60_000,
+        )
         parked_at_millis = landing_fallback_parked
-        parked_source = "landing_plus_3min"
+        parked_source = "landing_plus_3min"  # tên giữ để tương thích Firestore lịch sử
         state = "PARKED"
 
     distance_rounded = round(sensors["distance_km"], 1) if sensors["distance_km"] is not None else None
@@ -1815,6 +1940,8 @@ def _process_match(
                 parked_at_millis=parked_at_millis,
                 parked_candidate_since_ms=parked_candidate_since_ms,
                 parked_source=parked_source,
+                parked_anchor_lat=parked_anchor_lat,
+                parked_anchor_lng=parked_anchor_lng,
             )
 
         # Reset history khi sang FINAL (dynamics khác hẳn)
@@ -1869,6 +1996,8 @@ def _process_match(
         parked_at_millis=parked_at_millis,
         parked_candidate_since_ms=parked_candidate_since_ms,
         parked_source=parked_source,
+        parked_anchor_lat=parked_anchor_lat,
+        parked_anchor_lng=parked_anchor_lng,
     )
 
 
@@ -1904,22 +2033,49 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
 
     miss_count = old.miss_count + 1
 
-    # Sau touchdown/taxi: ưu tiên chốt bằng landed_at + 3 phút.
-    # Không cần đợi 12/30 phút; mọi chuyến đã có người đón sẽ có mốc hoàn tất ổn định.
+    # Sau touchdown/taxi: ưu tiên chốt bằng landed_at + N phút (N theo loại tàu).
+    # Chỉ fallback khi đã miss đủ chu kỳ — tránh chốt sớm khi radar chỉ tạm mất 1 cycle.
     if old.state in GROUND_ACTIVE_STATES:
         landed_at = old.landed_at_millis or old.updated_at or now_ms
-        fallback_parked = _fallback_parked_from_landing(landed_at, now_ms)
+        # _process_miss không có details. Lấy aircraft từ schedule hint.
+        hint = SCHEDULE_HINTS.get(code) or {}
+        aircraft_type = str(hint.get("aircraft") or "").upper().strip()
+        taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
+        fallback_parked = _fallback_parked_from_landing(landed_at, now_ms, taxi_buffer_ms)
+        # Tier B: signal cutoff confirms stop.
+        # Khi tàu có candidate đứng yên (đã ≥ 1 cycle xác nhận trước đó) và sau đó
+        # radar mất tín hiệu, đó chính là pattern "tàu đỗ → engine shutdown → transponder off".
+        # AIBT = parked_candidate_since_ms (chính xác đến giây, không phụ thuộc buffer cố định).
+        # Cần candidate đã ổn định ≥ 30s trước khi mất signal để loại FR24 hiccup ngắn.
+        candidate_ms = old.parked_candidate_since_ms
+        candidate_stable_before_loss = (
+            candidate_ms is not None
+            and old.parked_anchor_lat is not None
+            and old.parked_anchor_lng is not None
+            and old.updated_at
+            and (old.updated_at - int(candidate_ms)) >= 30_000
+        )
         if old.parked_at_millis:
             parked_at = old.parked_at_millis
             new_source = old.parked_source or "ground_stop"
-        elif fallback_parked:
+        elif candidate_stable_before_loss and miss_count >= 1:
+            # Tier B: tin tưởng cao nhất khi không thể chờ 240s stable
+            parked_at = int(candidate_ms)
+            new_source = "ground_stop"  # giữ HIGH confidence, signal cutoff xác nhận
+            log.info(
+                "%s: signal cutoff confirms stop → PARKED at candidate %s (miss=%d, ac=%s)",
+                code, candidate_ms, miss_count, aircraft_type or "?",
+            )
+        elif miss_count >= LANDED_MISS_TO_PARKED and fallback_parked:
+            # Mất tín hiệu đủ lâu + đã qua taxi buffer → chốt landing+N
             parked_at = fallback_parked
             new_source = "landing_plus_3min"
         elif miss_count >= LANDED_MISS_TO_PARKED:
-            # Nếu polling thưa hoặc clock lệch, vẫn dùng landed_at +3 nhưng không quá now.
-            parked_at = min(int(landed_at) + LANDING_TO_PARK_FALLBACK_MS, now_ms)
+            # Mất tín hiệu nhưng chưa qua buffer → cap landed+N, không vượt now
+            parked_at = min(int(landed_at) + taxi_buffer_ms, now_ms)
             new_source = "landing_plus_3min"
         else:
+            # Chưa đủ miss để chốt — giữ state cũ, bump counter
             return FlightEntry(
                 state=old.state,
                 eta_millis=old.eta_millis,
@@ -1941,11 +2097,14 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 parked_at_millis=old.parked_at_millis,
                 parked_candidate_since_ms=old.parked_candidate_since_ms,
                 parked_source=old.parked_source,
+                parked_anchor_lat=old.parked_anchor_lat,
+                parked_anchor_lng=old.parked_anchor_lng,
             )
 
         log.info(
-            "%s: %s + missed %d → PARKED (parked_at=%s, source=%s)",
+            "%s: %s + missed %d → PARKED (parked_at=%s, source=%s, taxi_buf=%dmin, ac=%s)",
             code, old.state, miss_count, parked_at, new_source,
+            taxi_buffer_ms // 60_000, aircraft_type or "?",
         )
         return FlightEntry(
             state="PARKED",
@@ -1968,6 +2127,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_at_millis=parked_at,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=new_source,
+            parked_anchor_lat=old.parked_anchor_lat,
+            parked_anchor_lng=old.parked_anchor_lng,
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
@@ -1994,6 +2155,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=old.parked_source,
+            parked_anchor_lat=old.parked_anchor_lat,
+            parked_anchor_lng=old.parked_anchor_lng,
         )
 
     # Vượt ngưỡng drop
@@ -2021,6 +2184,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 parked_at_millis=old.parked_at_millis,
                 parked_candidate_since_ms=old.parked_candidate_since_ms,
                 parked_source=old.parked_source,
+                parked_anchor_lat=old.parked_anchor_lat,
+                parked_anchor_lng=old.parked_anchor_lng,
             )
         log.info("%s: %s + missed %d → LOST", code, old.state, miss_count)
         return FlightEntry(
@@ -2044,6 +2209,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
             parked_source=old.parked_source,
+            parked_anchor_lat=old.parked_anchor_lat,
+            parked_anchor_lng=old.parked_anchor_lng,
         )
 
     # Chưa tới ngưỡng — chỉ bump counter, giữ data cũ
@@ -2068,6 +2235,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         parked_at_millis=old.parked_at_millis,
         parked_candidate_since_ms=old.parked_candidate_since_ms,
         parked_source=old.parked_source,
+        parked_anchor_lat=old.parked_anchor_lat,
+        parked_anchor_lng=old.parked_anchor_lng,
     )
 
 
