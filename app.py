@@ -209,12 +209,17 @@ PARKED_SANITY_AFTER_SIBT_MS = int(os.environ.get("PARKED_SANITY_AFTER_SIBT_MS", 
 # Firestore online mode: server tự đọc lịch bay đã nạp và tự ghi mốc giờ dừng bến.
 # Bật mặc định. Nếu chưa cấu hình Firebase Admin, server vẫn chạy radar nhưng không tự ghi Firestore.
 FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
-FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "60000"))
+# Lịch đã được web/Gmail push ngay lúc đổi; poll nền chỉ là lớp dự phòng khi server restart
+# hoặc client không mở. Giữ cache RAM 15 phút thay vì đọc lại 3 document mỗi phút.
+FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "900000"))
 # Fallback nghiệp vụ: nếu một chuyến đã có người đón nhưng radar không sinh PARKED,
 # sau SIBT một khoảng an toàn server sẽ chốt bằng giờ lịch để hồ sơ không treo mãi.
 # Để ổn định khi giao ngày/delay muộn, mặc định chờ 90 phút thay vì 30 phút.
 SCHEDULE_FALLBACK_FINALIZE_GRACE_MS = int(os.environ.get("SCHEDULE_FALLBACK_FINALIZE_GRACE_MS", str(90 * 60 * 1000)))
 FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS", "60000"))
+# Chuyến quá hạn nhưng chưa có người nhận không cần kiểm tra lại từng phút.
+# Nếu người dùng nhận chuyến sau lần kiểm tra rỗng, chậm chốt tối đa 15 phút là chấp nhận được.
+FIRESTORE_SCHEDULE_FALLBACK_EMPTY_RETRY_MS = int(os.environ.get("FIRESTORE_SCHEDULE_FALLBACK_EMPTY_RETRY_MS", "900000"))
 FIRESTORE_SCHEDULE_DAYS_BACK = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_BACK", "1"))
 FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEAD", "1"))
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
@@ -250,13 +255,25 @@ LAST_FIRESTORE_SCHEDULE_SYNC_MS: Optional[int] = None
 LAST_FIRESTORE_SYNC_ERROR: Optional[str] = None
 LAST_FIRESTORE_PARKED_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_WRITE_MS: Optional[int] = None
+LAST_FIRESTORE_FALLBACK_SYNC_MS: Optional[int] = None
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
 PARKED_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_FIRESTORE_SYNCED: set[str] = set()
+SCHEDULE_FALLBACK_NEXT_CHECK_MS: dict[str, int] = {}
 _FIRESTORE_CLIENT = None
+ETAS_REVISION = 0
+ETAS_INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _bump_etas_revision() -> int:
+    """Tăng phiên bản feed RAM để client biết có cần lấy lại payload live hay không."""
+    global ETAS_REVISION
+    with _lock:
+        ETAS_REVISION += 1
+        return ETAS_REVISION
 
 
 def _format_hhmm(ms: Optional[int]) -> Optional[str]:
@@ -679,7 +696,11 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if not date_key or not doc_id:
         return False
 
-    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}"
+    # Nguồn là một phần của khóa: nếu mốc fallback LOW được nâng cấp thành ground_stop
+    # HIGH với cùng timestamp, server vẫn được phép kiểm tra/ghi lại đúng một lần.
+    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}:{entry.parked_source or ''}"
+    if sync_key in PARKED_FIRESTORE_SYNCED:
+        return False
 
     # Phân biệt nguồn để dễ dọn rác và để web hiển thị mức tin cậy.
     if entry.parked_source == "signal_lost":
@@ -860,8 +881,14 @@ def _sync_overdue_schedule_claims_to_firestore(now_ms: Optional[int] = None) -> 
     sai code-share hoặc không trả ground stop. Nếu pickup đã có pickerName và SIBT
     đã quá grace, server chốt bằng giờ lịch với confidence LOW.
     """
-    global LAST_FIRESTORE_FALLBACK_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
+    global LAST_FIRESTORE_FALLBACK_SYNC_MS, LAST_FIRESTORE_FALLBACK_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
     now_ms = int(now_ms or time.time() * 1000)
+    if (
+        LAST_FIRESTORE_FALLBACK_SYNC_MS
+        and now_ms - LAST_FIRESTORE_FALLBACK_SYNC_MS < FIRESTORE_SCHEDULE_FALLBACK_SYNC_MS
+    ):
+        return 0
+    LAST_FIRESTORE_FALLBACK_SYNC_MS = now_ms
     db = _init_firestore_client()
     if db is None:
         return 0
@@ -889,18 +916,23 @@ def _sync_overdue_schedule_claims_to_firestore(now_ms: Optional[int] = None) -> 
             sync_key = f"{date_key}:{doc_id}:{sibt}:schedule_fallback"
             if sync_key in SCHEDULE_FALLBACK_FIRESTORE_SYNCED:
                 continue
+            if now_ms < SCHEDULE_FALLBACK_NEXT_CHECK_MS.get(sync_key, 0):
+                continue
 
             ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
             snap = ref.get()
             if not snap.exists:
+                SCHEDULE_FALLBACK_NEXT_CHECK_MS[sync_key] = now_ms + FIRESTORE_SCHEDULE_FALLBACK_EMPTY_RETRY_MS
                 continue
             old = snap.to_dict() or {}
             if old.get("finalized") or old.get("locked"):
                 SCHEDULE_FALLBACK_FIRESTORE_SYNCED.add(sync_key)
+                SCHEDULE_FALLBACK_NEXT_CHECK_MS.pop(sync_key, None)
                 continue
 
             picker_name = str(old.get("pickerName") or "").strip()
             if not picker_name:
+                SCHEDULE_FALLBACK_NEXT_CHECK_MS[sync_key] = now_ms + FIRESTORE_SCHEDULE_FALLBACK_EMPTY_RETRY_MS
                 continue
             picker_uid = str(old.get("pickerUid") or "").strip()
             stand = str(old.get("stand") or hint.get("stand") or "").strip()
@@ -976,6 +1008,7 @@ def _sync_overdue_schedule_claims_to_firestore(now_ms: Optional[int] = None) -> 
 
             ref.set(payload, merge=True)
             SCHEDULE_FALLBACK_FIRESTORE_SYNCED.add(sync_key)
+            SCHEDULE_FALLBACK_NEXT_CHECK_MS.pop(sync_key, None)
             LAST_FIRESTORE_FALLBACK_WRITE_MS = now_ms
             LAST_FIRESTORE_SYNC_ERROR = None
             written += 1
@@ -1639,6 +1672,8 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
             SCHEDULE_HINTS[code] = normalized_hint
             written += 1
     _prune_old_schedule_hints(now_ms)
+    if written:
+        _bump_etas_revision()
     return written
 
 
@@ -2519,6 +2554,9 @@ def _do_poll() -> None:
         LAST_POLL_MS = now_ms
         LAST_ERROR = None
 
+    if updates or drops:
+        _bump_etas_revision()
+
     duration_ms = int((time.time() - started) * 1000)
     LAST_POLL_DURATION_MS = duration_ms
 
@@ -2613,10 +2651,12 @@ def require_api_key():
     return None
 
 
-def build_etas_payload() -> dict:
+def build_etas_payload(known_revision=None) -> dict:
     """Build response cho /api/etas: live data + SCHEDULED placeholder cho mã chưa có live."""
     now_ms = int(time.time() * 1000)
+    known_revision = str(known_revision or "").strip() or None
     with _lock:
+        feed_revision = f"{ETAS_INSTANCE_ID}:{ETAS_REVISION}"
         result = {}
         for code in QUEUE:
             entry = TRACKED.get(code)
@@ -2657,8 +2697,14 @@ def build_etas_payload() -> dict:
                     public["longitude"] = None
                     public["map_hidden"] = True
                 result[code] = public
+        not_modified = known_revision is not None and known_revision == feed_revision
+        if not_modified:
+            # Client đã giữ bản đầy đủ trong RAM/thiết bị; chỉ trả metadata nhỏ.
+            result = {}
         return {
             "status": "success",
+            "feed_revision": feed_revision,
+            "not_modified": not_modified,
             "server_time_millis": now_ms,
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
@@ -2671,6 +2717,7 @@ def build_etas_payload() -> dict:
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
@@ -2697,6 +2744,7 @@ def health():
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
@@ -2719,6 +2767,7 @@ def firestore_sync_now():
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
+            "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
@@ -2851,8 +2900,8 @@ def get_all_etas():
     if (err := require_api_key()):
         return err
     _refresh_schedule_from_firestore(force=False)
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     if request.method == "POST":
-        body = request.get_json(silent=True) or {}
         codes = body.get("codes", []) or []
         cleaned = [_clean_code(c) for c in codes if isinstance(c, str) and _clean_code(c)]
         force_refresh = bool(body.get("force_refresh"))
@@ -2882,7 +2931,7 @@ def get_all_etas():
                     f"etas refresh new={len(new_codes)} force={force_refresh} min={min_refresh_ms} sched={scheduled_written}",
                     bypass_cooldown=force_refresh,
                 )
-    return jsonify(build_etas_payload())
+    return jsonify(build_etas_payload(body.get("known_revision") or request.args.get("known_revision")))
 
 
 @app.route("/api/schedule", methods=["POST"])
@@ -2963,6 +3012,8 @@ def add_track(flight_code):
         is_new = code not in TRACKED
         QUEUE.add(code)
     if is_new:
+        _bump_etas_revision()
+    if is_new:
         _try_immediate_poll(f"track {code}")
     return jsonify({"status": "success", "tracked": sorted(QUEUE)})
 
@@ -2973,9 +3024,12 @@ def remove_track(flight_code):
         return err
     code = _clean_code(flight_code)
     with _lock:
+        changed = code in QUEUE or code in TRACKED or code in SCHEDULE_HINTS
         QUEUE.discard(code)
         TRACKED.pop(code, None)
         SCHEDULE_HINTS.pop(code, None)
+    if changed:
+        _bump_etas_revision()
     return jsonify({"status": "success", "tracked": sorted(QUEUE)})
 
 
