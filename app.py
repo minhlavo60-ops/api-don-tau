@@ -3108,16 +3108,35 @@ def _looks_like_aircraft_type(value: str) -> bool:
     ))
 
 
-def _looks_like_flight_code(value: str) -> bool:
+def _looks_like_flight_code(value: str, *, route_context: bool = False) -> bool:
     """Kiểm tra chuỗi có giống mã chuyến bay không.
 
-    Hỗ trợ cả IATA bắt đầu bằng số như 9G2962, 7C2211, 5J5756, 3U3905, 8M454.
+    Hỗ trợ:
+      - Mã IATA thường: VN337, VJ628, QH154, 9G937, 7C2211, 8M454.
+      - Mã có hậu tố chữ dài hơn: CHN73GP.
+      - Callsign/charter/medical dài khi đã chắc là cột A.FLIGHT của dòng đến DAD: CHMEDIC78.
+
+    route_context=True nghĩa là giá trị đang nằm trong cột A.FLIGHT của một dòng
+    đã xác nhận A.ROUTE kết thúc bằng -DAD và có SIBT hợp lệ. Khi đó cho phép
+    một số callsign đặc biệt nhưng vẫn chặn mã loại tàu bay như A321, B38M, E90.
     """
     import re
     code = _canonical_flight_code(value)
     if not code or _looks_like_aircraft_type(code):
         return False
-    return bool(re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})\d{1,5}[A-Z]?$", code))
+
+    # Mã phổ thông: VN337, VJ628, QH154, 9G937, 7C2211...
+    # Cho phép hậu tố chữ tối đa 3 ký tự để bắt các mã như CHN73GP.
+    if re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})\d{1,5}[A-Z]{0,3}$", code):
+        return True
+
+    # Khi đã chắc đây là cột A.FLIGHT của dòng đến DAD, cho phép callsign/charter/medical
+    # dài hơn, ví dụ CHMEDIC78. Bắt buộc phải có ít nhất một chữ số để tránh nuốt ghi chú.
+    if route_context:
+        if re.match(r"^[A-Z][A-Z0-9]{2,11}$", code) and re.search(r"\d", code):
+            return True
+
+    return False
 
 
 def _route_arrives_target(value: str, target: str = TARGET_AIRPORT) -> bool:
@@ -3182,7 +3201,7 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
         arrival_code = _canonical_flight_code(arrival_raw)
         departure_code = _canonical_flight_code(departure_raw)
 
-        if not arrival_code or not _looks_like_flight_code(arrival_code):
+        if not arrival_code or not _looks_like_flight_code(arrival_code, route_context=True):
             return
 
         sibt_ms = _parse_sibt_to_millis(sibt, date_key)
