@@ -31,7 +31,7 @@ Response v2.3 thêm: scheduled, sibt_millis (cho state SCHEDULED) và actual_par
 """
 from __future__ import annotations
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from FlightRadar24 import FlightRadar24API
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -40,6 +40,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -50,11 +51,12 @@ import time
 
 try:
     import firebase_admin
-    from firebase_admin import credentials, firestore as firebase_firestore
+    from firebase_admin import credentials, firestore as firebase_firestore, messaging as firebase_messaging
 except Exception:  # firebase-admin là dependency tùy chọn; server vẫn chạy radar nếu chưa cấu hình.
     firebase_admin = None
     credentials = None
     firebase_firestore = None
+    firebase_messaging = None
 
 app = Flask(__name__)
 CORS(
@@ -225,6 +227,12 @@ FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEA
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
+# App Android được đánh thức bằng FCM tại các mốc tác nghiệp, không cần tự poll radar nền.
+MOBILE_ALERT_STATES = {
+    state.strip().upper()
+    for state in os.environ.get("MOBILE_ALERT_STATES", "FINAL,PARKED").split(",")
+    if state.strip()
+}
 
 # Gmail auto-import: mã bí mật Apps Script phải gửi trong header X-Import-Secret.
 # Khuyến nghị vẫn đặt biến môi trường GMAIL_IMPORT_SECRET trên Render bằng đúng mã dưới đây.
@@ -2529,6 +2537,7 @@ def _do_poll() -> None:
     now_ms = int(time.time() * 1000)
     updates = {}
     drops = []
+    transitions = []
 
     with _lock:
         for code in queue_snapshot:
@@ -2545,6 +2554,8 @@ def _do_poll() -> None:
                 new_entry = _process_miss(code, old, now_ms)
                 if new_entry is not None:
                     updates[code] = new_entry
+            if new_entry is not None and (old is None or old.state != new_entry.state):
+                transitions.append((code, new_entry))
 
         for code, entry in updates.items():
             TRACKED[code] = entry
@@ -2571,6 +2582,96 @@ def _do_poll() -> None:
     _sync_parked_entries_to_firestore(updates)
     # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
     _sync_overdue_schedule_claims_to_firestore(now_ms)
+    # Native app: phát cảnh báo theo chuyển trạng thái, không phát sinh vòng quét FR24 mới.
+    _notify_mobile_transitions(transitions)
+
+
+def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> None:
+    """Push canh bao tac nghiep cho app native khi tau chuyen sang moc quan trong."""
+    if not transitions or firebase_messaging is None:
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+
+    for code, entry in transitions:
+        state = str(entry.state or "").upper()
+        if state not in MOBILE_ALERT_STATES:
+            continue
+        with _lock:
+            hint = dict(SCHEDULE_HINTS.get(code) or {})
+        date_key = str(hint.get("date_key") or datetime.now(VN_TZ).strftime("%Y-%m-%d"))
+        event_id = f"{date_key}_{_clean_code(code)}_{state}"
+        event_ref = db.collection("mobileAlertEvents").document(event_id)
+        try:
+            if event_ref.get().exists:
+                continue
+            token_docs = list(db.collection("mobileDeviceTokens").where("enabled", "==", True).stream())
+            tokens = [
+                str(doc.to_dict().get("token") or "").strip()
+                for doc in token_docs
+                if str(doc.to_dict().get("token") or "").strip()
+            ]
+            if not tokens:
+                log.info("Mobile alert %s skipped: no registered Android token", event_id)
+                continue
+
+            claim = (
+                db.collection("pickups").document(date_key).collection("flights").document(code).get().to_dict()
+                or {}
+            )
+            stand = str(claim.get("stand") or hint.get("stand") or "").strip()
+            picker = str(claim.get("pickerName") or "").strip()
+            if state == "FINAL":
+                title = f"{code} đang vào hạ cánh"
+                speech = f"Chú ý. Tàu {code} đang vào hạ cánh."
+            else:
+                title = f"{code} đã vào bến"
+                speech = f"Chú ý. Tàu {code} đã vào bến."
+            if stand:
+                speech += f" Bến {stand}."
+            body = speech
+            if picker:
+                body += f" Người đón: {picker}."
+            else:
+                body += " Chưa có người nhận."
+                speech += " Chưa có người nhận."
+
+            success_count = 0
+            failure_count = 0
+            for start in range(0, len(tokens), 500):
+                response = firebase_messaging.send_each_for_multicast(
+                    firebase_messaging.MulticastMessage(
+                        tokens=tokens[start:start + 500],
+                        data={
+                            "type": "pickup_alert",
+                            "flight_code": code,
+                            "flight_state": state,
+                            "date_key": date_key,
+                            "stand": stand,
+                            "title": title,
+                            "body": body,
+                            "speech": speech,
+                        },
+                        android=firebase_messaging.AndroidConfig(priority="high"),
+                    )
+                )
+                success_count += response.success_count
+                failure_count += response.failure_count
+            event_ref.set({
+                "flightCode": code,
+                "flightState": state,
+                "dateKey": date_key,
+                "sentAt": firebase_firestore.SERVER_TIMESTAMP,
+                "successCount": success_count,
+                "failureCount": failure_count,
+            })
+            log.info(
+                "Mobile alert sent %s: success=%d failure=%d",
+                event_id, success_count, failure_count,
+            )
+        except Exception as error:
+            log.warning("Mobile alert failed %s: %s", event_id, error)
 
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
@@ -2636,7 +2737,7 @@ def require_api_key():
             return jsonify({"status": "error", "message": "Server chưa sẵn sàng xác thực"}), 500
         try:
             from firebase_admin import auth as fb_auth
-            fb_auth.verify_id_token(token)
+            g.firebase_user = fb_auth.verify_id_token(token)
             return None
         except Exception as e:
             log.warning("ID token verify failed: %s", e)
@@ -2776,6 +2877,45 @@ def firestore_sync_now():
             "tracked_count": len(TRACKED),
             "pid": os.getpid(),
         })
+
+
+@app.route("/api/mobile/device-token", methods=["POST"])
+def register_mobile_device_token():
+    """Dang ky FCM token cua app Android bang chinh Firebase ID token cua nguoi dung."""
+    if (err := require_api_key()):
+        return err
+    identity = getattr(g, "firebase_user", {}) or {}
+    uid = str(identity.get("uid") or identity.get("sub") or "").strip()
+    if not uid:
+        return jsonify({"status": "error", "message": "Chi chap nhan dang ky tu tai khoan Firebase."}), 403
+    db = _init_firestore_client()
+    if db is None:
+        return jsonify({"status": "error", "message": "Firestore chua san sang."}), 500
+    body = request.get_json(silent=True) or {}
+    token = str(body.get("token") or "").strip()
+    if len(token) < 20:
+        return jsonify({"status": "error", "message": "Thieu FCM token hop le."}), 400
+    enabled_raw = body.get("enabled", True)
+    enabled = (
+        enabled_raw.strip().lower() not in ("0", "false", "no", "off")
+        if isinstance(enabled_raw, str)
+        else bool(enabled_raw)
+    )
+    token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    payload = {
+        "uid": uid,
+        "email": str(identity.get("email") or ""),
+        "token": token,
+        "enabled": enabled,
+        "platform": str(body.get("platform") or "android"),
+        "appPackage": str(body.get("app_package") or ""),
+        "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+    }
+    if not enabled:
+        payload["disabledAt"] = firebase_firestore.SERVER_TIMESTAMP
+    db.collection("mobileDeviceTokens").document(token_id).set(payload, merge=True)
+    return jsonify({"status": "success", "enabled": enabled})
+
 
 @app.route("/api/cleanup_bad_parked_times", methods=["POST"])
 def cleanup_bad_parked_times():
