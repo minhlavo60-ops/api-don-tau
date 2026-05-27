@@ -3330,6 +3330,12 @@ def _looks_like_flight_code(value: str, *, route_context: bool = False) -> bool:
         if re.match(r"^[A-Z][A-Z0-9]{2,11}$", code) and re.search(r"\d", code):
             return True
 
+        # Một số chuyến charter/private trong lịch dùng callsign/registration toàn chữ,
+        # ví dụ CHVPBMH. Chỉ mở rule này trong route_context vì lúc đó dòng đã được
+        # xác nhận là dòng số thứ tự hợp lệ, A.ROUTE kết thúc -DAD và có SIBT.
+        if re.match(r"^[A-Z]{5,12}$", code):
+            return True
+
     return False
 
 
