@@ -233,16 +233,6 @@ MOBILE_ALERT_STATES = {
     for state in os.environ.get("MOBILE_ALERT_STATES", "FINAL,PARKED").split(",")
     if state.strip()
 }
-# Web/PWA cảnh báo nền dùng chung collection mobileDeviceTokens nhưng platform="web".
-# CLAIMED được tạo từ Firestore pickups, FINAL/PARKED được tạo từ transition radar.
-PICKUP_ALERT_WEB_LINK = os.environ.get("PICKUP_ALERT_WEB_LINK", "https://nhat-ky-don.web.app/").strip()
-CLAIM_ALERT_SYNC_MS = int(os.environ.get("CLAIM_ALERT_SYNC_MS", "60000"))
-CLAIM_ALERT_DATE_OFFSETS = [
-    int(part.strip())
-    for part in os.environ.get("CLAIM_ALERT_DATE_OFFSETS", "-1,0,1").split(",")
-    if part.strip().lstrip("-").isdigit()
-]
-LAST_CLAIM_ALERT_SYNC_MS: Optional[int] = None
 
 # Gmail auto-import: mã bí mật Apps Script phải gửi trong header X-Import-Secret.
 # Khuyến nghị vẫn đặt biến môi trường GMAIL_IMPORT_SECRET trên Render bằng đúng mã dưới đây.
@@ -2592,143 +2582,12 @@ def _do_poll() -> None:
     _sync_parked_entries_to_firestore(updates)
     # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
     _sync_overdue_schedule_claims_to_firestore(now_ms)
-    # Native app + Web/PWA: phát cảnh báo theo chuyển trạng thái, không phát sinh vòng quét FR24 mới.
+    # Native app: phát cảnh báo theo chuyển trạng thái, không phát sinh vòng quét FR24 mới.
     _notify_mobile_transitions(transitions)
-    # Web/PWA: phát cảnh báo mốc ETA còn N phút. Dùng feed vừa poll, không gọi FR24 thêm.
-    _notify_eta_minute_thresholds(updates, now_ms)
-    # Web/PWA: phát cảnh báo khi chuyến đã có người nhận. Tách riêng, throttle bằng CLAIM_ALERT_SYNC_MS.
-    _notify_claimed_pickups_from_firestore(now_ms)
-
-
-def _alert_setting_bool(raw, default: bool = True) -> bool:
-    """Ép setting bật/tắt từ body Firestore/API."""
-    if isinstance(raw, str):
-        return raw.strip().lower() not in ("0", "false", "no", "off")
-    if raw is None:
-        return default
-    return bool(raw)
-
-
-def _device_doc_enabled_for_state(data: dict, state: str) -> bool:
-    """Lọc token theo loại cảnh báo người dùng đã bật."""
-    state = str(state or "").upper()
-    platform = str(data.get("platform") or "android").lower()
-    # Android/native cũ chưa có setting chi tiết: giữ hành vi cũ cho FINAL/PARKED.
-    if state == "FINAL":
-        return _alert_setting_bool(data.get("alertFinal"), True)
-    if state == "PARKED":
-        return _alert_setting_bool(data.get("alertParked"), True)
-    if state == "CLAIMED":
-        # CLAIMED là chức năng mới, chỉ phát cho thiết bị đã bật rõ ràng.
-        return _alert_setting_bool(data.get("alertClaimed"), platform == "web")
-    return True
-
-
-def _load_enabled_device_docs_for_state(db, state: str) -> list[dict]:
-    """Đọc token đã bật và lọc theo setting. Collection cũ vẫn dùng được."""
-    docs = []
-    try:
-        token_docs = list(db.collection("mobileDeviceTokens").where("enabled", "==", True).stream())
-    except Exception as error:
-        log.warning("Load device tokens failed for %s: %s", state, error)
-        return docs
-    for doc_snap in token_docs:
-        data = doc_snap.to_dict() or {}
-        token = str(data.get("token") or "").strip()
-        if not token:
-            continue
-        if not _device_doc_enabled_for_state(data, state):
-            continue
-        data["token"] = token
-        data["tokenId"] = doc_snap.id
-        docs.append(data)
-    return docs
-
-
-def _send_pickup_alert_to_devices(
-    device_docs: list[dict],
-    *,
-    event_id: str,
-    code: str,
-    state: str,
-    date_key: str,
-    title: str,
-    body: str,
-    speech: str,
-    stand: str = "",
-    picker: str = "",
-) -> tuple[int, int]:
-    """Gửi FCM cho Android/native dạng data-only và Web/PWA dạng webpush notification."""
-    if not device_docs or firebase_messaging is None:
-        return 0, 0
-
-    data_payload = {
-        "type": "pickup_alert",
-        "event_id": str(event_id),
-        "flight_code": str(code),
-        "flight_state": str(state),
-        "date_key": str(date_key),
-        "stand": str(stand or ""),
-        "picker": str(picker or ""),
-        "title": str(title or "Cảnh báo đón tàu"),
-        "body": str(body or ""),
-        "speech": str(speech or body or ""),
-    }
-
-    web_tokens = []
-    native_tokens = []
-    for doc_data in device_docs:
-        token = str(doc_data.get("token") or "").strip()
-        platform = str(doc_data.get("platform") or "android").lower()
-        if platform == "web":
-            web_tokens.append(token)
-        else:
-            native_tokens.append(token)
-
-    success_count = 0
-    failure_count = 0
-
-    for start in range(0, len(native_tokens), 500):
-        response = firebase_messaging.send_each_for_multicast(
-            firebase_messaging.MulticastMessage(
-                tokens=native_tokens[start:start + 500],
-                data=data_payload,
-                android=firebase_messaging.AndroidConfig(priority="high"),
-            )
-        )
-        success_count += response.success_count
-        failure_count += response.failure_count
-
-    for start in range(0, len(web_tokens), 500):
-        response = firebase_messaging.send_each_for_multicast(
-            firebase_messaging.MulticastMessage(
-                tokens=web_tokens[start:start + 500],
-                data=data_payload,
-                notification=firebase_messaging.Notification(
-                    title=data_payload["title"],
-                    body=data_payload["body"],
-                ),
-                webpush=firebase_messaging.WebpushConfig(
-                    notification=firebase_messaging.WebpushNotification(
-                        title=data_payload["title"],
-                        body=data_payload["body"],
-                        icon="/icon-192.png",
-                        badge="/icon-192.png",
-                        tag=str(event_id),
-                        renotify=True,
-                    ),
-                    fcm_options=firebase_messaging.WebpushFCMOptions(link=PICKUP_ALERT_WEB_LINK),
-                ),
-            )
-        )
-        success_count += response.success_count
-        failure_count += response.failure_count
-
-    return success_count, failure_count
 
 
 def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> None:
-    """Push cảnh báo tác nghiệp cho Android/native và Web/PWA khi tàu chuyển mốc quan trọng."""
+    """Push canh bao tac nghiep cho app native khi tau chuyen sang moc quan trong."""
     if not transitions or firebase_messaging is None:
         return
     db = _init_firestore_client()
@@ -2741,30 +2600,34 @@ def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> No
             continue
         with _lock:
             hint = dict(SCHEDULE_HINTS.get(code) or {})
-        clean_code = _clean_code(code)
         date_key = str(hint.get("date_key") or datetime.now(VN_TZ).strftime("%Y-%m-%d"))
-        event_id = f"{date_key}_{clean_code}_{state}"
+        event_id = f"{date_key}_{_clean_code(code)}_{state}"
         event_ref = db.collection("mobileAlertEvents").document(event_id)
         try:
             if event_ref.get().exists:
                 continue
-            device_docs = _load_enabled_device_docs_for_state(db, state)
-            if not device_docs:
-                log.info("Pickup alert %s skipped: no eligible token", event_id)
+            token_docs = list(db.collection("mobileDeviceTokens").where("enabled", "==", True).stream())
+            tokens = [
+                str(doc.to_dict().get("token") or "").strip()
+                for doc in token_docs
+                if str(doc.to_dict().get("token") or "").strip()
+            ]
+            if not tokens:
+                log.info("Mobile alert %s skipped: no registered Android token", event_id)
                 continue
 
             claim = (
-                db.collection("pickups").document(date_key).collection("flights").document(clean_code).get().to_dict()
+                db.collection("pickups").document(date_key).collection("flights").document(code).get().to_dict()
                 or {}
             )
             stand = str(claim.get("stand") or hint.get("stand") or "").strip()
             picker = str(claim.get("pickerName") or "").strip()
             if state == "FINAL":
-                title = f"{clean_code} đang vào hạ cánh"
-                speech = f"Chú ý. Tàu {clean_code} đang vào hạ cánh."
+                title = f"{code} đang vào hạ cánh"
+                speech = f"Chú ý. Tàu {code} đang vào hạ cánh."
             else:
-                title = f"{clean_code} đã vào bến"
-                speech = f"Chú ý. Tàu {clean_code} đã vào bến."
+                title = f"{code} đã vào bến"
+                speech = f"Chú ý. Tàu {code} đã vào bến."
             if stand:
                 speech += f" Bến {stand}."
             body = speech
@@ -2774,225 +2637,41 @@ def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> No
                 body += " Chưa có người nhận."
                 speech += " Chưa có người nhận."
 
-            success_count, failure_count = _send_pickup_alert_to_devices(
-                device_docs,
-                event_id=event_id,
-                code=clean_code,
-                state=state,
-                date_key=date_key,
-                title=title,
-                body=body,
-                speech=speech,
-                stand=stand,
-                picker=picker,
-            )
+            success_count = 0
+            failure_count = 0
+            for start in range(0, len(tokens), 500):
+                response = firebase_messaging.send_each_for_multicast(
+                    firebase_messaging.MulticastMessage(
+                        tokens=tokens[start:start + 500],
+                        data={
+                            "type": "pickup_alert",
+                            "flight_code": code,
+                            "flight_state": state,
+                            "date_key": date_key,
+                            "stand": stand,
+                            "title": title,
+                            "body": body,
+                            "speech": speech,
+                        },
+                        android=firebase_messaging.AndroidConfig(priority="high"),
+                    )
+                )
+                success_count += response.success_count
+                failure_count += response.failure_count
             event_ref.set({
-                "flightCode": clean_code,
+                "flightCode": code,
                 "flightState": state,
                 "dateKey": date_key,
                 "sentAt": firebase_firestore.SERVER_TIMESTAMP,
                 "successCount": success_count,
                 "failureCount": failure_count,
-                "webEnabled": True,
             })
-            log.info("Pickup alert sent %s: success=%d failure=%d", event_id, success_count, failure_count)
-        except Exception as error:
-            log.warning("Pickup alert failed %s: %s", event_id, error)
-
-
-
-def _normalize_alert_minutes(data: dict) -> list[int]:
-    raw = data.get("alertMinutes") or data.get("alert_minutes") or [10, 5, 3, 1]
-    if isinstance(raw, str):
-        raw = [part.strip() for part in raw.split(",")]
-    if not isinstance(raw, list):
-        raw = [10, 5, 3, 1]
-    result = []
-    for value in raw:
-        try:
-            n = int(value)
-            if n > 0 and n not in result:
-                result.append(n)
-        except (TypeError, ValueError):
-            continue
-    return sorted(result or [10, 5, 3, 1], reverse=True)
-
-
-def _notify_eta_minute_thresholds(entries: dict[str, FlightEntry], now_ms: Optional[int] = None) -> int:
-    """Phát cảnh báo ETA còn N phút theo setting từng thiết bị.
-
-    Không gọi FR24 thêm; chỉ dùng entries vừa được _do_poll cập nhật.
-    Event id có thêm phút nên mỗi chuyến chỉ báo một lần cho từng mốc 10/5/3/1.
-    """
-    if not entries or firebase_messaging is None:
-        return 0
-    now_ms = int(now_ms or time.time() * 1000)
-    db = _init_firestore_client()
-    if db is None:
-        return 0
-    all_final_docs = _load_enabled_device_docs_for_state(db, "FINAL")
-    if not all_final_docs:
-        return 0
-
-    sent_total = 0
-    for code, entry in list(entries.items()):
-        try:
-            state = str(getattr(entry, "state", "") or "").upper()
-            if state not in ("EN_ROUTE", "APPROACH", "FINAL"):
-                continue
-            eta = getattr(entry, "eta_millis", None)
-            if not isinstance(eta, int) or eta <= now_ms:
-                continue
-            remaining_ms = eta - now_ms
-            with _lock:
-                hint = dict(SCHEDULE_HINTS.get(code) or {})
-            clean_code = _clean_code(code)
-            date_key = str(hint.get("date_key") or _date_key_from_millis(eta))
-
-            # Gom các mốc mà người dùng thật sự đăng ký.
-            thresholds = sorted({m for doc in all_final_docs for m in _normalize_alert_minutes(doc)}, reverse=True)
-            for minute in thresholds:
-                if remaining_ms > minute * 60_000:
-                    continue
-                event_id = f"{date_key}_{clean_code}_ETA_{minute}MIN"
-                event_ref = db.collection("mobileAlertEvents").document(event_id)
-                if event_ref.get().exists:
-                    continue
-                device_docs = [
-                    doc for doc in all_final_docs
-                    if minute in _normalize_alert_minutes(doc)
-                ]
-                if not device_docs:
-                    continue
-                claim = (
-                    db.collection("pickups").document(date_key).collection("flights").document(clean_code).get().to_dict()
-                    or {}
-                )
-                stand = str(claim.get("stand") or hint.get("stand") or "").strip()
-                picker = str(claim.get("pickerName") or "").strip()
-                title = f"{clean_code} còn khoảng {minute} phút"
-                speech = f"Chú ý. Tàu {clean_code} còn khoảng {minute} phút hạ cánh."
-                if stand:
-                    speech += f" Bến {stand}."
-                if picker:
-                    speech += f" Người đón: {picker}."
-                else:
-                    speech += " Chưa có người nhận."
-                body = speech
-                success_count, failure_count = _send_pickup_alert_to_devices(
-                    device_docs,
-                    event_id=event_id,
-                    code=clean_code,
-                    state=f"ETA_{minute}MIN",
-                    date_key=date_key,
-                    title=title,
-                    body=body,
-                    speech=speech,
-                    stand=stand,
-                    picker=picker,
-                )
-                event_ref.set({
-                    "flightCode": clean_code,
-                    "flightState": f"ETA_{minute}MIN",
-                    "dateKey": date_key,
-                    "etaMillis": eta,
-                    "minuteThreshold": minute,
-                    "sentAt": firebase_firestore.SERVER_TIMESTAMP,
-                    "successCount": success_count,
-                    "failureCount": failure_count,
-                })
-                sent_total += 1
-                # Chỉ gửi một mốc mỗi lần poll cho một chuyến để tránh bắn dồn 10/5/3/1 cùng lúc.
-                break
-        except Exception as error:
-            log.warning("ETA minute alert failed %s: %s", code, error)
-    if sent_total:
-        log.info("ETA minute alerts sent: %d", sent_total)
-    return sent_total
-
-def _notify_claimed_pickups_from_firestore(now_ms: Optional[int] = None) -> int:
-    """Phát cảnh báo khi chuyến đã có người nhận. Throttle riêng để không tăng read quá mức."""
-    global LAST_CLAIM_ALERT_SYNC_MS
-    if firebase_messaging is None:
-        return 0
-    now_ms = int(now_ms or time.time() * 1000)
-    if LAST_CLAIM_ALERT_SYNC_MS and now_ms - LAST_CLAIM_ALERT_SYNC_MS < CLAIM_ALERT_SYNC_MS:
-        return 0
-    LAST_CLAIM_ALERT_SYNC_MS = now_ms
-    db = _init_firestore_client()
-    if db is None:
-        return 0
-
-    with _lock:
-        schedule_dates = set(FIRESTORE_SCHEDULE_DATES or [])
-        hints = {code: dict(hint or {}) for code, hint in SCHEDULE_HINTS.items()}
-    for offset in CLAIM_ALERT_DATE_OFFSETS or [0]:
-        schedule_dates.add(_date_key_with_offset(offset, now_ms))
-
-    sent_total = 0
-    for date_key in sorted(d for d in schedule_dates if d):
-        try:
-            # Query có pickerUid để chỉ đọc các chuyến đã có người nhận, không quét toàn bộ lịch bay.
-            docs = list(
-                db.collection("pickups").document(date_key).collection("flights")
-                .where("pickerUid", ">", "")
-                .stream()
+            log.info(
+                "Mobile alert sent %s: success=%d failure=%d",
+                event_id, success_count, failure_count,
             )
-            if not docs:
-                continue
-            for snap in docs:
-                claim = snap.to_dict() or {}
-                clean_code = _clean_code(claim.get("flightCode") or snap.id)
-                if not clean_code:
-                    continue
-                picker = str(claim.get("pickerName") or "").strip()
-                picker_uid = str(claim.get("pickerUid") or "").strip()
-                if not picker and not picker_uid:
-                    continue
-                event_id = f"{date_key}_{clean_code}_CLAIMED"
-                event_ref = db.collection("mobileAlertEvents").document(event_id)
-                if event_ref.get().exists:
-                    continue
-                device_docs = _load_enabled_device_docs_for_state(db, "CLAIMED")
-                if not device_docs:
-                    continue
-                hint = hints.get(clean_code) or {}
-                stand = str(claim.get("stand") or hint.get("stand") or "").strip()
-                title = f"{clean_code} đã có người nhận"
-                speech = f"Chú ý. Tàu {clean_code} đã có người nhận."
-                if stand:
-                    speech += f" Bến {stand}."
-                if picker:
-                    speech += f" Người đón: {picker}."
-                body = speech
-                success_count, failure_count = _send_pickup_alert_to_devices(
-                    device_docs,
-                    event_id=event_id,
-                    code=clean_code,
-                    state="CLAIMED",
-                    date_key=date_key,
-                    title=title,
-                    body=body,
-                    speech=speech,
-                    stand=stand,
-                    picker=picker,
-                )
-                event_ref.set({
-                    "flightCode": clean_code,
-                    "flightState": "CLAIMED",
-                    "dateKey": date_key,
-                    "pickerUid": picker_uid,
-                    "pickerName": picker,
-                    "sentAt": firebase_firestore.SERVER_TIMESTAMP,
-                    "successCount": success_count,
-                    "failureCount": failure_count,
-                })
-                sent_total += 1
         except Exception as error:
-            log.warning("Claim alert scan failed %s: %s", date_key, error)
-    if sent_total:
-        log.info("Claim alerts sent: %d", sent_total)
-    return sent_total
+            log.warning("Mobile alert failed %s: %s", event_id, error)
 
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
@@ -3141,7 +2820,6 @@ def build_etas_payload(known_revision=None) -> dict:
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
             "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
-            "last_claim_alert_sync_ms": LAST_CLAIM_ALERT_SYNC_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
             "pid": os.getpid(),
@@ -3203,7 +2881,7 @@ def firestore_sync_now():
 
 @app.route("/api/mobile/device-token", methods=["POST"])
 def register_mobile_device_token():
-    """Đăng ký FCM token cho Android/native hoặc Web/PWA bằng Firebase ID token của người dùng."""
+    """Dang ky FCM token cua app Android bang chinh Firebase ID token cua nguoi dung."""
     if (err := require_api_key()):
         return err
     identity = getattr(g, "firebase_user", {}) or {}
@@ -3217,46 +2895,26 @@ def register_mobile_device_token():
     token = str(body.get("token") or "").strip()
     if len(token) < 20:
         return jsonify({"status": "error", "message": "Thieu FCM token hop le."}), 400
-    enabled = _alert_setting_bool(body.get("enabled", True), True)
-    platform = str(body.get("platform") or "android").strip().lower() or "android"
+    enabled_raw = body.get("enabled", True)
+    enabled = (
+        enabled_raw.strip().lower() not in ("0", "false", "no", "off")
+        if isinstance(enabled_raw, str)
+        else bool(enabled_raw)
+    )
     token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-    raw_minutes = body.get("alert_minutes") or body.get("alertMinutes") or [10, 5, 3, 1]
-    if isinstance(raw_minutes, str):
-        raw_minutes = [part.strip() for part in raw_minutes.split(",")]
-    if not isinstance(raw_minutes, list):
-        raw_minutes = [10, 5, 3, 1]
-    alert_minutes = []
-    for value in raw_minutes:
-        try:
-            n = int(value)
-            if n > 0 and n not in alert_minutes:
-                alert_minutes.append(n)
-        except (TypeError, ValueError):
-            continue
-    if not alert_minutes:
-        alert_minutes = [10, 5, 3, 1]
-
     payload = {
         "uid": uid,
         "email": str(identity.get("email") or ""),
         "token": token,
         "enabled": enabled,
-        "platform": platform,
-        "appPackage": str(body.get("app_package") or body.get("appPackage") or ""),
-        "deviceName": str(body.get("device_name") or body.get("deviceName") or ""),
-        "alertFinal": _alert_setting_bool(body.get("alert_final", body.get("alertFinal", True)), True),
-        "alertClaimed": _alert_setting_bool(body.get("alert_claimed", body.get("alertClaimed", platform == "web")), platform == "web"),
-        "alertParked": _alert_setting_bool(body.get("alert_parked", body.get("alertParked", True)), True),
-        "alertMinutes": alert_minutes,
+        "platform": str(body.get("platform") or "android"),
+        "appPackage": str(body.get("app_package") or ""),
         "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
     }
     if not enabled:
         payload["disabledAt"] = firebase_firestore.SERVER_TIMESTAMP
-    else:
-        payload["enabledAt"] = firebase_firestore.SERVER_TIMESTAMP
     db.collection("mobileDeviceTokens").document(token_id).set(payload, merge=True)
-    return jsonify({"status": "success", "enabled": enabled, "platform": platform})
+    return jsonify({"status": "success", "enabled": enabled})
 
 
 @app.route("/api/cleanup_bad_parked_times", methods=["POST"])
