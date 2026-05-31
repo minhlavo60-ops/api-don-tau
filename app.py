@@ -159,6 +159,43 @@ PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
 # 80m vừa đủ chứa biến động GPS + dịch chuyển nhỏ trong stand, không nuốt mất dừng tạm
 # trên taxiway intersection (thường cách bến vài trăm mét).
 PARKED_ANCHOR_DRIFT_M = float(os.environ.get("PARKED_ANCHOR_DRIFT_M", "80.0"))
+# ── STAND-SNAP: chỉ chốt PARKED khi tàu dừng GẦN một bến đã biết ──────────────
+# Chống lỗi "dừng chờ trên đường lăn/đường băng bị tính nhầm là vào bến".
+# Toạ độ bến được HỌC online từ các lần PARKED radar tin cậy (median per-stand),
+# lưu ở Firestore config/standCoords; có thể seed tay toạ độ chính xác sau.
+# An toàn nguội: khi chưa học đủ STAND_SNAP_MIN_COVERAGE bến → giữ nguyên hành vi cũ.
+STAND_SNAP_ENABLED = os.environ.get("STAND_SNAP_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+STAND_SNAP_M = float(os.environ.get("STAND_SNAP_M", "45.0"))                       # <= bán kính này coi là "ở bến"
+# Khi dừng XA mọi bến đã học (nghi dừng tạm, hoặc bến mới chưa học): chờ lâu hơn mới chốt.
+# Dừng tạm trên đường lăn hiếm khi đứng yên liên tục 9 phút (thường lăn tiếp → anchor reset),
+# còn bến mới thật sẽ đứng yên đủ lâu → vẫn chốt + học được toạ độ bến đó.
+PARKED_STABLE_FAR_MS = int(os.environ.get("PARKED_STABLE_FAR_MS", "540000"))
+STAND_SNAP_MIN_COVERAGE = int(os.environ.get("STAND_SNAP_MIN_COVERAGE", "8"))       # đủ số bến đã học mới tin cổng xa/gần
+STAND_LEARN_MIN_SAMPLES = int(os.environ.get("STAND_LEARN_MIN_SAMPLES", "3"))       # đủ mẫu mới coi toạ độ bến là tin được
+STAND_LEARN_MAX_SAMPLES = int(os.environ.get("STAND_LEARN_MAX_SAMPLES", "25"))      # giữ tối đa N mẫu/bến để tính median
+STAND_LEARN_OUTLIER_M = float(os.environ.get("STAND_LEARN_OUTLIER_M", "150.0"))     # mẫu lệch > ngưỡng so median = nhiễu → bỏ
+STAND_COORDS_DOC = os.environ.get("STAND_COORDS_DOC", "config/standCoords")
+STAND_COORDS_RELOAD_MS = int(os.environ.get("STAND_COORDS_RELOAD_MS", str(6 * 3600 * 1000)))  # nạp lại từ Firestore mỗi 6h
+STAND_COORDS_PERSIST_MS = int(os.environ.get("STAND_COORDS_PERSIST_MS", str(5 * 60 * 1000)))  # ghi Firestore tối đa mỗi 5 phút
+# Toạ độ bến CHÍNH THỨC từ AIP Việt Nam — VVDN AD 2.24-3a "INS coordinates and elevation
+# for aircraft stands" (30 JUL 2022). DMS đã đổi sang thập phân. Đây là seed authoritative:
+# deploy là stand-snap chính xác NGAY, không cần giai đoạn học. Bến 13 không tồn tại.
+# Có thể tắt seed bằng env STAND_SEED_ENABLED=false (khi đó quay lại chế độ tự học).
+STAND_SEED_ENABLED = os.environ.get("STAND_SEED_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+STAND_SEED_COORDS = {
+    "1": (16.06275, 108.200722), "2": (16.062347, 108.200781), "3": (16.061944, 108.200839),
+    "4": (16.061542, 108.200897), "5": (16.060625, 108.201031), "6": (16.060222, 108.201089),
+    "7": (16.059819, 108.201147), "8": (16.059417, 108.201208), "9": (16.059014, 108.201267),
+    "10": (16.0582, 108.201383), "11": (16.057794, 108.201231), "12": (16.057419, 108.201283),
+    "14": (16.056933, 108.2014), "15": (16.0566, 108.201403), "16": (16.056283, 108.201494),
+    "17": (16.055947, 108.201497), "18": (16.055636, 108.201589), "19": (16.055275, 108.201597),
+    "20": (16.054928, 108.201692), "21": (16.05455, 108.201703), "22": (16.054108, 108.201767),
+    "23": (16.053758, 108.201964), "24": (16.053369, 108.201883), "25": (16.053019, 108.202086),
+    "26": (16.052628, 108.201989), "27": (16.052283, 108.202231), "28": (16.05175, 108.202256),
+    "29": (16.051192, 108.202028), "30": (16.050789, 108.202086), "31": (16.050386, 108.202144),
+    "32": (16.049983, 108.202203), "33": (16.048886, 108.202736), "34": (16.048836, 108.202383),
+    "35": (16.048789, 108.202031), "36": (16.048742, 108.201681),
+}
 # Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
 # 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
@@ -269,6 +306,12 @@ FIRESTORE_SCHEDULE_DATES: list[str] = []
 PARKED_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_NEXT_CHECK_MS: dict[str, int] = {}
+# Stand-snap: toạ độ bến đã học. key = số bến (vd "25"); value = {lat,lng,n,samples,updated_ms,seed}
+STAND_COORDS: dict[str, dict] = {}
+STAND_COORDS_DIRTY = False
+STAND_COORDS_LOADED = False
+LAST_STAND_COORDS_LOAD_MS = 0
+LAST_STAND_COORDS_PERSIST_MS = 0
 _FIRESTORE_CLIENT = None
 ETAS_REVISION = 0
 ETAS_INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
@@ -771,6 +814,11 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                 taxi_delta_ms = max(0, int(entry.parked_at_millis) - int(entry.landed_at_millis))
             except (TypeError, ValueError):
                 taxi_delta_ms = None
+        # STAND-SNAP LEARN: chỉ học từ mốc radar ground-stop tin cậy cao (đã qua Gate A vị trí
+        # ở phần trên: có lat/lng và trong vòng FINAL_DIST_KM của DAD) + có số bến.
+        if (STAND_SNAP_ENABLED and new_source == "server_radar_ground_stop"
+                and old_stand and parked_lat is not None and parked_lng is not None):
+            _record_stand_observation(old_stand, parked_lat, parked_lng)
         payload = {
             "flightCode": old.get("flightCode") or doc_id,
             "displayFlightCode": old.get("displayFlightCode") or doc_id,
@@ -1194,6 +1242,212 @@ def _is_parked_on_ground(gs_kt: Optional[int], dist_km: Optional[float]) -> bool
     if gs_kt is None or dist_km is None:
         return False
     return gs_kt <= PARKED_GS_KT and dist_km <= PARKED_DIST_KM
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STAND-SNAP: học toạ độ bến + phân biệt "ở bến" với "dừng tạm trên đường lăn"
+# ══════════════════════════════════════════════════════════════════════════
+def _stand_key(stand) -> str:
+    """Chuẩn hoá số bến về key. "B25" → "25"; bỏ khoảng trắng; in hoa."""
+    s = str(stand or "").strip().upper()
+    if s.startswith("B") and s[1:].isdigit():
+        s = s[1:]
+    return s
+
+
+def _median(values) -> Optional[float]:
+    vals = sorted(v for v in values if isinstance(v, (int, float)))
+    if not vals:
+        return None
+    m = len(vals) // 2
+    return float(vals[m]) if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2.0
+
+
+def _stand_coord(stand_key: str):
+    """Trả (lat, lng, n) nếu bến đã đủ mẫu để tin; None nếu chưa."""
+    rec = STAND_COORDS.get(stand_key)
+    if not rec:
+        return None
+    lat, lng, n = rec.get("lat"), rec.get("lng"), int(rec.get("n") or 0)
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return None
+    if n < STAND_LEARN_MIN_SAMPLES:
+        return None
+    return (float(lat), float(lng), n)
+
+
+def _trusted_stand_count() -> int:
+    return sum(1 for k in STAND_COORDS if _stand_coord(k))
+
+
+def _nearest_trusted_stand_m(lat, lng):
+    """(stand_key, distance_m) tới bến đã học gần nhất; (None, inf) nếu chưa có bến nào tin được."""
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return (None, float("inf"))
+    best_key, best_m = None, float("inf")
+    for k in list(STAND_COORDS.keys()):
+        c = _stand_coord(k)
+        if not c:
+            continue
+        d = _haversine_km(lat, lng, c[0], c[1]) * 1000.0
+        if d < best_m:
+            best_m, best_key = d, k
+    return (best_key, best_m)
+
+
+def _stand_snap_status(lat, lng):
+    """(near_known_stand, far_from_all_known_stands).
+
+    (False, False) = chưa đủ dữ liệu / vị trí không rõ → caller giữ hành vi cũ (PARKED_STABLE_MS).
+    Chỉ phán "xa" khi đã học đủ STAND_SNAP_MIN_COVERAGE bến, để cold-start không bị chặn nhầm.
+    """
+    if not STAND_SNAP_ENABLED:
+        return (False, False)
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return (False, False)
+    if _trusted_stand_count() < STAND_SNAP_MIN_COVERAGE:
+        return (False, False)
+    _, dist_m = _nearest_trusted_stand_m(lat, lng)
+    return (True, False) if dist_m <= STAND_SNAP_M else (False, True)
+
+
+def _record_stand_observation(stand, lat, lng) -> None:
+    """Học toạ độ bến từ một lần PARKED radar đáng tin (median + loại nhiễu outlier)."""
+    global STAND_COORDS_DIRTY
+    try:
+        key = _stand_key(stand)
+        if not key or not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+            return
+        now_ms = int(time.time() * 1000)
+        rec = STAND_COORDS.get(key)
+        if rec is not None and rec.get("seed"):
+            return  # bến seed AIP: giữ toạ độ chính thức, không để mẫu radar kéo lệch
+        if rec is None:
+            STAND_COORDS[key] = {
+                "lat": float(lat), "lng": float(lng), "n": 1,
+                "samples": [[float(lat), float(lng)]], "updated_ms": now_ms, "seed": False,
+            }
+            STAND_COORDS_DIRTY = True
+            return
+        cur_lat, cur_lng = rec.get("lat"), rec.get("lng")
+        if isinstance(cur_lat, (int, float)) and isinstance(cur_lng, (int, float)):
+            drift_m = _haversine_km(lat, lng, cur_lat, cur_lng) * 1000.0
+            if drift_m > STAND_LEARN_OUTLIER_M:
+                log.info("stand %s: bỏ mẫu nhiễu cách median hiện tại %.0fm (> %.0fm)",
+                         key, drift_m, STAND_LEARN_OUTLIER_M)
+                return
+        samples = (rec.get("samples") or [])
+        samples.append([float(lat), float(lng)])
+        samples = samples[-STAND_LEARN_MAX_SAMPLES:]
+        rec["samples"] = samples
+        rec["lat"] = _median([s[0] for s in samples])
+        rec["lng"] = _median([s[1] for s in samples])
+        rec["n"] = len(samples)
+        rec["updated_ms"] = now_ms
+        STAND_COORDS_DIRTY = True
+    except Exception as e:
+        log.warning("record stand observation failed: %s", e)
+
+
+def _ensure_seed_coords() -> None:
+    """Đảm bảo có toạ độ bến seed AIP cho các bến còn thiếu (chạy được cả khi Firestore chưa sẵn sàng)."""
+    global STAND_COORDS_DIRTY
+    if not (STAND_SNAP_ENABLED and STAND_SEED_ENABLED):
+        return
+    now_ms = int(time.time() * 1000)
+    added = 0
+    for k, (la, lo) in STAND_SEED_COORDS.items():
+        key = _stand_key(k)
+        if key not in STAND_COORDS:
+            STAND_COORDS[key] = {
+                "lat": float(la), "lng": float(lo), "n": STAND_LEARN_MIN_SAMPLES,
+                "samples": [[float(la), float(lo)]], "updated_ms": now_ms, "seed": True,
+            }
+            added += 1
+    if added:
+        STAND_COORDS_DIRTY = True
+        log.info("Stand-snap: seed %d bến AIP (tổng %d, đủ tin %d)", added, len(STAND_COORDS), _trusted_stand_count())
+
+
+def _refresh_stand_coords_from_firestore(force: bool = False) -> None:
+    """Nạp toạ độ bến từ Firestore config/standCoords (throttle 6h) + điền seed AIP cho bến thiếu.
+
+    Firestore (nếu có chỉnh tay) được ưu tiên; seed AIP chỉ điền vào bến chưa có trong store.
+    """
+    global STAND_COORDS_LOADED, LAST_STAND_COORDS_LOAD_MS
+    if not STAND_SNAP_ENABLED:
+        return
+    now_ms = int(time.time() * 1000)
+    do_load = force or (not STAND_COORDS_LOADED) or (now_ms - LAST_STAND_COORDS_LOAD_MS) >= STAND_COORDS_RELOAD_MS
+    if do_load:
+        db = _init_firestore_client()
+        if db is not None:
+            try:
+                col, _, doc = STAND_COORDS_DOC.partition("/")
+                snap = db.collection(col).document(doc).get()
+                LAST_STAND_COORDS_LOAD_MS = now_ms
+                STAND_COORDS_LOADED = True
+                stands = (snap.to_dict() or {}).get("stands") if snap.exists else None
+                loaded = 0
+                if isinstance(stands, dict):
+                    for k, v in stands.items():
+                        if not isinstance(v, dict):
+                            continue
+                        lat, lng = v.get("lat"), v.get("lng")
+                        if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+                            continue
+                        key = _stand_key(k)
+                        seed = bool(v.get("seed"))
+                        n = int(v.get("n") or 0)
+                        samples = v.get("samples") if isinstance(v.get("samples"), list) else [[float(lat), float(lng)]]
+                        STAND_COORDS[key] = {
+                            "lat": float(lat), "lng": float(lng),
+                            # Toạ độ seed tay coi là tin ngay; toạ độ học giữ nguyên n đã lưu.
+                            "n": max(n, STAND_LEARN_MIN_SAMPLES) if seed else max(n, len(samples)),
+                            "samples": samples, "updated_ms": int(v.get("updated_ms") or now_ms), "seed": seed,
+                        }
+                        loaded += 1
+                log.info("Stand-snap: nạp %d bến từ %s", loaded, STAND_COORDS_DOC)
+            except Exception as e:
+                log.warning("load stand coords failed: %s", e)
+    # Luôn điền seed AIP cho bến còn thiếu (Firestore ưu tiên, seed bù vào chỗ trống).
+    _ensure_seed_coords()
+
+
+def _maybe_persist_stand_coords(force: bool = False) -> None:
+    """Ghi toạ độ bến đã học lên Firestore (throttle 5 phút, chỉ khi có thay đổi)."""
+    global STAND_COORDS_DIRTY, LAST_STAND_COORDS_PERSIST_MS
+    if not STAND_SNAP_ENABLED:
+        return
+    if not STAND_COORDS_DIRTY and not force:
+        return
+    now_ms = int(time.time() * 1000)
+    if not force and LAST_STAND_COORDS_PERSIST_MS and (now_ms - LAST_STAND_COORDS_PERSIST_MS) < STAND_COORDS_PERSIST_MS:
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        stands_out = {}
+        for k, rec in STAND_COORDS.items():
+            if not isinstance(rec, dict):
+                continue
+            stands_out[k] = {
+                "lat": rec.get("lat"), "lng": rec.get("lng"), "n": int(rec.get("n") or 0),
+                "samples": (rec.get("samples") or [])[-STAND_LEARN_MAX_SAMPLES:],
+                "updated_ms": int(rec.get("updated_ms") or now_ms), "seed": bool(rec.get("seed")),
+            }
+        col, _, doc = STAND_COORDS_DOC.partition("/")
+        db.collection(col).document(doc).set({
+            "stands": stands_out,
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "updatedByName": "server-radar-standlearn",
+        }, merge=True)
+        LAST_STAND_COORDS_PERSIST_MS = now_ms
+        STAND_COORDS_DIRTY = False
+        log.info("Stand-snap: đã ghi %d bến vào %s (đủ tin: %d)", len(stands_out), STAND_COORDS_DOC, _trusted_stand_count())
+    except Exception as e:
+        log.warning("persist stand coords failed: %s", e)
 
 
 def _terminal_age_ms(entry: Optional["FlightEntry"], now_ms: int) -> int:
@@ -1903,7 +2157,14 @@ def _process_match(
                 parked_anchor_lat = cur_lat
                 parked_anchor_lng = cur_lng
 
-        if now_ms - parked_candidate_since_ms >= PARKED_STABLE_MS:
+        # STAND-SNAP: gần một bến đã học → chốt nhanh (PARKED_STABLE_MS).
+        # Xa MỌI bến đã học (nghi dừng tạm trên đường lăn, hoặc bến mới chưa học) → đòi đứng
+        # yên lâu hơn (PARKED_STABLE_FAR_MS). Dừng tạm thường lăn tiếp trước ngưỡng đó nên
+        # candidate sẽ reset (anchor drift) → không bị chốt sai; bến mới thật đứng yên đủ lâu
+        # vẫn chốt được + sau đó học toạ độ bến đó. Khi chưa đủ coverage → (False,False) → như cũ.
+        _near_stand, _far_from_stands = _stand_snap_status(cur_lat, cur_lng)
+        required_stable_ms = PARKED_STABLE_FAR_MS if _far_from_stands else PARKED_STABLE_MS
+        if now_ms - parked_candidate_since_ms >= required_stable_ms:
             state = "PARKED"
             if parked_at_millis is None:
                 parked_at_millis = parked_candidate_since_ms
@@ -2100,10 +2361,14 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             and old.updated_at
             and (old.updated_at - int(candidate_ms)) >= 30_000
         )
+        # STAND-SNAP: nếu anchor (chỗ dừng lúc mất sóng) XA mọi bến đã học → "mất tín hiệu = đã đỗ"
+        # kém tin (có thể là dừng tạm trên đường lăn rồi mất sóng) → bỏ Tier B, rơi xuống landing+N.
+        # Cold-start / chưa đủ coverage → far=False → giữ nguyên hành vi cũ.
+        _, _anchor_far_from_stands = _stand_snap_status(old.parked_anchor_lat, old.parked_anchor_lng)
         if old.parked_at_millis:
             parked_at = old.parked_at_millis
             new_source = old.parked_source or "ground_stop"
-        elif candidate_stable_before_loss and miss_count >= 1:
+        elif candidate_stable_before_loss and not _anchor_far_from_stands and miss_count >= 1:
             # Tier B: tin tưởng cao nhất khi không thể chờ 240s stable
             parked_at = int(candidate_ms)
             new_source = "ground_stop"  # giữ HIGH confidence, signal cutoff xác nhận
@@ -2699,7 +2964,9 @@ def poll_loop() -> None:
     while True:
         try:
             _refresh_schedule_from_firestore(force=False)
+            _refresh_stand_coords_from_firestore(force=False)
             _do_poll()
+            _maybe_persist_stand_coords()
             _prune_old_schedule_hints()
             _prune_old_tracked_entries()
         except Exception as e:
@@ -3695,6 +3962,8 @@ def _start_poller():
 
 # Khởi tạo Firestore sớm để log trạng thái ngay khi deploy. Poller vẫn sẽ retry nếu credentials chưa sẵn sàng.
 _init_firestore_client()
+# Nạp sẵn toạ độ bến seed AIP để stand-snap chính xác ngay từ poll đầu tiên (kể cả poll tức thời).
+_ensure_seed_coords()
 _start_poller()
 
 
