@@ -251,6 +251,9 @@ FIRESTORE_SYNC_ENABLED = os.environ.get("FIRESTORE_SYNC_ENABLED", "true").strip(
 # Lịch đã được web/Gmail push ngay lúc đổi; poll nền chỉ là lớp dự phòng khi server restart
 # hoặc client không mở. Giữ cache RAM 15 phút thay vì đọc lại 3 document mỗi phút.
 FIRESTORE_SCHEDULE_SYNC_MS = int(os.environ.get("FIRESTORE_SCHEDULE_SYNC_MS", "900000"))
+# Chuyến nhập tay ngoài lịch nằm trong pickups/{date}/flights với manualTracking=true.
+# Server phải tự nạp các mã này vào QUEUE để bám FR24, kể cả khi client cũ chưa gửi code.
+FIRESTORE_MANUAL_TRACKING_SYNC_MS = int(os.environ.get("FIRESTORE_MANUAL_TRACKING_SYNC_MS", "60000"))
 # Fallback nghiệp vụ: nếu một chuyến đã có người đón nhưng radar không sinh PARKED,
 # sau SIBT một khoảng an toàn server sẽ chốt bằng giờ lịch để hồ sơ không treo mãi.
 # Để ổn định khi giao ngày/delay muộn, mặc định chờ 90 phút thay vì 30 phút.
@@ -297,12 +300,15 @@ LAST_IMMEDIATE_POLL_MS = 0
 LAST_ERROR: Optional[str] = None
 LAST_POLL_DURATION_MS: Optional[int] = None
 LAST_FIRESTORE_SCHEDULE_SYNC_MS: Optional[int] = None
+LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS: Optional[int] = None
+LAST_FIRESTORE_MANUAL_TRACKING_ERROR: Optional[str] = None
 LAST_FIRESTORE_SYNC_ERROR: Optional[str] = None
 LAST_FIRESTORE_PARKED_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_SYNC_MS: Optional[int] = None
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
+FIRESTORE_MANUAL_TRACKING_DATES: list[str] = []
 PARKED_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_NEXT_CHECK_MS: dict[str, int] = {}
@@ -686,6 +692,87 @@ def _refresh_schedule_from_firestore(force: bool = False) -> int:
         LAST_FIRESTORE_SCHEDULE_SYNC_MS = now_ms
         LAST_FIRESTORE_SYNC_ERROR = str(e)
         log.warning("Firestore schedule sync failed: %s", e)
+        return 0
+
+
+def _sync_manual_tracking_from_firestore(force: bool = False, trigger_poll: bool = True) -> int:
+    """Đưa các chuyến nhập tay đang theo dõi vào QUEUE radar.
+
+    Các chuyến ngoài lịch không có trong flightPlans nên sync lịch thường không biết tới.
+    Khi user bấm "Thêm theo dõi", web/Android ghi pickups/{date}/flights/{code}
+    với manualTracking=true. Server đọc các doc này định kỳ để bám FR24. Nếu FR24 chưa
+    thấy mã đó thì API chỉ trả PENDING; khi FR24 bắt được, chuyến sẽ có lat/lng như bình thường.
+    """
+    global LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS, LAST_FIRESTORE_MANUAL_TRACKING_ERROR
+    global LAST_FIRESTORE_SYNC_ERROR, FIRESTORE_MANUAL_TRACKING_DATES
+
+    now_ms = int(time.time() * 1000)
+    if (not force and LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS
+            and now_ms - LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS < FIRESTORE_MANUAL_TRACKING_SYNC_MS):
+        return 0
+
+    db = _init_firestore_client()
+    if db is None:
+        LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS = now_ms
+        return 0
+
+    date_keys = [
+        _date_key_with_offset(offset, now_ms)
+        for offset in range(-max(0, FIRESTORE_SCHEDULE_DAYS_BACK), max(0, FIRESTORE_SCHEDULE_DAYS_AHEAD) + 1)
+    ]
+    codes: set[str] = set()
+    loaded_dates: list[str] = []
+
+    try:
+        for date_key in date_keys:
+            col = db.collection("pickups").document(date_key).collection("flights")
+            # Query 1 field để không cần composite index.
+            docs = col.where("manualTracking", "==", True).stream()
+            date_has_tracking = False
+            for snap in docs:
+                data = snap.to_dict() or {}
+                if data.get("finalized") is True or data.get("locked") is True:
+                    continue
+                picker_uid = str(data.get("pickerUid") or "").strip()
+                picker_name = str(data.get("pickerName") or "").strip()
+                if not picker_uid and not picker_name:
+                    continue
+                code = _clean_code(data.get("displayFlightCode") or data.get("flightCode") or snap.id)
+                if not code:
+                    continue
+                codes.add(code)
+                date_has_tracking = True
+            if date_has_tracking:
+                loaded_dates.append(date_key)
+
+        new_codes: list[str] = []
+        if codes:
+            with _lock:
+                new_codes = [code for code in codes if code not in QUEUE]
+                QUEUE.update(codes)
+            if new_codes:
+                _bump_etas_revision()
+
+        LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS = now_ms
+        LAST_FIRESTORE_MANUAL_TRACKING_ERROR = None
+        FIRESTORE_MANUAL_TRACKING_DATES = loaded_dates
+        LAST_FIRESTORE_SYNC_ERROR = None
+
+        if codes:
+            log.info(
+                "Firestore manual tracking sync: dates=%s codes=%d new=%d",
+                ",".join(loaded_dates) or "-",
+                len(codes),
+                len(new_codes),
+            )
+        if trigger_poll and new_codes:
+            _try_immediate_poll(f"manual tracking new={len(new_codes)}")
+        return len(codes)
+    except Exception as e:
+        LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS = now_ms
+        LAST_FIRESTORE_MANUAL_TRACKING_ERROR = str(e)
+        LAST_FIRESTORE_SYNC_ERROR = str(e)
+        log.warning("Firestore manual tracking sync failed: %s", e)
         return 0
 
 
@@ -2745,6 +2832,10 @@ def _do_poll() -> None:
 
     started = time.time()
 
+    # Bám cả chuyến nhập tay ngoài lịch: chúng không nằm trong flightPlans nên phải
+    # sync từ pickups trước khi chụp QUEUE cho chu kỳ poll này.
+    _sync_manual_tracking_from_firestore(force=False, trigger_poll=False)
+
     with _lock:
         queue_snapshot = set(QUEUE)
 
@@ -3084,11 +3175,14 @@ def build_etas_payload(known_revision=None) -> dict:
             "tracked_count": len(TRACKED),
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_manual_tracking_sync_ms": LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
             "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "last_firestore_manual_tracking_error": LAST_FIRESTORE_MANUAL_TRACKING_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
+            "firestore_manual_tracking_dates": FIRESTORE_MANUAL_TRACKING_DATES,
             "pid": os.getpid(),
             "flights": result,
         }
@@ -3111,11 +3205,14 @@ def health():
             "pid": os.getpid(),
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_manual_tracking_sync_ms": LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
             "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "last_firestore_manual_tracking_error": LAST_FIRESTORE_MANUAL_TRACKING_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
+            "firestore_manual_tracking_dates": FIRESTORE_MANUAL_TRACKING_DATES,
         })
 
 
@@ -3126,19 +3223,24 @@ def firestore_sync_now():
     if (err := require_api_key()):
         return err
     written = _refresh_schedule_from_firestore(force=True)
+    manual_tracking = _sync_manual_tracking_from_firestore(force=True)
     now_ms = int(time.time() * 1000)
     with _lock:
         return jsonify({
             "status": "success" if FIRESTORE_STATUS in ("ready", "disabled", "missing_firebase_admin") else "error",
             "server_time_millis": now_ms,
             "registered": written,
+            "manual_tracking_codes": manual_tracking,
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
+            "last_firestore_manual_tracking_sync_ms": LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS,
             "last_firestore_parked_write_ms": LAST_FIRESTORE_PARKED_WRITE_MS,
             "last_firestore_fallback_sync_ms": LAST_FIRESTORE_FALLBACK_SYNC_MS,
             "last_firestore_fallback_write_ms": LAST_FIRESTORE_FALLBACK_WRITE_MS,
             "last_firestore_sync_error": LAST_FIRESTORE_SYNC_ERROR,
+            "last_firestore_manual_tracking_error": LAST_FIRESTORE_MANUAL_TRACKING_ERROR,
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
+            "firestore_manual_tracking_dates": FIRESTORE_MANUAL_TRACKING_DATES,
             "queue_count": len(QUEUE),
             "schedule_count": len(SCHEDULE_HINTS),
             "tracked_count": len(TRACKED),
@@ -3307,6 +3409,7 @@ def get_all_etas():
     if (err := require_api_key()):
         return err
     _refresh_schedule_from_firestore(force=False)
+    _sync_manual_tracking_from_firestore(force=False)
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     if request.method == "POST":
         codes = body.get("codes", []) or []
