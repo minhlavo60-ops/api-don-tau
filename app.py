@@ -35,7 +35,7 @@ from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from FlightRadar24 import FlightRadar24API
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -159,6 +159,13 @@ PARKED_STABLE_MS = int(os.environ.get("PARKED_STABLE_MS", "240000"))
 # 80m vừa đủ chứa biến động GPS + dịch chuyển nhỏ trong stand, không nuốt mất dừng tạm
 # trên taxiway intersection (thường cách bến vài trăm mét).
 PARKED_ANCHOR_DRIFT_M = float(os.environ.get("PARKED_ANCHOR_DRIFT_M", "80.0"))
+# ── GỠ CHỐT KHI TÀU LĂN TIẾP (giờ tạm → cập nhật) ────────────────────────────
+# Mô hình: khi đã chốt PARKED nhưng radar còn live, đó mới là GIỜ TẠM (provisional).
+# Nếu sau đó tàu LĂN TIẾP rõ ràng (gs cao hoặc rời xa chỗ đã dừng) → GỠ chốt tạm,
+# theo dõi lại để lấy mốc dừng MỚI. Mốc chỉ được XÁC NHẬN (chốt thật) khi tàu tắt
+# radar (transponder off tại bến). Xử lý case "dừng chờ ngoài đường lăn rồi lăn vào bến".
+PARKED_RESUME_GS_KT = int(os.environ.get("PARKED_RESUME_GS_KT", "8"))       # gs ≥ ngưỡng = đang lăn lại
+PARKED_RESUME_DRIFT_M = float(os.environ.get("PARKED_RESUME_DRIFT_M", "150.0"))  # rời chỗ đã dừng > ngưỡng = đã lăn đi
 # ── STAND-SNAP: chỉ chốt PARKED khi tàu dừng GẦN một bến đã biết ──────────────
 # Chống lỗi "dừng chờ trên đường lăn/đường băng bị tính nhầm là vào bến".
 # Toạ độ bến được HỌC online từ các lần PARKED radar tin cậy (median per-stand),
@@ -834,9 +841,10 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if not date_key or not doc_id:
         return False
 
-    # Nguồn là một phần của khóa: nếu mốc fallback LOW được nâng cấp thành ground_stop
-    # HIGH với cùng timestamp, server vẫn được phép kiểm tra/ghi lại đúng một lần.
-    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}:{entry.parked_source or ''}"
+    # Nguồn + cờ "đã xác nhận" là một phần của khóa: cùng mốc nhưng từ TẠM → ĐÃ XÁC NHẬN
+    # (hoặc fallback LOW → ground_stop HIGH) vẫn được phép ghi lại đúng một lần để chốt.
+    confirmed = bool(getattr(entry, "parked_confirmed", False))
+    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}:{entry.parked_source or ''}:{int(confirmed)}"
     if sync_key in PARKED_FIRESTORE_SYNCED:
         return False
 
@@ -868,7 +876,10 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         old_picker_name = str(old.get("pickerName") or "").strip()
         old_picker_uid = str(old.get("pickerUid") or "").strip()
         old_stand = str(old.get("stand") or hint.get("stand") or "").strip()
-        should_auto_finalize = bool(old_picker_name and old_stand and not old.get("finalized") and not old.get("locked"))
+        # CHỈ tự chốt khi đã XÁC NHẬN (tàu tắt radar). Còn TẠM thì chỉ ghi giờ, chưa chốt.
+        should_auto_finalize = bool(old_picker_name and old_stand and confirmed
+                                    and not old.get("finalized") and not old.get("locked"))
+        old_provisional = bool(old.get("actualParkedProvisional"))
         old_source = str(old.get("actualParkedSource") or "")
         has_old_parked_time = bool(old.get("actualParkedAtMillis") or old.get("actualParkedTime"))
         overwritable_sources = {
@@ -880,7 +891,9 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "web_landing_plus_3min",
             "server_landing_plus_3min",
         }
-        if has_old_parked_time and not should_auto_finalize:
+        # Mốc cũ đang TẠM (provisional) thì luôn cho ghi đè bằng mốc mới (cập nhật khi tàu
+        # lăn tiếp rồi dừng lại, hoặc khi chốt lúc tắt radar).
+        if has_old_parked_time and not should_auto_finalize and not old_provisional:
             if old_source not in overwritable_sources:
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
@@ -922,6 +935,8 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "actualParkedTimeFull": parked_hhmmss,
             "actualParkedSource": new_source,
             "actualParkedConfidence": new_confidence,
+            # True = giờ TẠM (radar còn thấy, tàu có thể lăn tiếp); False = đã XÁC NHẬN (chốt).
+            "actualParkedProvisional": (not confirmed),
             "actualParkedUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
             "actualParkedLat": parked_lat,
             "actualParkedLng": parked_lng,
@@ -941,6 +956,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         should_refresh_auto_finalized_time = bool(
             (old.get("autoFinalizedByRadar") or old.get("autoFinalizedByLandingFallback"))
             and new_source == "server_radar_ground_stop"
+            and confirmed
         )
         if should_auto_finalize or should_refresh_auto_finalized_time:
             payload.update({
@@ -1200,6 +1216,10 @@ class FlightEntry:
     # Cách này tách "dừng cuối cùng tại bến" khỏi "dừng tạm chờ giao thông".
     parked_anchor_lat: Optional[float] = None
     parked_anchor_lng: Optional[float] = None
+    # Mốc parked đã được XÁC NHẬN (tàu tắt radar tại bến) chưa? False = mới chỉ TẠM
+    # (radar còn thấy, tàu có thể lăn tiếp). Provisional vẫn ghi vào lịch sử để xem/đếm
+    # nhưng CHƯA "chốt"; chỉ chốt khi confirmed=True (tín hiệu mất sau khi đã dừng).
+    parked_confirmed: bool = False
 
     def to_public(self, now_ms: int) -> dict:
         stale_seconds = (now_ms - self.updated_at) // 1000 if self.updated_at else None
@@ -1259,6 +1279,10 @@ class FlightEntry:
             "parked_candidate_since_ms": self.parked_candidate_since_ms,
             "parked_anchor_lat": self.parked_anchor_lat,
             "parked_anchor_lng": self.parked_anchor_lng,
+            # Giờ vào bến đã xác nhận (chốt) hay mới chỉ tạm. Web dùng để KHÔNG chốt
+            # vội khi tàu còn có thể lăn tiếp.
+            "parked_confirmed": self.parked_confirmed,
+            "actual_parked_provisional": bool(self.parked_at_millis) and not self.parked_confirmed,
         }
 
 
@@ -2206,6 +2230,7 @@ def _process_match(
     parked_anchor_lat = old.parked_anchor_lat if old else None
     parked_anchor_lng = old.parked_anchor_lng if old else None
     parked_source = old.parked_source if old else None
+    parked_confirmed = False   # _process_match là lúc radar CÒN thấy tàu ⇒ chỉ là giờ TẠM
     landed_at_millis, landed_source = _resolve_landed_at_millis(
         state, old, now_ms,
         real_arrival_ms=real_arrival_ms,
@@ -2214,13 +2239,39 @@ def _process_match(
     )
 
     if old and old.state == "PARKED":
-        # Sticky PARKED: đã dừng/vào bến rồi thì không revert về taxi/airborne.
-        # Không tự gán now_ms/updated_at làm giờ dừng bến; chỉ giữ timestamp đã được xác nhận ổn định.
-        state = "PARKED"
-        parked_at_millis = old.parked_at_millis
-        parked_source = old.parked_source
-        parked_anchor_lat = old.parked_anchor_lat
-        parked_anchor_lng = old.parked_anchor_lng
+        # Đã PARKED. Mặc định "sticky" (giữ mốc, dung sai nhiễu GPS) — TRỪ KHI tàu rõ ràng
+        # LĂN TIẾP: khi đó gỡ giờ TẠM và theo dõi lại để lấy mốc dừng MỚI. Mốc đã được
+        # XÁC NHẬN (parked_confirmed, tức tàu từng tắt radar) thì không gỡ nữa.
+        cur_lat = sensors["lat"]
+        cur_lng = sensors["lng"]
+        moving_gs = sensors["gs_kt"] is not None and sensors["gs_kt"] >= PARKED_RESUME_GS_KT
+        drift_resume_m = None
+        if (cur_lat is not None and cur_lng is not None
+                and old.parked_anchor_lat is not None and old.parked_anchor_lng is not None):
+            drift_resume_m = _haversine_km(cur_lat, cur_lng, old.parked_anchor_lat, old.parked_anchor_lng) * 1000
+        moving_drift = drift_resume_m is not None and drift_resume_m > PARKED_RESUME_DRIFT_M
+        still_near_dad = _is_at_dad_airport(sensors["distance_km"])
+        if (not old.parked_confirmed) and still_near_dad and (moving_gs or moving_drift):
+            log.info(
+                "%s: UNPARK — tàu lăn tiếp sau khi dừng tạm (gs=%s kt, drift=%s m); gỡ giờ tạm, theo dõi lại",
+                code, sensors["gs_kt"],
+                f"{drift_resume_m:.0f}" if drift_resume_m is not None else "?",
+            )
+            state = "TAXIING"
+            parked_at_millis = None
+            parked_candidate_since_ms = None
+            parked_anchor_lat = None
+            parked_anchor_lng = None
+            parked_source = None
+            parked_confirmed = False
+        else:
+            # Sticky: giữ mốc (tạm hoặc đã xác nhận), không revert về taxi/airborne.
+            state = "PARKED"
+            parked_at_millis = old.parked_at_millis
+            parked_source = old.parked_source
+            parked_anchor_lat = old.parked_anchor_lat
+            parked_anchor_lng = old.parked_anchor_lng
+            parked_confirmed = old.parked_confirmed
     elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
         cur_lat = sensors["lat"]
         cur_lng = sensors["lng"]
@@ -2275,11 +2326,17 @@ def _process_match(
     aircraft_type = _aircraft_type_for_code(code, details)
     taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
     landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms, taxi_buffer_ms)
+    # Không để fallback landing+N tái-chốt NGAY khi vừa GỠ (tàu đang lăn tiếp), cũng không
+    # chốt khi tàu đang lăn rõ ràng — chờ tàu dừng lại (ground_stop) hoặc tắt radar.
+    _just_unparked = bool(old and old.state == "PARKED" and state == "TAXIING")
+    _clearly_moving = sensors["gs_kt"] is not None and sensors["gs_kt"] >= PARKED_RESUME_GS_KT
     if (
         parked_at_millis is None
         and landing_fallback_parked is not None
         and landed_at_millis is not None
         and (now_ms - int(landed_at_millis)) >= LANDED_MIN_AGE_BEFORE_FALLBACK_MS
+        and not _just_unparked
+        and not _clearly_moving
     ):
         log.info(
             "%s: fallback landing+%dmin fire (aircraft=%s, age_after_landing=%dmin)",
@@ -2335,6 +2392,7 @@ def _process_match(
                 parked_source=parked_source,
                 parked_anchor_lat=parked_anchor_lat,
                 parked_anchor_lng=parked_anchor_lng,
+                parked_confirmed=parked_confirmed,
             )
 
         # Reset history khi sang FINAL (dynamics khác hẳn)
@@ -2391,6 +2449,7 @@ def _process_match(
         parked_source=parked_source,
         parked_anchor_lat=parked_anchor_lat,
         parked_anchor_lng=parked_anchor_lng,
+        parked_confirmed=parked_confirmed,
     )
 
 
@@ -2418,6 +2477,10 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         if _terminal_age_ms(old, now_ms) > TRACKED_TERMINAL_RETAIN_MS:
             log.info("%s: drop stale PARKED entry from RAM after %d minutes", code, _terminal_age_ms(old, now_ms) // 60000)
             return None
+        if not old.parked_confirmed:
+            # Đã PARKED rồi mất tín hiệu = transponder off tại bến → XÁC NHẬN (chốt) giờ vào bến.
+            log.info("%s: PARKED + mất tín hiệu → XÁC NHẬN giờ vào bến (chốt)", code)
+            return replace(old, parked_confirmed=True, miss_count=old.miss_count + 1)
         return old
 
     # SCHEDULED state có sẵn: giữ nguyên, không tăng miss vì chưa từng có live.
@@ -2496,6 +2559,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 parked_source=old.parked_source,
                 parked_anchor_lat=old.parked_anchor_lat,
                 parked_anchor_lng=old.parked_anchor_lng,
+                parked_confirmed=old.parked_confirmed,
             )
 
         log.info(
@@ -2526,6 +2590,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_source=new_source,
             parked_anchor_lat=old.parked_anchor_lat,
             parked_anchor_lng=old.parked_anchor_lng,
+            parked_confirmed=True,
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
@@ -2554,6 +2619,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_source=old.parked_source,
             parked_anchor_lat=old.parked_anchor_lat,
             parked_anchor_lng=old.parked_anchor_lng,
+            parked_confirmed=old.parked_confirmed,
         )
 
     # Vượt ngưỡng drop
@@ -2583,6 +2649,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 parked_source=old.parked_source,
                 parked_anchor_lat=old.parked_anchor_lat,
                 parked_anchor_lng=old.parked_anchor_lng,
+                parked_confirmed=old.parked_confirmed,
             )
         log.info("%s: %s + missed %d → LOST", code, old.state, miss_count)
         return FlightEntry(
@@ -2608,6 +2675,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_source=old.parked_source,
             parked_anchor_lat=old.parked_anchor_lat,
             parked_anchor_lng=old.parked_anchor_lng,
+            parked_confirmed=old.parked_confirmed,
         )
 
     # Chưa tới ngưỡng — chỉ bump counter, giữ data cũ
@@ -2634,6 +2702,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         parked_source=old.parked_source,
         parked_anchor_lat=old.parked_anchor_lat,
         parked_anchor_lng=old.parked_anchor_lng,
+        parked_confirmed=old.parked_confirmed,
     )
 
 
