@@ -100,7 +100,7 @@ IMMEDIATE_POLL_COOLDOWN_MS = 10_000
 # Adaptive polling: giảm tải server miễn phí nhưng vẫn cập nhật dày khi tàu gần DAD/taxi.
 ADAPTIVE_POLL_FAR_MS = int(os.environ.get("ADAPTIVE_POLL_FAR_MS", "60000"))       # tàu còn xa
 ADAPTIVE_POLL_MID_MS = int(os.environ.get("ADAPTIVE_POLL_MID_MS", "30000"))       # approach xa / còn 10-20 phút
-ADAPTIVE_POLL_NEAR_MS = int(os.environ.get("ADAPTIVE_POLL_NEAR_MS", "20000"))     # final / còn dưới 10 phút
+ADAPTIVE_POLL_NEAR_MS = int(os.environ.get("ADAPTIVE_POLL_NEAR_MS", "30000"))     # final / taxi / gần sân bay (đo 06/2026: FR24 tươi ~8s, web client refresh 60s → 30s đủ cho chockon mà nhẹ request hơn 20s)
 ADAPTIVE_POLL_TAXI_MS = int(os.environ.get("ADAPTIVE_POLL_TAXI_MS", "20000"))     # đã hạ, đang taxi
 ADAPTIVE_MID_REMAINING_MS = int(os.environ.get("ADAPTIVE_MID_REMAINING_MS", str(20 * 60_000)))
 ADAPTIVE_NEAR_REMAINING_MS = int(os.environ.get("ADAPTIVE_NEAR_REMAINING_MS", str(10 * 60_000)))
