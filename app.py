@@ -306,6 +306,10 @@ LAST_POLL_MS: Optional[int] = None
 LAST_IMMEDIATE_POLL_MS = 0
 LAST_ERROR: Optional[str] = None
 LAST_POLL_DURATION_MS: Optional[int] = None
+# code → ms lần cuối gọi get_flight_details cho mã đó. Dùng để giãn fetch chi tiết
+# theo nhịp riêng từng tàu (tàu xa 60s, tàu gần 30s) thay vì fetch MỌI mã mỗi chu kỳ.
+# Vị trí live vẫn lấy free từ 1 lần get_flights/chu kỳ nên throttle này không ảnh hưởng vị trí.
+_LAST_DETAIL_MS: dict = {}
 LAST_FIRESTORE_SCHEDULE_SYNC_MS: Optional[int] = None
 LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS: Optional[int] = None
 LAST_FIRESTORE_MANUAL_TRACKING_ERROR: Optional[str] = None
@@ -1894,6 +1898,21 @@ def _desired_refresh_interval_ms(entry: Optional[FlightEntry], now_ms: int) -> i
     return ADAPTIVE_POLL_FAR_MS
 
 
+def _should_fetch_details(entry: Optional[FlightEntry], last_detail_ms: int, now_ms: int) -> bool:
+    """Có nên gọi get_flight_details cho mã này ở chu kỳ poll hiện tại không.
+
+    Vị trí live đã lấy free từ get_flights mỗi chu kỳ; đây chỉ quyết định khi nào tốn thêm
+    1 request get_flight_details (ETA-FR24, real_arrival, chi tiết tàu) cho từng mã.
+    - PARKED/LOST: không cần (đã chốt; vị trí bounds scan là đủ).
+    - Mã mới (last_detail_ms=0) hoặc tàu near/approach/final/đang lăn: fetch (giữ chất lượng).
+    - Tàu en-route ở xa: chỉ fetch lại sau _desired_refresh_interval_ms (60s) → giãn tải.
+    """
+    if entry is not None and entry.state in TERMINAL_STATES:
+        return False
+    desired = max(5_000, _desired_refresh_interval_ms(entry, now_ms))
+    return now_ms - last_detail_ms >= desired
+
+
 def _entry_needs_refresh(entry: Optional[FlightEntry], now_ms: int, min_refresh_ms: Optional[int] = None) -> bool:
     """Có cần poll lại FR24 để cập nhật live position không."""
     if entry is None:
@@ -2941,13 +2960,27 @@ def _do_poll() -> None:
                 targets[requested_code] = f
                 break
 
+    # Lọc fetch chi tiết theo nhịp riêng TỪNG tàu (tiết kiệm request FR24 → giảm rủi ro chặn IP):
+    #   - Tàu near/approach/final/đang lăn → fetch ~30s (giữ ETA-FR24 & mốc hạ chính xác).
+    #   - Tàu en-route ở xa → giãn ra ~60s; vị trí vẫn cập nhật MỖI chu kỳ từ get_flights.
+    #   - Tàu đã PARKED/LOST → khỏi fetch (vị trí bounds scan là đủ).
+    # Trước đây fetch MỌI mã mỗi chu kỳ; 1 tàu hạ (cycle=30s) kéo cả đội bị fetch 30s.
+    # _process_match đã xử lý details=None an toàn (vốn xảy ra khi detail timeout) nên mã bị
+    # giãn chu kỳ vẫn được phân loại đúng từ vị trí (state/physics-ETA không cần details).
+    now_pre = int(time.time() * 1000)
+    detail_targets = {}
+    with _lock:
+        for code, flight in targets.items():
+            if _should_fetch_details(TRACKED.get(code), _LAST_DETAIL_MS.get(code, 0), now_pre):
+                detail_targets[code] = flight
+
     # Parallel fetch details (5 worker, timeout 8s/call)
     details_map = {}
-    if targets:
+    if detail_targets:
         with ThreadPoolExecutor(max_workers=DETAIL_POOL_SIZE) as ex:
             futures = {
                 code: ex.submit(_safe_get_details, fr_api, flight)
-                for code, flight in targets.items()
+                for code, flight in detail_targets.items()
             }
             for code, fut in futures.items():
                 try:
@@ -2958,6 +2991,13 @@ def _do_poll() -> None:
                 except Exception as e:
                     log.warning("Detail fail %s: %s", code, e)
                     details_map[code] = None
+        fetched_ms = int(time.time() * 1000)
+        with _lock:
+            for code in detail_targets:
+                _LAST_DETAIL_MS[code] = fetched_ms
+            for c in list(_LAST_DETAIL_MS.keys()):
+                if c not in queue_snapshot:
+                    _LAST_DETAIL_MS.pop(c, None)
 
     now_ms = int(time.time() * 1000)
     updates = {}
