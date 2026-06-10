@@ -274,6 +274,27 @@ FIRESTORE_SCHEDULE_DAYS_AHEAD = int(os.environ.get("FIRESTORE_SCHEDULE_DAYS_AHEA
 FIRESTORE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
+
+# ===========================================================
+# LIVE BRIDGE — chống FR24 chặn IP data center.
+#   FR24 chặn IP trung tâm dữ liệu (Render) qua Cloudflare. Giải pháp: chạy phần
+#   gọi FR24 trên máy có IP nhà dân (máy nhà/cơ quan), đẩy kết quả qua Firestore.
+#   RADAR_ROLE:
+#     "fetcher" (mặc định, chạy ở máy nhà/cơ quan): gọi FR24 như cũ + sau mỗi vòng
+#        poll GHI snapshot tàu live lên Firestore doc radarLive/current.
+#     "server"  (đặt trên Render): KHÔNG gọi FR24; ĐỌC radarLive/current rồi phục vụ
+#        /api/etas như cũ → web app không phải sửa gì.
+RADAR_ROLE = os.environ.get("RADAR_ROLE", "fetcher").strip().lower()
+RADAR_LIVE_COLLECTION = os.environ.get("RADAR_LIVE_COLLECTION", "radarLive")
+RADAR_LIVE_DOC_ID = os.environ.get("RADAR_LIVE_DOC_ID", "current")
+# Server coi dữ liệu radarLive là cũ nếu fetcher ngừng cập nhật quá ngưỡng này (mặc định 5 phút).
+RADAR_LIVE_STALE_MS = int(os.environ.get("RADAR_LIVE_STALE_MS", str(5 * 60 * 1000)))
+# Nhãn nguồn để debug biết máy nào đang ghi.
+RADAR_SOURCE_ID = (os.environ.get("RADAR_SOURCE_ID") or os.environ.get("COMPUTERNAME")
+                   or os.environ.get("HOSTNAME") or "fetcher")
+# Khóa service account đặt cạnh app.py (dùng cho máy nhà/cơ quan chạy role fetcher).
+_LOCAL_SERVICE_ACCOUNT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "serviceAccount.json")
 # App Android được đánh thức bằng FCM tại các mốc tác nghiệp, không cần tự poll radar nền.
 MOBILE_ALERT_STATES = {
     state.strip().upper()
@@ -317,6 +338,11 @@ LAST_FIRESTORE_SYNC_ERROR: Optional[str] = None
 LAST_FIRESTORE_PARKED_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_SYNC_MS: Optional[int] = None
+# Live bridge: trạng thái ghi/đọc radarLive.
+LAST_RADAR_LIVE_WRITE_MS: Optional[int] = None
+LAST_RADAR_LIVE_WRITE_ERROR: Optional[str] = None
+LAST_RADAR_LIVE_READ_MS: Optional[int] = None
+LAST_RADAR_LIVE_READ_ERROR: Optional[str] = None
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
 FIRESTORE_MANUAL_TRACKING_DATES: list[str] = []
@@ -567,6 +593,11 @@ def _init_firestore_client():
                 cred_obj = credentials.Certificate(json.loads(decoded))
             elif os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
                 cred_obj = credentials.ApplicationDefault()
+            elif os.path.exists(_LOCAL_SERVICE_ACCOUNT_PATH):
+                # Tiện cho máy nhà/cơ quan (role fetcher): chỉ cần đặt serviceAccount.json
+                # cạnh app.py là tự nạp, khỏi cần set biến môi trường.
+                cred_obj = credentials.Certificate(_LOCAL_SERVICE_ACCOUNT_PATH)
+                log.info("Firestore: dùng khóa local %s", _LOCAL_SERVICE_ACCOUNT_PATH)
             else:
                 # Trên Google Cloud có thể dùng ADC; trên Render thường cần JSON/B64.
                 cred_obj = credentials.ApplicationDefault()
@@ -3141,6 +3172,9 @@ def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> No
 
 def _try_immediate_poll(reason: str = "", bypass_cooldown: bool = False) -> bool:
     global LAST_IMMEDIATE_POLL_MS, LAST_ERROR
+    if RADAR_ROLE == "server":
+        # Server không gọi FR24; mọi dữ liệu đến từ radarLive trên Firestore.
+        return False
     with _immediate_poll_lock:
         now = int(time.time() * 1000)
         if not bypass_cooldown and now - LAST_IMMEDIATE_POLL_MS < IMMEDIATE_POLL_COOLDOWN_MS:
@@ -3163,12 +3197,17 @@ def poll_loop() -> None:
     time.sleep(2)
     while True:
         try:
-            _refresh_schedule_from_firestore(force=False)
-            _refresh_stand_coords_from_firestore(force=False)
-            _do_poll()
-            _maybe_persist_stand_coords()
-            _prune_old_schedule_hints()
-            _prune_old_tracked_entries()
+            if RADAR_ROLE == "server":
+                # Server (Render) không gọi FR24; dữ liệu lấy từ Firestore khi có request.
+                pass
+            else:
+                _refresh_schedule_from_firestore(force=False)
+                _refresh_stand_coords_from_firestore(force=False)
+                _do_poll()
+                _write_live_to_firestore()
+                _maybe_persist_stand_coords()
+                _prune_old_schedule_hints()
+                _prune_old_tracked_entries()
         except Exception as e:
             with _lock:
                 LAST_ERROR = str(e)
@@ -3223,6 +3262,10 @@ def build_etas_payload(known_revision=None) -> dict:
     """Build response cho /api/etas: live data + SCHEDULED placeholder cho mã chưa có live."""
     now_ms = int(time.time() * 1000)
     known_revision = str(known_revision or "").strip() or None
+    # Role "server" (Render): không có TRACKED riêng (không gọi FR24); đọc snapshot
+    # mà fetcher đã ghi lên Firestore rồi phục vụ y nguyên.
+    if RADAR_ROLE == "server":
+        return _build_etas_payload_from_live(known_revision, now_ms)
     with _lock:
         feed_revision = f"{ETAS_INSTANCE_ID}:{ETAS_REVISION}"
         result = {}
@@ -3297,12 +3340,112 @@ def build_etas_payload(known_revision=None) -> dict:
         }
 
 
+# ===========================================================
+# LIVE BRIDGE: ghi/đọc snapshot tàu live qua Firestore (radarLive/current)
+# ===========================================================
+
+_radar_live_lock = threading.Lock()
+_RADAR_LIVE_CACHE: dict = {"ts": 0, "flights": None, "meta": {}}
+# Server đọc lại Firestore tối đa mỗi ngần này ms (fetcher chỉ cập nhật ~mỗi vòng poll,
+# nên cache vài giây là đủ và tiết kiệm read Firestore).
+RADAR_LIVE_READ_CACHE_MS = int(os.environ.get("RADAR_LIVE_READ_CACHE_MS", "8000"))
+
+
+def _write_live_to_firestore() -> None:
+    """Fetcher: ghi snapshot tàu live (giống payload /api/etas) lên radarLive/current."""
+    global LAST_RADAR_LIVE_WRITE_MS, LAST_RADAR_LIVE_WRITE_ERROR
+    if RADAR_ROLE != "fetcher":
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        payload = build_etas_payload()  # dict đầy đủ {mã: thông tin}
+        flights = payload.get("flights") or {}
+        doc = {
+            "flights": flights,
+            "flight_count": len(flights),
+            "server_time_millis": payload.get("server_time_millis"),
+            "feed_revision": payload.get("feed_revision"),
+            "last_poll_millis": payload.get("last_poll_millis"),
+            "source": RADAR_SOURCE_ID,
+            "updated_at": firebase_firestore.SERVER_TIMESTAMP,
+        }
+        db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
+        LAST_RADAR_LIVE_WRITE_MS = int(time.time() * 1000)
+        LAST_RADAR_LIVE_WRITE_ERROR = None
+    except Exception as e:
+        LAST_RADAR_LIVE_WRITE_ERROR = str(e)
+        log.warning("Ghi radarLive lên Firestore lỗi: %s", e)
+
+
+def _load_live_from_firestore():
+    """Server: đọc snapshot tàu live (có cache ngắn). Trả (flights_dict|None, meta_dict)."""
+    global LAST_RADAR_LIVE_READ_MS, LAST_RADAR_LIVE_READ_ERROR
+    now = int(time.time() * 1000)
+    with _radar_live_lock:
+        if _RADAR_LIVE_CACHE["flights"] is not None and now - _RADAR_LIVE_CACHE["ts"] < RADAR_LIVE_READ_CACHE_MS:
+            return _RADAR_LIVE_CACHE["flights"], _RADAR_LIVE_CACHE["meta"]
+    db = _init_firestore_client()
+    if db is None:
+        return None, {}
+    try:
+        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get()
+        LAST_RADAR_LIVE_READ_MS = int(time.time() * 1000)
+        LAST_RADAR_LIVE_READ_ERROR = None
+        data = snap.to_dict() or {} if snap.exists else {}
+        flights = data.get("flights") or {}
+        with _radar_live_lock:
+            _RADAR_LIVE_CACHE.update({"ts": now, "flights": flights, "meta": data})
+        return flights, data
+    except Exception as e:
+        LAST_RADAR_LIVE_READ_ERROR = str(e)
+        log.warning("Đọc radarLive từ Firestore lỗi: %s", e)
+        return None, {}
+
+
+def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
+    """Server role: dựng payload /api/etas từ radarLive mà fetcher đã ghi."""
+    flights, meta = _load_live_from_firestore()
+    if flights is None:
+        flights = {}
+    fetcher_time = meta.get("server_time_millis")
+    stale = (fetcher_time is None) or (now_ms - int(fetcher_time) > RADAR_LIVE_STALE_MS)
+    feed_revision = meta.get("feed_revision") or "live:none"
+    not_modified = known_revision is not None and known_revision == feed_revision
+    return {
+        "status": "success",
+        "feed_revision": feed_revision,
+        "not_modified": not_modified,
+        "server_time_millis": now_ms,
+        "last_poll_millis": meta.get("last_poll_millis"),
+        "poll_interval_seconds": POLL_INTERVAL,
+        "radar_role": "server",
+        "radar_live_source": meta.get("source"),
+        "radar_live_fetcher_time_millis": fetcher_time,
+        "radar_live_stale": stale,
+        "schedule_count": len(flights),
+        "queue_count": len(flights),
+        "tracked_count": len(flights),
+        "firestore_status": FIRESTORE_STATUS,
+        "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
+        "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
+        "flights": {} if not_modified else flights,
+    }
+
+
 @app.route("/", methods=["GET"])
 def health():
     """Health check public (không yêu cầu API key) để cron-job.org ping keep-alive."""
     with _lock:
         return jsonify({
             "status": "ok",
+            "radar_role": RADAR_ROLE,
+            "radar_source_id": RADAR_SOURCE_ID,
+            "last_radar_live_write_ms": LAST_RADAR_LIVE_WRITE_MS,
+            "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
+            "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
+            "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
             "server_time_millis": int(time.time() * 1000),
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
@@ -3471,6 +3614,24 @@ def scan_arrivals():
     """Quét mọi tàu đang bay về DAD trong N phút tới và tùy chọn đưa vào QUEUE server."""
     if (err := require_api_key()):
         return err
+
+    # Role "server" (Render): không gọi FR24. Trả tàu từ radarLive (fetcher đã ghi),
+    # dạng list để app chuẩn hóa như kết quả scan cũ.
+    if RADAR_ROLE == "server":
+        flights, meta = _load_live_from_firestore()
+        now_ms = int(time.time() * 1000)
+        arrivals = list((flights or {}).values()) if isinstance(flights, dict) else (flights or [])
+        arrivals = [f for f in arrivals if isinstance(f, dict)]
+        arrivals.sort(key=lambda item: item.get("eta_millis") or 9_999_999_999_999)
+        return jsonify({
+            "status": "success",
+            "server_time_millis": now_ms,
+            "radar_role": "server",
+            "radar_live_source": meta.get("source"),
+            "radar_live_fetcher_time_millis": meta.get("server_time_millis"),
+            "count": len(arrivals),
+            "flights": arrivals,
+        })
 
     body = request.get_json(silent=True) or {}
     raw_minutes = body.get("max_minutes") or request.args.get("max_minutes") or AUTO_SCAN_DEFAULT_MINUTES
