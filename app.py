@@ -34,6 +34,7 @@ from __future__ import annotations
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from FlightRadar24 import FlightRadar24API
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -46,6 +47,7 @@ import json
 import logging
 import math
 import os
+import random
 import threading
 import time
 
@@ -116,6 +118,12 @@ AUTO_SCAN_DEFAULT_MINUTES = int(os.environ.get("AUTO_SCAN_DEFAULT_MINUTES", "60"
 AUTO_SCAN_MAX_MINUTES = int(os.environ.get("AUTO_SCAN_MAX_MINUTES", "180"))
 AUTO_SCAN_MAX_CANDIDATES = int(os.environ.get("AUTO_SCAN_MAX_CANDIDATES", "120"))
 AUTO_SCAN_MAX_RESULTS = int(os.environ.get("AUTO_SCAN_MAX_RESULTS", "60"))
+# Auto-track arrivals that FR24 feed already marks as DAD, even when the code is
+# not present in the uploaded flight plan. This catches ad-hoc/extra flights
+# without requiring the web client to trigger a separate scan.
+AUTO_DISCOVER_FEED_ENABLED = os.environ.get("AUTO_DISCOVER_FEED_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+AUTO_DISCOVER_MAX_PER_POLL = int(os.environ.get("AUTO_DISCOVER_MAX_PER_POLL", "25"))
+OUTSIDE_SCHEDULE_RETAIN_MS = int(os.environ.get("OUTSIDE_SCHEDULE_RETAIN_MS", str(4 * 3600 * 1000)))
 
 # Parallel get_flight_details
 DETAIL_TIMEOUT_S = 8
@@ -295,6 +303,45 @@ RADAR_SOURCE_ID = (os.environ.get("RADAR_SOURCE_ID") or os.environ.get("COMPUTER
 # Khóa service account đặt cạnh app.py (dùng cho máy nhà/cơ quan chạy role fetcher).
 _LOCAL_SERVICE_ACCOUNT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "serviceAccount.json")
+
+# ── SERVER PHỤ (nhiều máy cùng chạy fetcher) ────────────────────────────────
+# 1 máy CHÍNH (cơ quan) + N máy PHỤ. Máy phụ KHÔNG poll theo nhịp riêng mà canh
+# BÙ vào GIỮA khoảng trống giữa 2 lần ghi radarLive của máy chính → web được làm
+# mới dày hơn (chính 30s/lần thì tổng ~15s/lần) và không ghi giẫm chân nhau.
+# Máy phụ NHƯỜNG việc ghi nghiệp vụ (giờ vào bến, FCM, học bến) cho máy chính;
+# chỉ khi chính im lặng quá PHU_TAKEOVER_MS thì phụ mới gánh thay toàn bộ.
+# Vai trò đặt trong file VaiTro.txt cạnh app.py ("chinh" hoặc "phu").
+# MẶC ĐỊNH (không có file / nội dung lạ) = "phu": mọi máy mở thêm sau này tự
+# động là server phụ, KHÔNG thể vô tình thành máy chính thứ 2. Chỉ máy nào ghi
+# rõ chữ "chinh" mới là chính (thư mục RadarCoQuan của máy cơ quan đã ghi sẵn).
+# Máy cơ quan đang chạy CODE CŨ (không có logic vai trò) vẫn được mọi máy phụ
+# coi là chính vì bản ghi của nó không có field vai_tro.
+_VAI_TRO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VaiTro.txt")
+
+
+def _doc_vai_tro_fetcher() -> str:
+    raw = ""
+    try:
+        if os.path.exists(_VAI_TRO_PATH):
+            with open(_VAI_TRO_PATH, "r", encoding="utf-8-sig") as f:
+                raw = f.read().strip().lower()
+    except Exception:
+        raw = ""
+    if not raw:
+        raw = os.environ.get("RADAR_FETCHER_ROLE", "").strip().lower()
+    return "chinh" if raw in ("chinh", "chính", "main", "primary") else "phu"
+
+
+FETCHER_VAI_TRO = _doc_vai_tro_fetcher()
+FETCHER_PHU = (RADAR_ROLE == "fetcher" and FETCHER_VAI_TRO == "phu")
+# Chính im lặng quá ngưỡng này → phụ coi như chính đã tắt và tự gánh thay.
+PHU_TAKEOVER_MS = int(os.environ.get("PHU_TAKEOVER_MS", "150000"))
+# Không ghi nếu máy khác (chính hoặc phụ khác) vừa ghi trong ngưỡng này.
+PHU_MIN_GAP_MS = int(os.environ.get("PHU_MIN_GAP_MS", "8000"))
+# Chờ tối đa 1 lượt trước khi cứ thế poll (đề phòng kẹt do đồng hồ lệch).
+PHU_MAX_WAIT_S = int(os.environ.get("PHU_MAX_WAIT_S", "90"))
+# Heartbeat radarLive/fetcher_<máy> (ghi thưa) để KiemTraRadar liệt kê máy đang chạy.
+FETCHER_HEARTBEAT_MS = int(os.environ.get("FETCHER_HEARTBEAT_MS", "300000"))
 # App Android được đánh thức bằng FCM tại các mốc tác nghiệp, không cần tự poll radar nền.
 MOBILE_ALERT_STATES = {
     state.strip().upper()
@@ -318,6 +365,10 @@ _poller_started_lock = threading.Lock()
 
 QUEUE: set = set()
 TRACKED: dict = {}
+# code -> first seen ms for flights discovered from live feed but not in schedule.
+OUTSIDE_SCHEDULE_CODES: dict = {}
+# code -> lightweight display metadata for outside-schedule flights.
+OUTSIDE_SCHEDULE_META: dict = {}
 # code (normalized) → {sibt_millis, origin, aircraft, route, date_key, registered_at_ms}
 SCHEDULE_HINTS: dict = {}
 # code (normalized) → list[{sibt_millis, origin, aircraft, route, date_key, registered_at_ms}]
@@ -343,6 +394,11 @@ LAST_RADAR_LIVE_WRITE_MS: Optional[int] = None
 LAST_RADAR_LIVE_WRITE_ERROR: Optional[str] = None
 LAST_RADAR_LIVE_READ_MS: Optional[int] = None
 LAST_RADAR_LIVE_READ_ERROR: Optional[str] = None
+# Server phụ: quan sát máy chính qua radarLive/current.
+PHU_LAST_MAIN_WRITE_MS: Optional[int] = None   # lần ghi gần nhất của máy CHÍNH (giờ Firestore)
+PHU_MAIN_WRITES: deque = deque(maxlen=6)       # các mốc ghi của chính → ước lượng chu kỳ
+PHU_DA_BU_CHO_MS: Optional[int] = None         # đã poll bù cho lượt ghi nào của chính rồi
+LAST_FETCHER_HEARTBEAT_MS = 0
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
 FIRESTORE_MANUAL_TRACKING_DATES: list[str] = []
@@ -1879,6 +1935,25 @@ def _code_aliases(value) -> set[str]:
         if alt:
             aliases.update(_flight_code_ocr_aliases(alt + suffix))
 
+    # Liên danh (codeshare) — KHÁC alias IATA↔ICAO ở trên (vốn 1:1 cùng số hiệu).
+    # Pacific Airlines (BL/PIC) hiện khai thác TOÀN BỘ bằng tàu Vietnam Airlines (VN/HVN):
+    # FR24 báo số/callsign VN/HVN trong khi lịch cơ quan vẫn ghi BL → 1 tàu hiện thành 2
+    # marker. Bắc cầu 2 chiều cả họ BL/PIC ↔ VN/HVN, giữ nguyên phần số hiệu, để gộp về một.
+    # Phải đồng bộ với codeshare pairs trong flightCodeAliases() ở index.html.
+    codeshare_groups = (
+        ({"BL", "PIC"}, ("VN", "HVN")),
+        ({"VN", "HVN"}, ("BL", "PIC")),
+    )
+    for alias in list(aliases):
+        m_cs = re.match(r"^([A-Z0-9]{2}|[A-Z]{3,5})(\d+)$", alias)
+        if not m_cs:
+            continue
+        src_prefix, cs_suffix = m_cs.group(1), m_cs.group(2)
+        for srcs, targets in codeshare_groups:
+            if src_prefix in srcs:
+                for t in targets:
+                    aliases.update(_flight_code_ocr_aliases(t + cs_suffix))
+
     # Charter prefix "CH": lịch nội bộ ghi "CH" + ICAO callsign cho chuyến charter.
     # Hỗ trợ 3 dạng đã gặp: CHMJJ721 (3 chữ + số), CHBLCAT62 (5 chữ + số),
     # CHOOLET (chữ thuần không số). Sinh alias 2 chiều cho radar match được.
@@ -1991,12 +2066,32 @@ def _prune_old_tracked_entries(now_ms: Optional[int] = None) -> int:
     now_ms = now_ms or int(time.time() * 1000)
     removed = 0
     with _lock:
+        removed_codes = set()
         for code, entry in list(TRACKED.items()):
             if not entry:
                 continue
             if entry.state in TERMINAL_STATES and _terminal_age_ms(entry, now_ms) > TRACKED_TERMINAL_RETAIN_MS:
                 TRACKED.pop(code, None)
+                removed_codes.add(code)
                 removed += 1
+        for code, first_seen in list(OUTSIDE_SCHEDULE_CODES.items()):
+            if _has_schedule_hint_for_code(code):
+                OUTSIDE_SCHEDULE_CODES.pop(code, None)
+                OUTSIDE_SCHEDULE_META.pop(code, None)
+                continue
+            try:
+                first_seen_ms = int(first_seen or 0)
+            except Exception:
+                first_seen_ms = 0
+            stale_without_live = (
+                not TRACKED.get(code)
+                and first_seen_ms
+                and now_ms - first_seen_ms > OUTSIDE_SCHEDULE_RETAIN_MS
+            )
+            if code in removed_codes or stale_without_live:
+                QUEUE.discard(code)
+                OUTSIDE_SCHEDULE_CODES.pop(code, None)
+                OUTSIDE_SCHEDULE_META.pop(code, None)
     return removed
 
 
@@ -2093,6 +2188,8 @@ def _register_schedule(schedule_payload: dict, now_ms: Optional[int] = None) -> 
             # Public/current hint vẫn giữ hành vi cũ để API không đổi contract;
             # các luồng ghi Firestore sẽ dùng _select_schedule_hint_for_event().
             SCHEDULE_HINTS[code] = normalized_hint
+            OUTSIDE_SCHEDULE_CODES.pop(code, None)
+            OUTSIDE_SCHEDULE_META.pop(code, None)
             written += 1
     _prune_old_schedule_hints(now_ms)
     if written:
@@ -2215,6 +2312,97 @@ def _extract_eta_from_details(details: dict):
 # XỬ LÝ TỪNG MÃ
 # ===========================================================
 
+def _update_parked_candidate(code, old, state, lat, lng, gs_kt, dist_km, now_ms):
+    """Dò mốc vào bến (ground_stop) từ 1 mẫu vị trí — DÙNG CHUNG cho _process_match
+    (fetcher, dữ liệu FR24) và _finalize_parked_from_live (server Render, dữ liệu radarLive).
+
+    Tách nguyên văn khối logic trong _process_match để 2 đường chốt giống hệt nhau.
+    Trả tuple: (state, parked_at_millis, parked_candidate_since_ms,
+                parked_anchor_lat, parked_anchor_lng, parked_source, parked_confirmed).
+    """
+    parking_signal = _is_parked_on_ground(gs_kt, dist_km)
+    parked_at_millis = old.parked_at_millis if old else None
+    parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
+    parked_anchor_lat = old.parked_anchor_lat if old else None
+    parked_anchor_lng = old.parked_anchor_lng if old else None
+    parked_source = old.parked_source if old else None
+    parked_confirmed = False   # lúc còn thấy tàu ⇒ chỉ là giờ TẠM
+
+    if old and old.state == "PARKED":
+        # Đã PARKED. Mặc định "sticky" — TRỪ KHI tàu rõ ràng LĂN TIẾP thì gỡ giờ TẠM.
+        cur_lat = lat
+        cur_lng = lng
+        moving_gs = gs_kt is not None and gs_kt >= PARKED_RESUME_GS_KT
+        drift_resume_m = None
+        if (cur_lat is not None and cur_lng is not None
+                and old.parked_anchor_lat is not None and old.parked_anchor_lng is not None):
+            drift_resume_m = _haversine_km(cur_lat, cur_lng, old.parked_anchor_lat, old.parked_anchor_lng) * 1000
+        moving_drift = drift_resume_m is not None and drift_resume_m > PARKED_RESUME_DRIFT_M
+        still_near_dad = _is_at_dad_airport(dist_km)
+        if (not old.parked_confirmed) and still_near_dad and (moving_gs or moving_drift):
+            log.info(
+                "%s: UNPARK — tàu lăn tiếp sau khi dừng tạm (gs=%s kt, drift=%s m); gỡ giờ tạm, theo dõi lại",
+                code, gs_kt,
+                f"{drift_resume_m:.0f}" if drift_resume_m is not None else "?",
+            )
+            state = "TAXIING"
+            parked_at_millis = None
+            parked_candidate_since_ms = None
+            parked_anchor_lat = None
+            parked_anchor_lng = None
+            parked_source = None
+            parked_confirmed = False
+        else:
+            state = "PARKED"
+            parked_at_millis = old.parked_at_millis
+            parked_source = old.parked_source
+            parked_anchor_lat = old.parked_anchor_lat
+            parked_anchor_lng = old.parked_anchor_lng
+            parked_confirmed = old.parked_confirmed
+    elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
+        cur_lat = lat
+        cur_lng = lng
+        if parked_candidate_since_ms is None:
+            # Lần đầu thấy parking_signal: bắt đầu candidate + chốt anchor
+            parked_candidate_since_ms = now_ms
+            parked_anchor_lat = cur_lat
+            parked_anchor_lng = cur_lng
+        elif (
+            cur_lat is not None and cur_lng is not None
+            and parked_anchor_lat is not None and parked_anchor_lng is not None
+        ):
+            # Cycle tiếp: kiểm tra drift so với anchor
+            drift_m = _haversine_km(cur_lat, cur_lng, parked_anchor_lat, parked_anchor_lng) * 1000
+            if drift_m > PARKED_ANCHOR_DRIFT_M:
+                log.info(
+                    "%s: parked candidate reset (drift=%.0fm > %.0fm) — dừng tạm rồi lăn tiếp",
+                    code, drift_m, PARKED_ANCHOR_DRIFT_M,
+                )
+                parked_candidate_since_ms = now_ms
+                parked_anchor_lat = cur_lat
+                parked_anchor_lng = cur_lng
+
+        # STAND-SNAP: gần bến đã học → chốt nhanh (PARKED_STABLE_MS); xa mọi bến → đòi lâu hơn.
+        _near_stand, _far_from_stands = _stand_snap_status(cur_lat, cur_lng)
+        required_stable_ms = PARKED_STABLE_FAR_MS if _far_from_stands else PARKED_STABLE_MS
+        if now_ms - parked_candidate_since_ms >= required_stable_ms:
+            state = "PARKED"
+            if parked_at_millis is None:
+                parked_at_millis = parked_candidate_since_ms
+                parked_source = "ground_stop"
+        elif state == "PARKED":
+            # _classify_state có thể trả PARKED ngay. Hạ xuống TAXIING cho tới khi ổn định.
+            state = "TAXIING"
+    else:
+        # Mất parking signal (hoặc state đã rời ground_active): reset candidate + anchor
+        parked_candidate_since_ms = None
+        parked_anchor_lat = None
+        parked_anchor_lng = None
+
+    return (state, parked_at_millis, parked_candidate_since_ms,
+            parked_anchor_lat, parked_anchor_lng, parked_source, parked_confirmed)
+
+
 def _process_match(
     code: str,
     flight,
@@ -2274,13 +2462,6 @@ def _process_match(
     #   1. Ground speed thấp + ở DAD (parking_signal) ổn định PARKED_STABLE_MS
     #   2. Position không dịch chuyển khỏi anchor quá PARKED_ANCHOR_DRIFT_M (80m)
     # Điều kiện (2) là cốt lõi để phân biệt "dừng cuối cùng ở bến" với "dừng tạm trên taxiway".
-    parking_signal = _is_parked_on_ground(sensors["gs_kt"], sensors["distance_km"])
-    parked_at_millis = old.parked_at_millis if old else None
-    parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
-    parked_anchor_lat = old.parked_anchor_lat if old else None
-    parked_anchor_lng = old.parked_anchor_lng if old else None
-    parked_source = old.parked_source if old else None
-    parked_confirmed = False   # _process_match là lúc radar CÒN thấy tàu ⇒ chỉ là giờ TẠM
     landed_at_millis, landed_source = _resolve_landed_at_millis(
         state, old, now_ms,
         real_arrival_ms=real_arrival_ms,
@@ -2288,83 +2469,12 @@ def _process_match(
         dist_km=sensors["distance_km"],
     )
 
-    if old and old.state == "PARKED":
-        # Đã PARKED. Mặc định "sticky" (giữ mốc, dung sai nhiễu GPS) — TRỪ KHI tàu rõ ràng
-        # LĂN TIẾP: khi đó gỡ giờ TẠM và theo dõi lại để lấy mốc dừng MỚI. Mốc đã được
-        # XÁC NHẬN (parked_confirmed, tức tàu từng tắt radar) thì không gỡ nữa.
-        cur_lat = sensors["lat"]
-        cur_lng = sensors["lng"]
-        moving_gs = sensors["gs_kt"] is not None and sensors["gs_kt"] >= PARKED_RESUME_GS_KT
-        drift_resume_m = None
-        if (cur_lat is not None and cur_lng is not None
-                and old.parked_anchor_lat is not None and old.parked_anchor_lng is not None):
-            drift_resume_m = _haversine_km(cur_lat, cur_lng, old.parked_anchor_lat, old.parked_anchor_lng) * 1000
-        moving_drift = drift_resume_m is not None and drift_resume_m > PARKED_RESUME_DRIFT_M
-        still_near_dad = _is_at_dad_airport(sensors["distance_km"])
-        if (not old.parked_confirmed) and still_near_dad and (moving_gs or moving_drift):
-            log.info(
-                "%s: UNPARK — tàu lăn tiếp sau khi dừng tạm (gs=%s kt, drift=%s m); gỡ giờ tạm, theo dõi lại",
-                code, sensors["gs_kt"],
-                f"{drift_resume_m:.0f}" if drift_resume_m is not None else "?",
-            )
-            state = "TAXIING"
-            parked_at_millis = None
-            parked_candidate_since_ms = None
-            parked_anchor_lat = None
-            parked_anchor_lng = None
-            parked_source = None
-            parked_confirmed = False
-        else:
-            # Sticky: giữ mốc (tạm hoặc đã xác nhận), không revert về taxi/airborne.
-            state = "PARKED"
-            parked_at_millis = old.parked_at_millis
-            parked_source = old.parked_source
-            parked_anchor_lat = old.parked_anchor_lat
-            parked_anchor_lng = old.parked_anchor_lng
-            parked_confirmed = old.parked_confirmed
-    elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
-        cur_lat = sensors["lat"]
-        cur_lng = sensors["lng"]
-        if parked_candidate_since_ms is None:
-            # Lần đầu thấy parking_signal: bắt đầu candidate + chốt anchor
-            parked_candidate_since_ms = now_ms
-            parked_anchor_lat = cur_lat
-            parked_anchor_lng = cur_lng
-        elif (
-            cur_lat is not None and cur_lng is not None
-            and parked_anchor_lat is not None and parked_anchor_lng is not None
-        ):
-            # Cycle tiếp: kiểm tra drift so với anchor
-            drift_m = _haversine_km(cur_lat, cur_lng, parked_anchor_lat, parked_anchor_lng) * 1000
-            if drift_m > PARKED_ANCHOR_DRIFT_M:
-                log.info(
-                    "%s: parked candidate reset (drift=%.0fm > %.0fm) — dừng tạm rồi lăn tiếp",
-                    code, drift_m, PARKED_ANCHOR_DRIFT_M,
-                )
-                parked_candidate_since_ms = now_ms
-                parked_anchor_lat = cur_lat
-                parked_anchor_lng = cur_lng
-
-        # STAND-SNAP: gần một bến đã học → chốt nhanh (PARKED_STABLE_MS).
-        # Xa MỌI bến đã học (nghi dừng tạm trên đường lăn, hoặc bến mới chưa học) → đòi đứng
-        # yên lâu hơn (PARKED_STABLE_FAR_MS). Dừng tạm thường lăn tiếp trước ngưỡng đó nên
-        # candidate sẽ reset (anchor drift) → không bị chốt sai; bến mới thật đứng yên đủ lâu
-        # vẫn chốt được + sau đó học toạ độ bến đó. Khi chưa đủ coverage → (False,False) → như cũ.
-        _near_stand, _far_from_stands = _stand_snap_status(cur_lat, cur_lng)
-        required_stable_ms = PARKED_STABLE_FAR_MS if _far_from_stands else PARKED_STABLE_MS
-        if now_ms - parked_candidate_since_ms >= required_stable_ms:
-            state = "PARKED"
-            if parked_at_millis is None:
-                parked_at_millis = parked_candidate_since_ms
-                parked_source = "ground_stop"
-        elif state == "PARKED":
-            # _classify_state có thể trả PARKED ngay. Hạ xuống TAXIING cho tới khi ổn định.
-            state = "TAXIING"
-    else:
-        # Mất parking signal (hoặc state đã rời ground_active): reset candidate + anchor
-        parked_candidate_since_ms = None
-        parked_anchor_lat = None
-        parked_anchor_lng = None
+    # Chốt giờ dừng bến/in-block từ radar (ground_stop) — logic dùng chung với server role.
+    (state, parked_at_millis, parked_candidate_since_ms, parked_anchor_lat,
+     parked_anchor_lng, parked_source, parked_confirmed) = _update_parked_candidate(
+        code, old, state,
+        sensors["lat"], sensors["lng"], sensors["gs_kt"], sensors["distance_km"], now_ms,
+    )
 
     # Fallback landing+N: chỉ kích hoạt khi đã qua đủ lâu sau touchdown.
     # Mục tiêu: KHÔNG vội chốt khi radar còn live và ground_stop có thể chạy.
@@ -2833,7 +2943,6 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
     now_ms = int(time.time() * 1000)
     fr_api = FlightRadar24API()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
-
     # Snapshot schedule hints để dùng làm whitelist khi FR24 thiếu dest
     with _lock:
         schedule_codes = set(SCHEDULE_HINTS.keys())
@@ -2867,6 +2976,7 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
     discovered: list[dict] = []
     staged_updates: dict[str, FlightEntry] = {}
     staged_queue: set[str] = set()
+    staged_meta: dict[str, dict] = {}
 
     for idx, flight in enumerate(candidates):
         details = details_by_idx.get(idx)
@@ -2914,6 +3024,7 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
         discovered.append(public)
         staged_updates[code] = entry
         staged_queue.add(code)
+        staged_meta[code] = meta
 
     discovered.sort(key=lambda item: item.get("eta_millis") or 9_999_999_999_999)
     if len(discovered) > AUTO_SCAN_MAX_RESULTS:
@@ -2926,6 +3037,10 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
         with _lock:
             QUEUE.update(staged_queue)
             TRACKED.update(staged_updates)
+            for code in staged_queue:
+                marked_code = _mark_outside_schedule_code(code, now_ms)
+                if marked_code in OUTSIDE_SCHEDULE_CODES:
+                    _merge_outside_schedule_meta(marked_code, staged_meta.get(code))
 
     log.info(
         "Auto-scan arrivals: bounds=%d, candidates=%d, found=%d, add_to_queue=%s, max_minutes=%d",
@@ -2945,6 +3060,130 @@ def _safe_get_details(fr_api, flight):
         return None
 
 
+def _has_schedule_hint_for_code(code: str) -> bool:
+    clean = _clean_code(code)
+    if not clean:
+        return False
+    if clean in SCHEDULE_HINTS:
+        return True
+    aliases = _code_aliases(clean)
+    return any(alias in SCHEDULE_HINTS for alias in aliases)
+
+
+def _is_outside_schedule_code(code: str) -> bool:
+    clean = _clean_code(code)
+    if not clean:
+        return False
+    with _lock:
+        if _has_schedule_hint_for_code(clean):
+            return False
+        return clean in OUTSIDE_SCHEDULE_CODES
+
+
+def _mark_outside_schedule_code(code: str, now_ms: int) -> str:
+    clean = _clean_code(code)
+    if not clean:
+        return ""
+    if _has_schedule_hint_for_code(clean):
+        OUTSIDE_SCHEDULE_CODES.pop(clean, None)
+        OUTSIDE_SCHEDULE_META.pop(clean, None)
+    else:
+        OUTSIDE_SCHEDULE_CODES.setdefault(clean, now_ms)
+    return clean
+
+
+def _merge_outside_schedule_meta(code: str, meta: Optional[dict]) -> None:
+    clean = _clean_code(code)
+    if not clean or not meta:
+        return
+    existing = dict(OUTSIDE_SCHEDULE_META.get(clean) or {})
+    for key, value in meta.items():
+        if value not in (None, ""):
+            existing[key] = value
+    existing["destination_iata"] = TARGET_AIRPORT
+    OUTSIDE_SCHEDULE_META[clean] = existing
+
+
+def _feed_arrival_metadata(flight) -> dict:
+    return {
+        "origin_iata": str(getattr(flight, "origin_airport_iata", "") or "").upper(),
+        "destination_iata": str(getattr(flight, "destination_airport_iata", "") or TARGET_AIRPORT).upper(),
+        "aircraft_type": str(getattr(flight, "aircraft_code", "") or "").upper(),
+        "callsign": _normalize_code(getattr(flight, "callsign", None)),
+        "number": _normalize_code(getattr(flight, "number", None)),
+        "discovery_source": "feed_dad_arrival",
+    }
+
+
+def _decorate_outside_schedule_public(code: str, payload: dict) -> dict:
+    if not _is_outside_schedule_code(code):
+        return payload
+    clean = _clean_code(code)
+    payload["outside_schedule"] = True
+    payload.setdefault("discovery_source", "feed_dad_arrival")
+    meta = OUTSIDE_SCHEDULE_META.get(clean) or {}
+    for key in ("origin_iata", "destination_iata", "aircraft_type", "callsign", "number"):
+        if meta.get(key):
+            payload.setdefault(key, meta[key])
+    return payload
+
+
+def _discover_dad_arrivals_from_feed(flights, queue_snapshot: set[str], now_ms: int) -> set[str]:
+    """Add FR24 feed-level DAD arrivals to QUEUE, including flights not in schedule."""
+    if not AUTO_DISCOVER_FEED_ENABLED or AUTO_DISCOVER_MAX_PER_POLL <= 0:
+        return set()
+    with _lock:
+        schedule_codes = set(SCHEDULE_HINTS.keys())
+
+    existing_aliases: set[str] = set()
+    for code in queue_snapshot:
+        existing_aliases.update(_code_aliases(code))
+
+    discovered_codes: set[str] = set()
+    outside_codes: set[str] = set()
+    outside_meta: dict[str, dict] = {}
+    for flight in flights or []:
+        dest_hint = (getattr(flight, "destination_airport_iata", None) or "").upper()
+        if dest_hint != TARGET_AIRPORT:
+            continue
+
+        code = _best_flight_code(flight, None)
+        if not code:
+            continue
+        aliases = _code_aliases(code)
+        if aliases & existing_aliases:
+            continue
+
+        schedule_alias = next((alias for alias in aliases if alias in schedule_codes), None)
+        track_code = schedule_alias or code
+        discovered_codes.add(track_code)
+        existing_aliases.update(_code_aliases(track_code))
+        if not schedule_alias:
+            outside_codes.add(track_code)
+            outside_meta[track_code] = _feed_arrival_metadata(flight)
+
+        if len(discovered_codes) >= AUTO_DISCOVER_MAX_PER_POLL:
+            break
+
+    if not discovered_codes:
+        return set()
+
+    with _lock:
+        QUEUE.update(discovered_codes)
+        for code in outside_codes:
+            _mark_outside_schedule_code(code, now_ms)
+            _merge_outside_schedule_meta(code, outside_meta.get(code))
+        for code in discovered_codes - outside_codes:
+            OUTSIDE_SCHEDULE_CODES.pop(code, None)
+            OUTSIDE_SCHEDULE_META.pop(code, None)
+
+    log.info(
+        "Auto-discover feed DAD arrivals: added=%d outside=%d",
+        len(discovered_codes), len(outside_codes),
+    )
+    return discovered_codes
+
+
 def _do_poll() -> None:
     """1 chu kỳ poll: scan bounds + parallel get_flight_details + update TRACKED."""
     global LAST_POLL_MS, LAST_ERROR, LAST_POLL_DURATION_MS
@@ -2958,16 +3197,24 @@ def _do_poll() -> None:
     with _lock:
         queue_snapshot = set(QUEUE)
 
-    if not queue_snapshot:
-        LAST_POLL_MS = int(started * 1000)
-        LAST_POLL_DURATION_MS = 0
-        return
-
     fr_api = FlightRadar24API()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
 
     # Match codes ổn định. Không dùng trực tiếp number/callsign làm key,
     # vì FR24 có lúc trả "VJ 962", có lúc "VJ962", có lúc callsign khác.
+    discovered_codes = _discover_dad_arrivals_from_feed(
+        flights,
+        queue_snapshot,
+        int(time.time() * 1000),
+    )
+    if discovered_codes:
+        queue_snapshot.update(discovered_codes)
+
+    if not queue_snapshot:
+        LAST_POLL_MS = int(started * 1000)
+        LAST_POLL_DURATION_MS = 0
+        return
+
     queue_by_norm = {}
     for code in queue_snapshot:
         for alias in _code_aliases(code):
@@ -3046,6 +3293,8 @@ def _do_poll() -> None:
                     drops.append(code)
                 else:
                     updates[code] = new_entry
+                    if code in OUTSIDE_SCHEDULE_CODES and not _has_schedule_hint_for_code(code):
+                        _merge_outside_schedule_meta(code, _extract_arrival_metadata(targets[code], details_map.get(code)))
             else:
                 new_entry = _process_miss(code, old, now_ms)
                 if new_entry is not None:
@@ -3075,11 +3324,14 @@ def _do_poll() -> None:
     )
 
     # Online mode: server tự ghi giờ tàu dừng bến vào Firestore, không cần web đang mở.
-    _sync_parked_entries_to_firestore(updates)
-    # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
-    _sync_overdue_schedule_claims_to_firestore(now_ms)
-    # Native app: phát cảnh báo theo chuyển trạng thái, không phát sinh vòng quét FR24 mới.
-    _notify_mobile_transitions(transitions)
+    # Máy PHỤ nhường toàn bộ phần này (giờ vào bến, fallback, FCM) cho máy CHÍNH khi
+    # chính còn sống — tránh 2 máy ghi đè mốc giờ lẫn nhau / bắn thông báo đúp.
+    if not _phu_nhuong_nghiep_vu():
+        _sync_parked_entries_to_firestore(updates)
+        # Lớp dự phòng: chuyến đã có người đón nhưng radar không sinh PARKED thì không để treo mãi.
+        _sync_overdue_schedule_claims_to_firestore(now_ms)
+        # Native app: phát cảnh báo theo chuyển trạng thái, không phát sinh vòng quét FR24 mới.
+        _notify_mobile_transitions(transitions)
 
 
 def _notify_mobile_transitions(transitions: list[tuple[str, FlightEntry]]) -> None:
@@ -3198,20 +3450,42 @@ def poll_loop() -> None:
     while True:
         try:
             if RADAR_ROLE == "server":
-                # Server (Render) không gọi FR24; dữ liệu lấy từ Firestore khi có request.
-                pass
+                # Server (Render) không gọi FR24; dữ liệu /api/etas lấy từ radarLive khi có
+                # request. Ngoài ra, khi BẬT cờ và máy chính (PC cơ quan) TẮT, server tự dò đỗ
+                # từ radarLive (box cấp vị trí) rồi chốt giờ vào bến — không cần ai mở web.
+                if SERVER_FINALIZE_FROM_LIVE:
+                    _refresh_schedule_from_firestore(force=False)
+                    _refresh_stand_coords_from_firestore(force=False)
+                    server_now_ms = int(time.time() * 1000)
+                    _server_quan_sat_chinh()
+                    if not _server_chinh_dang_song(server_now_ms) and not _server_sample_chinh(12_000):
+                        n = _finalize_parked_from_live(int(time.time() * 1000))
+                        if n:
+                            log.info("Server finalize-from-live: %d chuyến chốt giờ vào bến", n)
             else:
+                if FETCHER_PHU:
+                    # Máy phụ: đợi tới điểm giữa khoảng trống của máy chính rồi mới poll.
+                    _phu_cho_den_luot()
                 _refresh_schedule_from_firestore(force=False)
                 _refresh_stand_coords_from_firestore(force=False)
                 _do_poll()
                 _write_live_to_firestore()
-                _maybe_persist_stand_coords()
+                if not _phu_nhuong_nghiep_vu():
+                    _maybe_persist_stand_coords()
                 _prune_old_schedule_hints()
                 _prune_old_tracked_entries()
         except Exception as e:
             with _lock:
                 LAST_ERROR = str(e)
             log.exception("Scheduled poll failed")
+        if RADAR_ROLE == "server":
+            # Server role không poll FR24; nghỉ cố định giữa các lần kiểm tra radarLive.
+            time.sleep(SERVER_LOOP_SLEEP_S)
+            continue
+        if FETCHER_PHU and _phu_chinh_dang_song():
+            # Nhịp của máy phụ do _phu_cho_den_luot quyết định; chỉ nghỉ ngắn lấy đà.
+            time.sleep(2.0)
+            continue
         sleep_ms = _adaptive_poll_interval_ms()
         log.info("Next scheduled poll in %.1fs", sleep_ms / 1000.0)
         time.sleep(max(5.0, sleep_ms / 1000.0))
@@ -3278,6 +3552,10 @@ def build_etas_payload(known_revision=None) -> dict:
                     result[code] = _schedule_public_entry(code, hint, now_ms)
                 else:
                     result[code] = {"state": "PENDING", "status": "pending"}
+                    if _is_outside_schedule_code(code):
+                        result[code]["outside_schedule"] = True
+                        result[code]["discovery_source"] = "feed_dad_arrival"
+                    result[code] = _decorate_outside_schedule_public(code, result[code])
             else:
                 public = entry.to_public(now_ms)
                 # Đính kèm hint từ lịch bay (origin/aircraft/sibt) để app có context.
@@ -3294,6 +3572,10 @@ def build_etas_payload(known_revision=None) -> dict:
                         public.setdefault("route", hint["route"])
                     if hint.get("date_key"):
                         public.setdefault("date_key", hint["date_key"])
+                if _is_outside_schedule_code(code):
+                    public["outside_schedule"] = True
+                    public.setdefault("discovery_source", "feed_dad_arrival")
+                public = _decorate_outside_schedule_public(code, public)
                 # Cắt lat/lng cho chuyến đã chốt từ lâu để client không vẽ marker treo trên map.
                 # Mốc giờ + state vẫn được giữ để app tra cứu / đồng bộ Firestore.
                 hide_marker = False
@@ -3350,6 +3632,14 @@ _RADAR_LIVE_CACHE: dict = {"ts": 0, "flights": None, "meta": {}}
 # nên cache vài giây là đủ và tiết kiệm read Firestore).
 RADAR_LIVE_READ_CACHE_MS = int(os.environ.get("RADAR_LIVE_READ_CACHE_MS", "8000"))
 
+# Server (Render) tự chốt GIỜ VÀO BẾN từ radarLive khi PC cơ quan (máy chính) TẮT.
+# FR24 chặn IP Render nên Render không tự lấy vị trí, nhưng box/PC đã đẩy vị trí lên
+# radarLive — đủ để chạy dò đỗ (ground_stop). Mặc định TẮT; bật bằng env trên Render.
+SERVER_FINALIZE_FROM_LIVE = os.environ.get("SERVER_FINALIZE_FROM_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
+SERVER_LOOP_SLEEP_S = int(os.environ.get("SERVER_LOOP_SLEEP_S", "25"))
+SERVER_TRACKED: dict = {}                          # state xuyên vòng cho dò đỗ ở server role
+SERVER_LAST_CHINH_WRITE_MS: Optional[int] = None   # lần ghi radarLive gần nhất của máy CHÍNH thật
+
 
 def _write_live_to_firestore() -> None:
     """Fetcher: ghi snapshot tàu live (giống payload /api/etas) lên radarLive/current."""
@@ -3369,11 +3659,13 @@ def _write_live_to_firestore() -> None:
             "feed_revision": payload.get("feed_revision"),
             "last_poll_millis": payload.get("last_poll_millis"),
             "source": RADAR_SOURCE_ID,
+            "vai_tro": _vai_tro_hien_tai(),
             "updated_at": firebase_firestore.SERVER_TIMESTAMP,
         }
         db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
         LAST_RADAR_LIVE_WRITE_MS = int(time.time() * 1000)
         LAST_RADAR_LIVE_WRITE_ERROR = None
+        _ghi_heartbeat_fetcher(db)
     except Exception as e:
         LAST_RADAR_LIVE_WRITE_ERROR = str(e)
         log.warning("Ghi radarLive lên Firestore lỗi: %s", e)
@@ -3402,6 +3694,245 @@ def _load_live_from_firestore():
         LAST_RADAR_LIVE_READ_ERROR = str(e)
         log.warning("Đọc radarLive từ Firestore lỗi: %s", e)
         return None, {}
+
+
+# ── SERVER PHỤ: quan sát máy chính & canh lượt poll bù ──────────────────────
+
+def _phu_quan_sat_live() -> tuple[Optional[int], str]:
+    """Đọc nhẹ radarLive/current (chỉ vài field) để biết máy nào vừa ghi lúc nào.
+
+    Trả (ms lần ghi cuối của BẤT KỲ máy nào, source). Đồng thời cập nhật
+    PHU_LAST_MAIN_WRITE_MS nếu lần ghi đó là của máy CHÍNH. Máy chạy code cũ
+    không có field vai_tro cũng được coi là chính (máy cơ quan chưa cập nhật).
+    Dùng snap.update_time (đồng hồ Firestore) để không phụ thuộc đồng hồ máy khác.
+    """
+    global PHU_LAST_MAIN_WRITE_MS
+    db = _init_firestore_client()
+    if db is None:
+        return None, ""
+    try:
+        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get(
+            field_paths=["source", "vai_tro", "server_time_millis"])
+    except Exception as e:
+        log.warning("Máy phụ đọc radarLive lỗi: %s", e)
+        return None, ""
+    if not snap.exists:
+        return None, ""
+    data = snap.to_dict() or {}
+    try:
+        last_ms = int(snap.update_time.timestamp() * 1000)
+    except Exception:
+        last_ms = _to_int_ms(data.get("server_time_millis"))
+    src = str(data.get("source") or "")
+    vai_tro = str(data.get("vai_tro") or "chinh").lower()
+    if last_ms and src and src != RADAR_SOURCE_ID and vai_tro != "phu":
+        if PHU_LAST_MAIN_WRITE_MS != last_ms:
+            PHU_LAST_MAIN_WRITE_MS = last_ms
+            PHU_MAIN_WRITES.append(last_ms)
+    return last_ms, src
+
+
+def _phu_chu_ky_chinh_ms() -> int:
+    """Ước lượng chu kỳ ghi của máy chính (median khoảng cách giữa các lần ghi)."""
+    moc = list(PHU_MAIN_WRITES)
+    deltas = sorted(b - a for a, b in zip(moc, moc[1:]) if 5_000 < b - a < 120_000)
+    if not deltas:
+        return 30_000
+    return max(20_000, min(90_000, deltas[len(deltas) // 2]))
+
+
+def _phu_chinh_dang_song(now_ms: Optional[int] = None) -> bool:
+    """True nếu máy chính còn ghi radarLive trong vòng PHU_TAKEOVER_MS."""
+    if not FETCHER_PHU or PHU_LAST_MAIN_WRITE_MS is None:
+        return False
+    now_ms = now_ms or int(time.time() * 1000)
+    return now_ms - PHU_LAST_MAIN_WRITE_MS <= PHU_TAKEOVER_MS
+
+
+def _phu_nhuong_nghiep_vu() -> bool:
+    """True = máy phụ đang nhường việc ghi giờ vào bến/FCM/học bến cho máy chính."""
+    return FETCHER_PHU and _phu_chinh_dang_song()
+
+
+def _vai_tro_hien_tai() -> str:
+    """Vai trò đang thể hiện ra ngoài (ghi kèm snapshot radarLive).
+
+    Máy phụ gánh thay khi chính tắt sẽ ghi "chinh-tam" — các máy phụ khác thấy
+    vậy sẽ coi nó là chính (bù xen kẽ + nhường nghiệp vụ cho nó). Nếu 2 máy phụ
+    cùng gánh thay một lúc, máy ghi SAU thắng: máy kia đọc thấy "chinh-tam" của
+    máy khác → tự lùi về vai trò bù. Tự ổn định sau đúng 1 chu kỳ, không cần khóa.
+    Máy chính thật sống lại → mọi máy phụ tự lùi về bù như cũ.
+    """
+    if FETCHER_PHU and not _phu_chinh_dang_song():
+        return "chinh-tam"
+    return FETCHER_VAI_TRO
+
+
+# ── SERVER ROLE: chốt giờ vào bến từ radarLive khi PC cơ quan tắt ───────────
+
+def _server_quan_sat_chinh() -> None:
+    """Đọc nhẹ radarLive/current; cập nhật SERVER_LAST_CHINH_WRITE_MS nếu lần ghi gần
+    nhất là của máy CHÍNH THẬT. CHỈ "chinh" (PC cơ quan) hoặc máy cũ KHÔNG có field
+    vai_tro mới tính — box ghi "phu"/"chinh-tam" và KHÔNG chốt giờ vào bến nên loại trừ.
+    Dùng snap.update_time (đồng hồ Firestore) để không phụ thuộc đồng hồ máy khác.
+    """
+    global SERVER_LAST_CHINH_WRITE_MS
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get(
+            field_paths=["source", "vai_tro", "server_time_millis"])
+    except Exception as e:
+        log.warning("Server đọc radarLive meta lỗi: %s", e)
+        return
+    if not snap.exists:
+        return
+    data = snap.to_dict() or {}
+    try:
+        last_ms = int(snap.update_time.timestamp() * 1000)
+    except Exception:
+        last_ms = _to_int_ms(data.get("server_time_millis"))
+    src = str(data.get("source") or "")
+    vai_tro = str(data.get("vai_tro") or "chinh").lower()
+    if last_ms and src != RADAR_SOURCE_ID and vai_tro not in ("phu", "chinh-tam"):
+        if SERVER_LAST_CHINH_WRITE_MS != last_ms:
+            SERVER_LAST_CHINH_WRITE_MS = last_ms
+
+
+def _server_chinh_dang_song(now_ms: Optional[int] = None) -> bool:
+    """True nếu máy CHÍNH (PC cơ quan) còn ghi radarLive trong vòng PHU_TAKEOVER_MS."""
+    if SERVER_LAST_CHINH_WRITE_MS is None:
+        return False
+    now_ms = now_ms or int(time.time() * 1000)
+    return now_ms - SERVER_LAST_CHINH_WRITE_MS <= PHU_TAKEOVER_MS
+
+
+def _server_sample_chinh(window_ms: int) -> bool:
+    """Rình radarLive dồn dập (mỗi 3s) trong window_ms; True ngay khi thấy máy chính.
+
+    Cần vì 2-3 máy ghi đè chung 1 ô: 1 cú đọc đơn lẻ dễ vớ trúng bản ghi của box.
+    Chỉ gọi khi SẮP chốt (tưởng chính đã tắt) — xác nhận thêm để khỏi chốt nhầm lúc
+    chính vẫn sống. Mirror logic sampleForMain của box.
+    """
+    until = time.time() + window_ms / 1000.0
+    while time.time() < until:
+        _server_quan_sat_chinh()
+        if _server_chinh_dang_song():
+            return True
+        time.sleep(3.0)
+    return _server_chinh_dang_song()
+
+
+def _finalize_parked_from_live(now_ms: int) -> int:
+    """Server: dò đỗ + chốt giờ vào bến từ radarLive (box/PC cấp vị trí). Tái dùng
+    nguyên _update_parked_candidate (giống fetcher) và _sync_parked_entries_to_firestore
+    (đầy đủ sanity gate + dedup). Trả số chuyến vừa ghi giờ vào bến."""
+    flights, _meta = _load_live_from_firestore()
+    if not flights:
+        return 0
+    updates: dict = {}
+    for code, d in flights.items():
+        if not isinstance(d, dict):
+            continue
+        lat = d.get("latitude")
+        lng = d.get("longitude")
+        gs = d.get("ground_speed_kt")
+        dist = d.get("distance_km")
+        live_state = str(d.get("state") or "").upper()
+        sample_ms = (_to_int_ms(d.get("updated_at")) or _to_int_ms(d.get("server_seen_millis"))
+                     or _to_int_ms(d.get("last_seen_millis")) or now_ms)
+        old = SERVER_TRACKED.get(code)
+        (state, parked_at_millis, parked_candidate_since_ms, parked_anchor_lat,
+         parked_anchor_lng, parked_source, parked_confirmed) = _update_parked_candidate(
+            code, old, live_state, lat, lng, gs, dist, sample_ms)
+        landed_at_millis = d.get("actual_landed_at_millis") or d.get("landed_at_millis")
+        if landed_at_millis is None and old is not None:
+            landed_at_millis = old.landed_at_millis
+        entry = FlightEntry(
+            state=state,
+            altitude_ft=d.get("altitude_ft"),
+            ground_speed_kt=gs,
+            distance_km=dist,
+            on_ground=bool(d.get("on_ground")),
+            latitude=lat,
+            longitude=lng,
+            updated_at=sample_ms,
+            landed=(state in ("LANDED", "TAXIING", "PARKED")),
+            landed_at_millis=landed_at_millis,
+            parked_at_millis=parked_at_millis,
+            parked_candidate_since_ms=parked_candidate_since_ms,
+            parked_source=parked_source,
+            parked_anchor_lat=parked_anchor_lat,
+            parked_anchor_lng=parked_anchor_lng,
+            parked_confirmed=parked_confirmed,
+        )
+        SERVER_TRACKED[code] = entry
+        if entry.state == "PARKED" and entry.parked_at_millis:
+            updates[code] = entry
+    if updates:
+        return _sync_parked_entries_to_firestore(updates)
+    return 0
+
+
+def _phu_cho_den_luot() -> None:
+    """Máy phụ: ngủ tới điểm GIỮA khoảng trống giữa 2 lần ghi của máy chính.
+
+    Chính ghi 30s/lần → phụ poll lệch ~15s → web nhận dữ liệu mới ~15s/lần.
+    Chính im lặng quá PHU_TAKEOVER_MS → trả về ngay (phụ chạy full nhịp thay chính).
+    Nhiều máy phụ cùng lúc: jitter ngẫu nhiên + né PHU_MIN_GAP_MS sau lần ghi
+    của máy khác để không trùng mốc nhau.
+    """
+    global PHU_DA_BU_CHO_MS
+    deadline = time.time() + PHU_MAX_WAIT_S
+    while True:
+        last_any_ms, _src = _phu_quan_sat_live()
+        now_ms = int(time.time() * 1000)
+        if not _phu_chinh_dang_song(now_ms):
+            return
+        if len(PHU_MAIN_WRITES) < 2 and time.time() < deadline:
+            # Mới khởi động: ĐO nhịp thật của máy chính trước đã — chờ thấy thêm
+            # 1 lần ghi mới (mốc 1 = lần ghi gần nhất, mốc 2 = lần kế tiếp,
+            # khoảng cách giữa 2 mốc = đúng chu kỳ thật) rồi mới chen vào giữa.
+            time.sleep(4.0)
+            continue
+        itv = _phu_chu_ky_chinh_ms()
+        if PHU_DA_BU_CHO_MS == PHU_LAST_MAIN_WRITE_MS:
+            # Đã bù cho lượt ghi này rồi → nhắm điểm giữa của chu kỳ KẾ TIẾP.
+            target = PHU_LAST_MAIN_WRITE_MS + itv + itv // 2
+        else:
+            target = PHU_LAST_MAIN_WRITE_MS + itv // 2
+        # Trừ hao thời gian quét FR24 của máy này để bản GHI (xong sau khi quét)
+        # rơi đúng điểm giữa khoảng trống, không phải lúc BẮT ĐẦU quét.
+        target -= min(int(LAST_POLL_DURATION_MS or 0), itv // 3)
+        if last_any_ms:
+            target = max(target, last_any_ms + PHU_MIN_GAP_MS)
+        if now_ms >= target or time.time() >= deadline:
+            PHU_DA_BU_CHO_MS = PHU_LAST_MAIN_WRITE_MS
+            return
+        con_lai_s = (target - now_ms) / 1000.0
+        time.sleep(max(1.0, min(con_lai_s + random.uniform(0.0, 2.0), 15.0,
+                                max(1.0, deadline - time.time()))))
+
+
+def _ghi_heartbeat_fetcher(db) -> None:
+    """Ghi nhịp tim radarLive/fetcher_<máy> (thưa) để KiemTraRadar liệt kê máy đang chạy."""
+    global LAST_FETCHER_HEARTBEAT_MS
+    now_ms = int(time.time() * 1000)
+    if now_ms - LAST_FETCHER_HEARTBEAT_MS < FETCHER_HEARTBEAT_MS:
+        return
+    try:
+        db.collection(RADAR_LIVE_COLLECTION).document(f"fetcher_{RADAR_SOURCE_ID}").set({
+            "source": RADAR_SOURCE_ID,
+            "vai_tro": FETCHER_VAI_TRO,
+            "vai_tro_hien_tai": _vai_tro_hien_tai(),
+            "nhuong_nghiep_vu": _phu_nhuong_nghiep_vu(),
+            "last_seen_millis": now_ms,
+            "updated_at": firebase_firestore.SERVER_TIMESTAMP,
+        })
+        LAST_FETCHER_HEARTBEAT_MS = now_ms
+    except Exception as e:
+        log.warning("Ghi heartbeat fetcher lỗi: %s", e)
 
 
 def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
@@ -3442,6 +3973,11 @@ def health():
             "status": "ok",
             "radar_role": RADAR_ROLE,
             "radar_source_id": RADAR_SOURCE_ID,
+            "fetcher_vai_tro": FETCHER_VAI_TRO,
+            "vai_tro_hien_tai": _vai_tro_hien_tai(),
+            "phu_nhuong_nghiep_vu": _phu_nhuong_nghiep_vu(),
+            "phu_last_main_write_ms": PHU_LAST_MAIN_WRITE_MS,
+            "phu_chu_ky_chinh_ms": _phu_chu_ky_chinh_ms() if FETCHER_PHU else None,
             "last_radar_live_write_ms": LAST_RADAR_LIVE_WRITE_MS,
             "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
             "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
