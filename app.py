@@ -3637,6 +3637,14 @@ RADAR_LIVE_READ_CACHE_MS = int(os.environ.get("RADAR_LIVE_READ_CACHE_MS", "8000"
 # radarLive — đủ để chạy dò đỗ (ground_stop). Mặc định TẮT; bật bằng env trên Render.
 SERVER_FINALIZE_FROM_LIVE = os.environ.get("SERVER_FINALIZE_FROM_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
 SERVER_LOOP_SLEEP_S = int(os.environ.get("SERVER_LOOP_SLEEP_S", "25"))
+# Server tự chốt từ radarLive (box cấp vị trí, độ tin thấp hơn FR24 đầy đủ của PC) nên SIẾT thêm
+# bằng chứng "thật sự dưới đất", chống "chưa hạ đã chốt giờ":
+#   - Bỏ qua mẫu không có mốc thời gian thật / quá cũ. KHÔNG fallback về giờ tường: vị trí FR24 bị
+#     đóng băng (tàu coast khi mất ADS-B) mà box vẫn dán nhãn "tươi" sẽ làm candidate "chín" giả.
+SERVER_SAMPLE_FRESH_MS = int(os.environ.get("SERVER_SAMPLE_FRESH_MS", "120000"))
+#   - Còn trên cao rõ ràng thì KHÔNG bao giờ coi là đỗ, kể cả khi FR24 bật nhầm cờ on_ground ở
+#     chặng cuối. Mặc định = ngưỡng touchdown của TẦNG 1 (field elev + 200 ft AGL).
+SERVER_GROUND_MAX_ALT_FT = int(os.environ.get("SERVER_GROUND_MAX_ALT_FT", str(DAD_FIELD_ELEV_FT + TOUCHDOWN_ALT_AGL_FT)))
 SERVER_TRACKED: dict = {}                          # state xuyên vòng cho dò đỗ ở server role
 SERVER_LAST_CHINH_WRITE_MS: Optional[int] = None   # lần ghi radarLive gần nhất của máy CHÍNH thật
 
@@ -3839,13 +3847,42 @@ def _finalize_parked_from_live(now_ms: int) -> int:
         lng = d.get("longitude")
         gs = d.get("ground_speed_kt")
         dist = d.get("distance_km")
-        live_state = str(d.get("state") or "").upper()
+        alt = d.get("altitude_ft")
+        on_ground = bool(d.get("on_ground"))
+
+        # CỔNG TƯƠI: chỉ tin mẫu có mốc thời gian THẬT và còn mới. KHÔNG fallback về giờ tường —
+        # vị trí FR24 bị đóng băng (tàu coast khi mất ADS-B) mà vẫn lấy giờ tường sẽ làm candidate
+        # "chín" giả. Thiếu mốc hoặc quá cũ → bỏ qua chuyến này.
         sample_ms = (_to_int_ms(d.get("updated_at")) or _to_int_ms(d.get("server_seen_millis"))
-                     or _to_int_ms(d.get("last_seen_millis")) or now_ms)
+                     or _to_int_ms(d.get("last_seen_millis")))
+        if sample_ms is None or now_ms - sample_ms > SERVER_SAMPLE_FRESH_MS:
+            continue
+
         old = SERVER_TRACKED.get(code)
+
+        # MÃ DÙNG LẠI: tàu đã PARKED trước đó nhưng giờ lại thấy bay/xa DAD = chuyến mới dùng lại
+        # số hiệu → bỏ entry cũ để không dính giờ vào bến giả (mirror _process_match phía fetcher).
+        sensors = {"distance_km": dist, "gs_kt": gs, "alt_ft": alt, "on_ground": on_ground}
+        if _is_reused_code_live_after_parked(old, sensors, sample_ms):
+            log.info("%s: server reset stale PARKED entry; same code is live again", code)
+            old = None
+
+        # TẦNG 1 cho server: KHÔNG tin thẳng state của box. Physics.classify của box chỉ dựa vào cờ
+        # on_ground của FR24 (hay bật sớm ở chặng cuối / coast vị trí khi mất ADS-B). Tính lại bằng
+        # _classify_state (có cổng khoảng cách DAD + cổng độ cao touchdown) như đường fetcher.
+        state = _classify_state(
+            on_ground=on_ground, alt_ft=alt, gs_kt=gs, dist_km=dist,
+            real_arrival_ms=None, fr24_live=True, now_ms=sample_ms,
+        )
+        # CHỐT CHẶN ĐỘ CAO: còn trên cao rõ ràng thì KHÔNG coi là đỗ, kể cả khi FR24 bật nhầm cờ
+        # on_ground. (Đường fetcher có signal-loss/real_arrival bù; server thì không có.)
+        if (isinstance(alt, (int, float)) and alt > SERVER_GROUND_MAX_ALT_FT
+                and state in ("LANDED", "TAXIING", "PARKED")):
+            state = "APPROACH"
+
         (state, parked_at_millis, parked_candidate_since_ms, parked_anchor_lat,
          parked_anchor_lng, parked_source, parked_confirmed) = _update_parked_candidate(
-            code, old, live_state, lat, lng, gs, dist, sample_ms)
+            code, old, state, lat, lng, gs, dist, sample_ms)
         landed_at_millis = d.get("actual_landed_at_millis") or d.get("landed_at_millis")
         if landed_at_millis is None and old is not None:
             landed_at_millis = old.landed_at_millis
