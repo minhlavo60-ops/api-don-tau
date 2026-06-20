@@ -3958,9 +3958,10 @@ def _correct_fallback_chots(now_ms: int) -> int:
             continue  # người dùng đã sửa tay → KHÔNG đụng
         cur = _to_int_ms(x.get("actualParkedAtMillis"))
         landed = _to_int_ms(x.get("actualLandedAtMillis") or x.get("landedAtMillis") or x.get("touchdownMillis"))
-        stand = x.get("stand")
-        if not (cur and landed and stand):
+        if not (cur and landed):
             continue
+        # stand có thể THIẾU (radar không xác định bến) → vẫn sửa bằng median toàn cục/flat.
+        stand = x.get("stand")
         buf = _corrected_taxi_buffer_ms(stand, x.get("aircraftType") or x.get("aircraft") or "")
         new_ms = int(landed) + buf
         if new_ms < int(landed) + CHOT_FIX_MIN_TAXI_MS:
