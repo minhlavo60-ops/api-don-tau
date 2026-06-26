@@ -223,26 +223,27 @@ LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", 
 LANDING_TO_PARK_FALLBACK_WIDEBODY_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_WIDEBODY_MS", "420000"))
 
 # ── [chot-fix] SỬA LẠI GIỜ CHỐT FALLBACK trên SERVER ONLINE (không cần đụng fetcher) ──
-# Fetcher (máy cơ quan/box) ghi fallback cố định landed+5p/+7p, thường TRỄ ~1.5–2.5p so taxi thật ở DAD.
-# Server online đọc lại các ca này rồi GHI ĐÈ bằng ước lượng sát hơn (per-stand → global median → flat),
-# CHỈ kéo SỚM (không bao giờ đẩy muộn), KHÔNG đụng ca radar-thật / ca người dùng sửa tay.
+# Nguyên tắc: KHÔNG BAO GIỜ ghi TRỄ; hụt sớm 1-2 phút thì chấp nhận. Vì vậy dùng CẬN DƯỚI
+# taxi-in học theo TỪNG BẾN (percentile thấp từ ca radar-thật) → chốt ≤ giờ thật ⇒ không trễ,
+# chỉ hụt phần dao động (E4/E6). Bến lấy từ record HOẶC lịch bay. CHỈ kéo SỚM, không đẩy muộn.
 CHOT_FIX_ENABLED = os.environ.get("CHOT_FIX_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-CHOT_FIX_FLAT_NB_MS = int(os.environ.get("CHOT_FIX_FLAT_NB_MS", "210000"))   # 3.5 phút (thân hẹp) — hậu phương cuối
-CHOT_FIX_FLAT_WB_MS = int(os.environ.get("CHOT_FIX_FLAT_WB_MS", "300000"))   # 5 phút (thân rộng) — hậu phương cuối
+CHOT_FIX_PCTL = int(os.environ.get("CHOT_FIX_PCTL", "10"))                   # percentile THẤP (cận dưới) — nhỏ = an toàn không trễ
+CHOT_FIX_FLAT_NB_MS = int(os.environ.get("CHOT_FIX_FLAT_NB_MS", "150000"))   # 2.5 phút (thân hẹp) — hậu phương cuối, thấp để không trễ
+CHOT_FIX_FLAT_WB_MS = int(os.environ.get("CHOT_FIX_FLAT_WB_MS", "180000"))   # 3 phút (thân rộng) — hậu phương cuối
 CHOT_FIX_MIN_TAXI_MS = int(os.environ.get("CHOT_FIX_MIN_TAXI_MS", "60000"))  # taxi tối thiểu 1 phút (sanity)
-CHOT_FIX_MIN_PULL_MS = int(os.environ.get("CHOT_FIX_MIN_PULL_MS", "45000"))  # chỉ ghi đè khi kéo sớm > 45s
+CHOT_FIX_MIN_PULL_MS = int(os.environ.get("CHOT_FIX_MIN_PULL_MS", "15000"))  # ghi đè khi dôi > 15s so cận dưới (chặt 'không trễ')
 CHOT_FIX_INTERVAL_MS = int(os.environ.get("CHOT_FIX_INTERVAL_MS", "60000"))  # quét pickups tối đa mỗi 60s
 CHOT_FIX_FALLBACK_SOURCES = {"server_landing_plus_3min", "landing_plus_3min", "web_landing_plus_3min"}
-# Học taxi-time median theo BẾN (và toàn cục) từ ca RADAR-THẬT trong lịch sử gần đây
+# Học CẬN DƯỚI taxi-time theo BẾN (và toàn cục) từ ca RADAR-THẬT trong lịch sử gần đây
 STAND_TAXI_REAL_SOURCES = ("ground_stop", "actual_parked", "on_ground_low_speed")
 STAND_TAXI_MIN_SAMPLES = int(os.environ.get("STAND_TAXI_MIN_SAMPLES", "4"))
 STAND_TAXI_GLOBAL_MIN_SAMPLES = int(os.environ.get("STAND_TAXI_GLOBAL_MIN_SAMPLES", "12"))
 STAND_TAXI_SCAN_DAYS = int(os.environ.get("STAND_TAXI_SCAN_DAYS", "14"))
 STAND_TAXI_RELOAD_MS = int(os.environ.get("STAND_TAXI_RELOAD_MS", str(6 * 3600 * 1000)))
-STAND_TAXI_MIN_MS = 60_000          # bỏ mẫu < 1 phút (nhiễu)
+STAND_TAXI_MIN_MS = 90_000          # bỏ mẫu < 1.5 phút (nhiễu/taxi bất khả thi)
 STAND_TAXI_MAX_MS = 20 * 60_000     # bỏ mẫu > 20 phút (outlier)
-STAND_TAXI_MEDIANS: dict[str, int] = {}
-STAND_TAXI_GLOBAL_MEDIAN: Optional[int] = None
+STAND_TAXI_LOW: dict[str, int] = {}        # cận dưới taxi theo bến (ms)
+STAND_TAXI_GLOBAL_LOW: Optional[int] = None
 LAST_STAND_TAXI_RELOAD_MS = 0
 LAST_CHOT_FIX_MS = 0
 # Khi radar còn live, KHÔNG vội chốt fallback. Đợi đủ N phút sau touchdown để ground_stop
@@ -3865,12 +3866,19 @@ def _stand_taxi_key(stand) -> str:
     return str(stand or "").strip().upper()
 
 
-def _refresh_stand_taxi_medians(db, now_ms: int) -> None:
-    """Quét pickups vài ngày gần đây, học median taxi-in (parked − landed) theo BẾN và toàn cục,
-    CHỈ từ ca RADAR-THẬT (ground_stop/actual_parked/on_ground_low_speed). Throttle theo RELOAD_MS."""
-    global LAST_STAND_TAXI_RELOAD_MS, STAND_TAXI_MEDIANS, STAND_TAXI_GLOBAL_MEDIAN
-    # Đã quét ít nhất 1 lần (LAST > 0) và còn trong hạn → bỏ qua, kể cả khi chưa học được median nào
-    # (tránh quét lại 14 ngày mỗi chu kỳ khi dữ liệu thật còn ít).
+def _percentile(arr: list[int], p: float) -> int:
+    """Percentile THẤP (p in 0..100) — lấy CẬN DƯỚI để chốt không bao giờ trễ."""
+    arr = sorted(arr)
+    if not arr:
+        return 0
+    idx = int((len(arr) - 1) * (max(0.0, min(100.0, p)) / 100.0))
+    return int(arr[idx])
+
+
+def _refresh_stand_taxi_low(db, now_ms: int) -> None:
+    """Quét pickups vài ngày gần đây, học CẬN DƯỚI taxi-in (percentile thấp) theo BẾN và toàn cục,
+    CHỈ từ ca RADAR-THẬT. Cận dưới ⇒ chốt luôn ≤ giờ thật ⇒ KHÔNG trễ. Throttle theo RELOAD_MS."""
+    global LAST_STAND_TAXI_RELOAD_MS, STAND_TAXI_LOW, STAND_TAXI_GLOBAL_LOW
     if LAST_STAND_TAXI_RELOAD_MS and now_ms - LAST_STAND_TAXI_RELOAD_MS < STAND_TAXI_RELOAD_MS:
         return
     LAST_STAND_TAXI_RELOAD_MS = now_ms
@@ -3899,33 +3907,36 @@ def _refresh_stand_taxi_medians(db, now_ms: int) -> None:
                 continue
             per_stand.setdefault(stand, []).append(delta)
             all_samples.append(delta)
-
-    def _median(arr: list[int]) -> int:
-        arr = sorted(arr)
-        n = len(arr)
-        return int(arr[n // 2]) if n % 2 else int((arr[n // 2 - 1] + arr[n // 2]) // 2)
-
-    STAND_TAXI_MEDIANS = {s: _median(a) for s, a in per_stand.items() if len(a) >= STAND_TAXI_MIN_SAMPLES}
-    STAND_TAXI_GLOBAL_MEDIAN = _median(all_samples) if len(all_samples) >= STAND_TAXI_GLOBAL_MIN_SAMPLES else None
-    if STAND_TAXI_MEDIANS or STAND_TAXI_GLOBAL_MEDIAN:
-        log.info("chot-fix: learned taxi medians — %d stands, global=%s ms (n=%d)",
-                 len(STAND_TAXI_MEDIANS), STAND_TAXI_GLOBAL_MEDIAN, len(all_samples))
+    STAND_TAXI_LOW = {s: _percentile(a, CHOT_FIX_PCTL) for s, a in per_stand.items() if len(a) >= STAND_TAXI_MIN_SAMPLES}
+    STAND_TAXI_GLOBAL_LOW = _percentile(all_samples, CHOT_FIX_PCTL) if len(all_samples) >= STAND_TAXI_GLOBAL_MIN_SAMPLES else None
+    if STAND_TAXI_LOW or STAND_TAXI_GLOBAL_LOW:
+        log.info("chot-fix: learned LOW(p%d) taxi — %d bến, global=%s ms (n=%d)",
+                 CHOT_FIX_PCTL, len(STAND_TAXI_LOW), STAND_TAXI_GLOBAL_LOW, len(all_samples))
 
 
-def _corrected_taxi_buffer_ms(stand, aircraft_type) -> int:
-    """Buffer taxi tốt hơn: median theo BẾN nếu đủ mẫu → median TOÀN CỤC → flat theo loại tàu."""
-    m = STAND_TAXI_MEDIANS.get(_stand_taxi_key(stand))
-    if isinstance(m, int) and m > 0:
-        return m
-    if isinstance(STAND_TAXI_GLOBAL_MEDIAN, int) and STAND_TAXI_GLOBAL_MEDIAN > 0:
-        return STAND_TAXI_GLOBAL_MEDIAN
+def _schedule_stand_for(code):
+    """Lấy bến theo LỊCH BAY khi record không có bến (radar không xác định)."""
+    try:
+        hint = SCHEDULE_HINTS.get(code) or SCHEDULE_HINTS.get(str(code or "").upper().strip())
+        return (hint or {}).get("stand")
+    except Exception:
+        return None
+
+
+def _corrected_taxi_buffer_ms(stand, aircraft_type) -> Optional[int]:
+    """CẬN DƯỚI taxi: theo BẾN (percentile thấp) nếu đủ mẫu → toàn cục → flat thấp."""
+    lo = STAND_TAXI_LOW.get(_stand_taxi_key(stand))
+    if isinstance(lo, int) and lo > 0:
+        return lo
+    if isinstance(STAND_TAXI_GLOBAL_LOW, int) and STAND_TAXI_GLOBAL_LOW > 0:
+        return STAND_TAXI_GLOBAL_LOW
     return CHOT_FIX_FLAT_WB_MS if _is_wide_body(aircraft_type) else CHOT_FIX_FLAT_NB_MS
 
 
 def _correct_fallback_chots(now_ms: int) -> int:
-    """SERVER ONLINE: đọc các ca chốt FALLBACK hôm nay rồi GHI ĐÈ bằng ước lượng sát hơn.
-    An toàn: chỉ source fallback, KHÔNG đụng ca radar-thật / ca sửa tay (lastUpdatedByName != server*),
-    chỉ kéo SỚM (sửa lỗi 'trễ'), lưu mốc gốc để có thể truy vết/khôi phục."""
+    """SERVER ONLINE: kéo các ca chốt FALLBACK 'trễ' về CẬN DƯỚI taxi thật.
+    Nguyên tắc: KHÔNG BAO GIỜ trễ (chốt ≤ giờ thật), chỉ hụt 1-2p. An toàn: chỉ source fallback;
+    KHÔNG đụng radar-thật / ca sửa tay; chỉ kéo SỚM; lưu mốc gốc."""
     global LAST_CHOT_FIX_MS
     if not CHOT_FIX_ENABLED:
         return 0
@@ -3936,9 +3947,13 @@ def _correct_fallback_chots(now_ms: int) -> int:
     if db is None:
         return 0
     try:
-        _refresh_stand_taxi_medians(db, now_ms)
+        _refresh_schedule_from_firestore(force=False)   # để lấy bến theo lịch bay khi radar thiếu bến
+    except Exception:
+        pass
+    try:
+        _refresh_stand_taxi_low(db, now_ms)
     except Exception as e:
-        log.warning("chot-fix: learn medians fail: %s", e)
+        log.warning("chot-fix: learn low fail: %s", e)
     date_key = _date_key_from_millis(now_ms)
     col = db.collection("pickups").document(date_key).collection("flights")
     try:
@@ -3960,10 +3975,11 @@ def _correct_fallback_chots(now_ms: int) -> int:
         landed = _to_int_ms(x.get("actualLandedAtMillis") or x.get("landedAtMillis") or x.get("touchdownMillis"))
         if not (cur and landed):
             continue
-        # stand có thể THIẾU (radar không xác định bến) → vẫn sửa bằng median toàn cục/flat.
-        stand = x.get("stand")
+        stand = x.get("stand") or _schedule_stand_for(doc.id)   # bến từ record HOẶC lịch bay
         buf = _corrected_taxi_buffer_ms(stand, x.get("aircraftType") or x.get("aircraft") or "")
-        new_ms = int(landed) + buf
+        if not buf:
+            continue
+        new_ms = int(landed) + int(buf)
         if new_ms < int(landed) + CHOT_FIX_MIN_TAXI_MS:
             new_ms = int(landed) + CHOT_FIX_MIN_TAXI_MS
         # CHỈ kéo SỚM (sửa lỗi 'trễ'); không bao giờ đẩy muộn
@@ -4129,6 +4145,34 @@ def _ghi_heartbeat_fetcher(db) -> None:
         log.warning("Ghi heartbeat fetcher lỗi: %s", e)
 
 
+def _hide_parked_at_stand_live(flights: dict, now_ms: int) -> dict:
+    """Trả BẢN SAO flights, cắt lat/lng các tàu đã DỪNG (gs ≤ PARKED_GS_KT) trong toạ độ một
+    bến đã biết (≤ STAND_SNAP_M) → web ẩn marker NGAY, không chờ chốt PARKED 4 phút.
+
+    Chạy ở server online (role 'server'), độc lập với máy cơ quan/box: web đọc /api/etas từ
+    server này nên chỉ cần cập nhật bản online là có hiệu lực. KHÔNG đụng radarLive cache
+    (tạo dict mới). Nếu tàu lăn tiếp, mẫu sau gs cao / rời bến → tự hiện lại marker."""
+    if not flights:
+        return flights
+    result = {}
+    for code, d in flights.items():
+        if isinstance(d, dict):
+            lat = d.get("latitude")
+            lng = d.get("longitude")
+            gs = d.get("ground_speed_kt")
+            if (lat is not None and lng is not None
+                    and isinstance(gs, (int, float)) and gs <= PARKED_GS_KT):
+                near_stand, _ = _stand_snap_status(lat, lng)
+                if near_stand:
+                    d = dict(d)
+                    d["latitude"] = None
+                    d["longitude"] = None
+                    d["map_hidden"] = True
+                    d["map_hidden_reason"] = "stopped_at_known_stand"
+        result[code] = d
+    return result
+
+
 def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     """Server role: dựng payload /api/etas từ radarLive mà fetcher đã ghi."""
     flights, meta = _load_live_from_firestore()
@@ -4138,6 +4182,7 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     stale = (fetcher_time is None) or (now_ms - int(fetcher_time) > RADAR_LIVE_STALE_MS)
     feed_revision = meta.get("feed_revision") or "live:none"
     not_modified = known_revision is not None and known_revision == feed_revision
+    out_flights = {} if not_modified else _hide_parked_at_stand_live(flights, now_ms)
     return {
         "status": "success",
         "feed_revision": feed_revision,
@@ -4155,7 +4200,7 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
         "firestore_status": FIRESTORE_STATUS,
         "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
         "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
-        "flights": {} if not_modified else flights,
+        "flights": out_flights,
     }
 
 
