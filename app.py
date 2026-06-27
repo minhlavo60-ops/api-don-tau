@@ -365,7 +365,10 @@ def _doc_vai_tro_fetcher() -> str:
 FETCHER_VAI_TRO = _doc_vai_tro_fetcher()
 FETCHER_PHU = (RADAR_ROLE == "fetcher" and FETCHER_VAI_TRO == "phu")
 # Chính im lặng quá ngưỡng này → phụ coi như chính đã tắt và tự gánh thay.
-PHU_TAKEOVER_MS = int(os.environ.get("PHU_TAKEOVER_MS", "150000"))
+# Mặc định 7 phút: phụ phán đoán chính còn sống qua nhịp tim fetcher_<chính>
+# (ghi tối đa mỗi FETCHER_HEARTBEAT_MS = 5 phút), nên ngưỡng phải > 5 phút +
+# biên an toàn, nếu không phụ sẽ tưởng nhầm chính tắt giữa 2 nhịp tim.
+PHU_TAKEOVER_MS = int(os.environ.get("PHU_TAKEOVER_MS", "420000"))
 # Không ghi nếu máy khác (chính hoặc phụ khác) vừa ghi trong ngưỡng này.
 PHU_MIN_GAP_MS = int(os.environ.get("PHU_MIN_GAP_MS", "8000"))
 # Chờ tối đa 1 lượt trước khi cứ thế poll (đề phòng kẹt do đồng hồ lệch).
@@ -428,6 +431,8 @@ LAST_RADAR_LIVE_READ_ERROR: Optional[str] = None
 PHU_LAST_MAIN_WRITE_MS: Optional[int] = None   # lần ghi gần nhất của máy CHÍNH (giờ Firestore)
 PHU_MAIN_WRITES: deque = deque(maxlen=6)       # các mốc ghi của chính → ước lượng chu kỳ
 PHU_DA_BU_CHO_MS: Optional[int] = None         # đã poll bù cho lượt ghi nào của chính rồi
+PHU_LAST_MAIN_HEARTBEAT_MS: Optional[int] = None  # nhịp tim fetcher_<chính> mới nhất (KHÔNG bị tranh ghi)
+PHU_LAST_HB_SCAN_MS = 0                         # lần quét nhịp tim chính gần nhất (để giãn nhịp đọc)
 LAST_FETCHER_HEARTBEAT_MS = 0
 FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
@@ -4106,7 +4111,49 @@ def _phu_quan_sat_live() -> tuple[Optional[int], str]:
         if PHU_LAST_MAIN_WRITE_MS != last_ms:
             PHU_LAST_MAIN_WRITE_MS = last_ms
             PHU_MAIN_WRITES.append(last_ms)
+    # Tín hiệu sống PHỤ (backstop): radarLive/current bị cả 3 máy ghi đè nên đọc
+    # 1 doc đó dễ "bắt trượt" lần ghi của chính → tưởng nhầm chính tắt. Đọc thêm
+    # nhịp tim fetcher_<chính> (chỉ chính ghi, không tranh ghi) để chắc chắn.
+    _phu_quan_sat_heartbeat_chinh(db)
     return last_ms, src
+
+
+def _phu_quan_sat_heartbeat_chinh(db) -> None:
+    """Cập nhật PHU_LAST_MAIN_HEARTBEAT_MS từ nhịp tim fetcher_<chính> mới nhất.
+
+    Chỉ máy CHÍNH ghi doc fetcher_<id> của nó với vai_tro='chinh' (máy phụ luôn
+    ghi 'phu' kể cả lúc gánh thay), nên đây là tín hiệu sống KHÔNG bị tranh ghi
+    đè như radarLive/current. Giãn nhịp đọc (PHU_HB_SCAN_INTERVAL_MS) để khỏi quét
+    cả collection mỗi vòng — ngưỡng gánh thay tính bằng phút nên không cần đọc dày.
+    """
+    global PHU_LAST_MAIN_HEARTBEAT_MS, PHU_LAST_HB_SCAN_MS
+    PHU_HB_SCAN_INTERVAL_MS = 45_000
+    now_ms = int(time.time() * 1000)
+    if now_ms - PHU_LAST_HB_SCAN_MS < PHU_HB_SCAN_INTERVAL_MS:
+        return
+    PHU_LAST_HB_SCAN_MS = now_ms
+    try:
+        moc = None
+        for doc in db.collection(RADAR_LIVE_COLLECTION).stream():
+            if not doc.id.startswith("fetcher_"):
+                continue
+            hb = doc.to_dict() or {}
+            src = str(hb.get("source") or "")
+            # vai_tro = vai trò CẤU HÌNH (chính/phụ), không phải vai_tro_hien_tai.
+            # Máy phụ đang gánh thay vẫn ghi 'phu' ở đây nên không bị nhận nhầm.
+            vai_tro = str(hb.get("vai_tro") or "chinh").lower()
+            if not src or src == RADAR_SOURCE_ID or vai_tro == "phu":
+                continue
+            try:
+                seen = int(doc.update_time.timestamp() * 1000)
+            except Exception:
+                seen = _to_int_ms(hb.get("last_seen_millis"))
+            if seen and (moc is None or seen > moc):
+                moc = seen
+        if moc and (PHU_LAST_MAIN_HEARTBEAT_MS is None or moc > PHU_LAST_MAIN_HEARTBEAT_MS):
+            PHU_LAST_MAIN_HEARTBEAT_MS = moc
+    except Exception as e:
+        log.warning("Máy phụ đọc nhịp tim chính lỗi: %s", e)
 
 
 def _phu_chu_ky_chinh_ms() -> int:
@@ -4119,11 +4166,19 @@ def _phu_chu_ky_chinh_ms() -> int:
 
 
 def _phu_chinh_dang_song(now_ms: Optional[int] = None) -> bool:
-    """True nếu máy chính còn ghi radarLive trong vòng PHU_TAKEOVER_MS."""
-    if not FETCHER_PHU or PHU_LAST_MAIN_WRITE_MS is None:
+    """True nếu máy chính còn sống trong vòng PHU_TAKEOVER_MS.
+
+    Coi là sống nếu MỘT TRONG HAI tín hiệu còn tươi: lần ghi radarLive/current của
+    chính (nhanh nhưng dễ bị tranh ghi đè) HOẶC nhịp tim fetcher_<chính> (thưa hơn
+    nhưng không bị tranh ghi). Lấy mốc mới nhất giữa hai tín hiệu → hết tình trạng
+    tưởng nhầm chính tắt khi có nhiều máy phụ cùng ghi đè radarLive/current."""
+    if not FETCHER_PHU:
+        return False
+    moc = [m for m in (PHU_LAST_MAIN_WRITE_MS, PHU_LAST_MAIN_HEARTBEAT_MS) if m]
+    if not moc:
         return False
     now_ms = now_ms or int(time.time() * 1000)
-    return now_ms - PHU_LAST_MAIN_WRITE_MS <= PHU_TAKEOVER_MS
+    return now_ms - max(moc) <= PHU_TAKEOVER_MS
 
 
 def _phu_nhuong_nghiep_vu() -> bool:
@@ -4576,6 +4631,7 @@ def health():
             "vai_tro_hien_tai": _vai_tro_hien_tai(),
             "phu_nhuong_nghiep_vu": _phu_nhuong_nghiep_vu(),
             "phu_last_main_write_ms": PHU_LAST_MAIN_WRITE_MS,
+            "phu_last_main_heartbeat_ms": PHU_LAST_MAIN_HEARTBEAT_MS,
             "phu_chu_ky_chinh_ms": _phu_chu_ky_chinh_ms() if FETCHER_PHU else None,
             "last_radar_live_write_ms": LAST_RADAR_LIVE_WRITE_MS,
             "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
