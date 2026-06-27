@@ -181,6 +181,11 @@ PARKED_RESUME_DRIFT_M = float(os.environ.get("PARKED_RESUME_DRIFT_M", "150.0")) 
 # An toàn nguội: khi chưa học đủ STAND_SNAP_MIN_COVERAGE bến → giữ nguyên hành vi cũ.
 STAND_SNAP_ENABLED = os.environ.get("STAND_SNAP_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 STAND_SNAP_M = float(os.environ.get("STAND_SNAP_M", "45.0"))                       # <= bán kính này coi là "ở bến"
+# Dừng ĐÚNG trong toạ độ một bến đã biết (≤ STAND_SNAP_M) = đỗ THẬT, sẽ không lăn tiếp →
+# CHỐT HẲN (parked_confirmed) sau khoảng xác nhận NGẮN này, KHÔNG chờ tàu tắt sóng (transponder
+# off) như trước. Còn dừng XA bến (đường lăn) vẫn giữ provisional để "đi tiếp thì chốt lại".
+# 1 mẫu confirming là đủ loại nhiễu 1-điểm; đặt 0 nếu muốn chốt ngay mẫu đầu.
+STAND_SNAP_CONFIRM_MS = int(os.environ.get("STAND_SNAP_CONFIRM_MS", "20000"))
 # Khi dừng XA mọi bến đã học (nghi dừng tạm, hoặc bến mới chưa học): chờ lâu hơn mới chốt.
 # Dừng tạm trên đường lăn hiếm khi đứng yên liên tục 9 phút (thường lăn tiếp → anchor reset),
 # còn bến mới thật sẽ đứng yên đủ lâu → vẫn chốt + học được toạ độ bến đó.
@@ -2384,6 +2389,13 @@ def _update_parked_candidate(code, old, state, lat, lng, gs_kt, dist_km, now_ms)
             parked_anchor_lat = old.parked_anchor_lat
             parked_anchor_lng = old.parked_anchor_lng
             parked_confirmed = old.parked_confirmed
+            # Đang PARKED tạm mà vị trí nằm trong tọa độ một bến đã biết → chốt HẲN ngay
+            # (đỗ thật, không chờ tắt sóng). Dừng tạm trên đường lăn không vào được nhánh này
+            # vì đã UNPARK ở trên khi lăn tiếp.
+            if not parked_confirmed:
+                _near_stand_sticky, _ = _stand_snap_status(cur_lat, cur_lng)
+                if _near_stand_sticky:
+                    parked_confirmed = True
     elif state in ("LANDED", "TAXIING", "PARKED") and parking_signal:
         cur_lat = lat
         cur_lng = lng
@@ -2407,14 +2419,24 @@ def _update_parked_candidate(code, old, state, lat, lng, gs_kt, dist_km, now_ms)
                 parked_anchor_lat = cur_lat
                 parked_anchor_lng = cur_lng
 
-        # STAND-SNAP: gần bến đã học → chốt nhanh (PARKED_STABLE_MS); xa mọi bến → đòi lâu hơn.
+        # STAND-SNAP: dừng ĐÚNG trong bến đã biết → chốt HẲN nhanh (STAND_SNAP_CONFIRM_MS);
+        # gần khu sân bay nhưng chưa rõ bến → PARKED_STABLE_MS; xa mọi bến → đòi lâu hơn.
         _near_stand, _far_from_stands = _stand_snap_status(cur_lat, cur_lng)
-        required_stable_ms = PARKED_STABLE_FAR_MS if _far_from_stands else PARKED_STABLE_MS
+        if _far_from_stands:
+            required_stable_ms = PARKED_STABLE_FAR_MS
+        elif _near_stand:
+            required_stable_ms = STAND_SNAP_CONFIRM_MS
+        else:
+            required_stable_ms = PARKED_STABLE_MS
         if now_ms - parked_candidate_since_ms >= required_stable_ms:
             state = "PARKED"
             if parked_at_millis is None:
                 parked_at_millis = parked_candidate_since_ms
                 parked_source = "ground_stop"
+            # Dừng tại tọa độ bến đã biết = đỗ thật → CHỐT HẲN luôn, không chờ tắt sóng.
+            # (Tàu dừng xa bến vẫn để provisional cho tính năng "đi tiếp chốt lại".)
+            if _near_stand:
+                parked_confirmed = True
         elif state == "PARKED":
             # _classify_state có thể trả PARKED ngay. Hạ xuống TAXIING cho tới khi ổn định.
             state = "TAXIING"
@@ -3483,6 +3505,7 @@ def poll_loop() -> None:
                 # Server (Render) không gọi FR24; dữ liệu /api/etas lấy từ radarLive khi có
                 # request. Ngoài ra, khi BẬT cờ và máy chính (PC cơ quan) TẮT, server tự dò đỗ
                 # từ radarLive (box cấp vị trí) rồi chốt giờ vào bến — không cần ai mở web.
+                did_full_finalize = False
                 if SERVER_FINALIZE_FROM_LIVE:
                     _refresh_schedule_from_firestore(force=False)
                     _refresh_stand_coords_from_firestore(force=False)
@@ -3490,8 +3513,20 @@ def poll_loop() -> None:
                     _server_quan_sat_chinh()
                     if not _server_chinh_dang_song(server_now_ms) and not _server_sample_chinh(12_000):
                         n = _finalize_parked_from_live(int(time.time() * 1000))
+                        did_full_finalize = True
                         if n:
                             log.info("Server finalize-from-live: %d chuyến chốt giờ vào bến", n)
+                # CHỐT TẠI BẾN ở server online — chạy MỖI nhịp, độc lập máy chính/phụ: chỉ chốt
+                # các chuyến đã DỪNG ngay trong tọa độ một bến đã biết (không đụng mốc tạm đường
+                # lăn / landing+N). Đây là cách "chốt bến luôn ở server online" mà không cần cập
+                # nhật máy box. Chỉ đọc radarLive (đã cache 8s) — không thêm read meta máy chính.
+                # Bỏ qua khi bản fallback đầy đủ vừa chạy (đã bao gồm cả bến).
+                if SERVER_FINALIZE_AT_STAND and not did_full_finalize:
+                    _refresh_schedule_from_firestore(force=False)
+                    _refresh_stand_coords_from_firestore(force=False)
+                    ns = _finalize_parked_from_live(int(time.time() * 1000), stand_only=True)
+                    if ns:
+                        log.info("Server chốt-tại-bến: %d chuyến chốt giờ vào bến", ns)
             else:
                 if FETCHER_PHU:
                     # Máy phụ: đợi tới điểm giữa khoảng trống của máy chính rồi mới poll.
@@ -3666,6 +3701,10 @@ RADAR_LIVE_READ_CACHE_MS = int(os.environ.get("RADAR_LIVE_READ_CACHE_MS", "8000"
 # FR24 chặn IP Render nên Render không tự lấy vị trí, nhưng box/PC đã đẩy vị trí lên
 # radarLive — đủ để chạy dò đỗ (ground_stop). Mặc định TẮT; bật bằng env trên Render.
 SERVER_FINALIZE_FROM_LIVE = os.environ.get("SERVER_FINALIZE_FROM_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
+# CHỐT TẠI BẾN ngay ở server online: chốt HẲN giờ vào bến cho tàu đã dừng đúng trong tọa độ một
+# bến đã biết, độc lập máy chính/phụ (chạy mỗi nhịp). Mặc định BẬT — chỉ động vào chuyến dừng ở
+# bến nên an toàn; tắt bằng env nếu cần. Đây là điểm "chốt bến luôn ở server online" không cần box.
+SERVER_FINALIZE_AT_STAND = os.environ.get("SERVER_FINALIZE_AT_STAND", "1").strip().lower() in ("1", "true", "yes", "on")
 SERVER_LOOP_SLEEP_S = int(os.environ.get("SERVER_LOOP_SLEEP_S", "25"))
 # Server tự chốt từ radarLive (box cấp vị trí, độ tin thấp hơn FR24 đầy đủ của PC) nên SIẾT thêm
 # bằng chứng "thật sự dưới đất", chống "chưa hạ đã chốt giờ":
@@ -4123,10 +4162,15 @@ def _correct_fallback_chots(now_ms: int) -> int:
     return fixed
 
 
-def _finalize_parked_from_live(now_ms: int) -> int:
+def _finalize_parked_from_live(now_ms: int, stand_only: bool = False) -> int:
     """Server: dò đỗ + chốt giờ vào bến từ radarLive (box/PC cấp vị trí). Tái dùng
     nguyên _update_parked_candidate (giống fetcher) và _sync_parked_entries_to_firestore
-    (đầy đủ sanity gate + dedup). Trả số chuyến vừa ghi giờ vào bến."""
+    (đầy đủ sanity gate + dedup). Trả số chuyến vừa ghi giờ vào bến.
+
+    stand_only=True: CHỈ ghi các chuyến đã CHỐT HẲN ngay trong tọa độ một bến đã biết
+    (parked_confirmed=True ⇔ dừng tại bến ở đường live này). Dùng cho server online chạy
+    MỖI vòng lặp, độc lập máy chính: chốt bến luôn ở server online mà không đụng các mốc tạm
+    (đường lăn / landing+N) — phần đó để bản fallback đầy đủ (khi máy chính tắt) hoặc máy chính lo."""
     flights, _meta = _load_live_from_firestore()
     if not flights:
         return 0
@@ -4197,6 +4241,10 @@ def _finalize_parked_from_live(now_ms: int) -> int:
         )
         SERVER_TRACKED[code] = entry
         if entry.state == "PARKED" and entry.parked_at_millis:
+            # stand_only: trên đường live, parked_confirmed=True chỉ xảy ra khi tàu dừng ĐÚNG
+            # trong tọa độ bến (xem _update_parked_candidate) → đó chính là "chốt tại bến".
+            if stand_only and not entry.parked_confirmed:
+                continue
             updates[code] = entry
     if updates:
         return _sync_parked_entries_to_firestore(updates)
