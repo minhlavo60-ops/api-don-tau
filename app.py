@@ -3724,6 +3724,10 @@ def _load_live_from_firestore():
         LAST_RADAR_LIVE_READ_MS = int(time.time() * 1000)
         LAST_RADAR_LIVE_READ_ERROR = None
         data = snap.to_dict() or {} if snap.exists else {}
+        try:
+            data["_doc_write_ms"] = int(snap.update_time.timestamp() * 1000) if snap.exists else 0
+        except Exception:
+            data["_doc_write_ms"] = _to_int_ms(data.get("server_time_millis")) or 0
         flights = data.get("flights") or {}
         with _radar_live_lock:
             _RADAR_LIVE_CACHE.update({"ts": now, "flights": flights, "meta": data})
@@ -3782,6 +3786,7 @@ def _read_live_raw_for_merge():
             doc_write_ms = int(snap.update_time.timestamp() * 1000) if snap.exists else 0
         except Exception:
             doc_write_ms = _to_int_ms(data.get("server_time_millis")) or 0
+        data["_doc_write_ms"] = doc_write_ms
         with _radar_live_lock:
             _RADAR_LIVE_CACHE.update({"ts": now, "flights": flights, "meta": data})
         return flights, data, doc_write_ms
@@ -3791,23 +3796,33 @@ def _read_live_raw_for_merge():
         return None, {}, 0
 
 
-def _merge_live_snapshot_into_store(flights: dict, now_ms: int) -> None:
-    """Gộp 1 ảnh chụp vừa đọc vào SERVER_LIVE_MERGE (mốc mới hơn thắng; mã vắng quá TTL thì bỏ)."""
-    global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS
-    if not isinstance(flights, dict):
-        return
+def _merge_live_snapshot_into_store(flights: dict, doc_write_ms: int, now_ms: int) -> None:
+    """Gộp 1 ảnh chụp vào SERVER_LIVE_MERGE. Gọi được từ CẢ luồng nền LẪN đường request
+    /api/etas (để chắc chắn chạy dù gunicorn không giữ luồng nền).
+
+    - CHỈ gộp dữ liệu mới khi doc THỰC SỰ có ghi mới (doc_write_ms đổi) → 1 doc bị nhiều
+      máy ghi đè vẫn gộp đúng, không gộp trùng cùng 1 bản ghi nhiều lần.
+    - LUÔN prune mã vắng mặt quá TTL — kể cả khi radar chết (doc đứng yên) → tàu hết hạn
+      biến mất → web báo 'mất kết nối' đúng lúc, không treo tàu ma.
+    - Trong từng mã: mốc telemetry (updated_at_millis) mới hơn thắng; entry rỗng/PENDING
+      (không mốc) KHÔNG đè được mã đang có vị trí."""
+    global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS, SERVER_MERGE_LAST_DOC_WRITE_MS
     changed = False
     with SERVER_LIVE_MERGE_LOCK:
-        for code, entry in flights.items():
-            if not isinstance(entry, dict):
-                continue
-            inc_ts = _entry_telemetry_ms(entry)
-            cur = SERVER_LIVE_MERGE.get(code)
-            if cur is None or inc_ts >= cur["ts"]:
-                SERVER_LIVE_MERGE[code] = {"entry": entry, "ts": inc_ts, "seen_ms": now_ms}
-                changed = True
-            else:
-                cur["seen_ms"] = now_ms  # mã vẫn được report (dù ảnh cũ hơn) → giữ tươi
+        is_new_write = bool(doc_write_ms) and doc_write_ms != SERVER_MERGE_LAST_DOC_WRITE_MS
+        if is_new_write and isinstance(flights, dict):
+            SERVER_MERGE_LAST_DOC_WRITE_MS = doc_write_ms
+            for code, entry in flights.items():
+                if not isinstance(entry, dict):
+                    continue
+                inc_ts = _entry_telemetry_ms(entry)
+                cur = SERVER_LIVE_MERGE.get(code)
+                if cur is None or inc_ts >= cur["ts"]:
+                    SERVER_LIVE_MERGE[code] = {"entry": entry, "ts": inc_ts, "seen_ms": now_ms}
+                    changed = True
+                else:
+                    cur["seen_ms"] = now_ms  # mã vẫn được report (dù ảnh cũ hơn) → giữ tươi
+        # LUÔN dọn mã quá hạn (chạy mọi lần gọi, kể cả khi không có ghi mới).
         for code in [c for c, v in SERVER_LIVE_MERGE.items()
                      if now_ms - v["seen_ms"] > SERVER_LIVE_MERGE_TTL_MS]:
             SERVER_LIVE_MERGE.pop(code, None)
@@ -3825,19 +3840,13 @@ def _server_merge_snapshot_view() -> dict:
 
 def _server_merge_reader_loop() -> None:
     """Server role: đọc radarLive/current DÀY rồi gộp, để bắt ảnh chụp của MỌI máy fetcher
-    dù chúng ghi đè chung 1 ô. Chạy nền, độc lập poll_loop.
-
-    CHỈ gộp khi doc có GHI MỚI (update_time đổi). Nếu mọi máy radar chết, doc đứng yên →
-    không gộp/không bơm 'còn tươi' → tàu trong store hết hạn TTL và biến mất → web báo
-    'mất kết nối' đúng lúc, không treo tàu ma."""
-    global SERVER_MERGE_LAST_DOC_WRITE_MS
+    dù chúng ghi đè chung 1 ô. Chạy nền, độc lập poll_loop. Hàm gộp tự gate ghi-mới + prune.
+    (Đường request /api/etas cũng gọi gộp → đúng kể cả khi gunicorn không giữ luồng nền này.)"""
     time.sleep(2)
     while True:
         try:
             flights, _meta, doc_write_ms = _read_live_raw_for_merge()
-            if flights is not None and doc_write_ms and doc_write_ms != SERVER_MERGE_LAST_DOC_WRITE_MS:
-                SERVER_MERGE_LAST_DOC_WRITE_MS = doc_write_ms
-                _merge_live_snapshot_into_store(flights, int(time.time() * 1000))
+            _merge_live_snapshot_into_store(flights, doc_write_ms, int(time.time() * 1000))
         except Exception as e:
             log.warning("Luồng gộp radarLive lỗi: %s", e)
         time.sleep(max(2.0, SERVER_MERGE_READ_INTERVAL_S))
@@ -4287,8 +4296,11 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     flights, meta = _load_live_from_firestore()  # cache đã được luồng gộp làm tươi
     if flights is None:
         flights = {}
+    # GỘP NGAY trên đường request: đảm bảo đúng KỂ CẢ khi gunicorn không giữ luồng nền.
+    # Hàm tự gate theo doc_write_ms (không gộp trùng với luồng nền) và tự prune.
+    _merge_live_snapshot_into_store(flights, (meta or {}).get("_doc_write_ms") or 0, now_ms)
     # Ưu tiên bộ ĐÃ GỘP theo thời gian (mượt, dùng cả 3 máy). Store rỗng lúc vừa khởi động
-    # (luồng gộp chưa chạy vòng đầu) → fallback ảnh thô để không gián đoạn.
+    # → fallback ảnh thô để không gián đoạn.
     merged = _server_merge_snapshot_view()
     if merged:
         flights = merged
@@ -4339,6 +4351,11 @@ def health():
             "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
             "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
             "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
+            # Gộp đa máy (server role): kiểm tra nhanh bản mới đã chạy chưa + đang gộp bao nhiêu tàu.
+            "merge_size": len(SERVER_LIVE_MERGE),
+            "merge_revision": SERVER_LIVE_MERGE_REV,
+            "merge_last_ms": SERVER_LIVE_MERGE_LAST_MS,
+            "merge_read_interval_s": SERVER_MERGE_READ_INTERVAL_S,
             "server_time_millis": int(time.time() * 1000),
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
