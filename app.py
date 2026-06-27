@@ -441,6 +441,30 @@ STAND_COORDS_DIRTY = False
 STAND_COORDS_LOADED = False
 LAST_STAND_COORDS_LOAD_MS = 0
 LAST_STAND_COORDS_PERSIST_MS = 0
+
+# ── LƯỚI HỌC CHUYỂN ĐỘNG DÙNG CHUNG (radarMotion flow grid) ───────────────────
+# Client (web) học hướng/độ-rẽ/tốc-độ điển hình theo ô vị trí để vẽ tàu mượt + đoán khúc rẽ.
+# Trước đây học PER-THIẾT-BỊ (IndexedDB). Nay GỘP CHUNG qua server online: mọi máy điện thoại/
+# máy tính dùng web đều POST phần đã học + GET lưới gộp → ai chạy cũng góp, app càng dùng càng
+# mượt/chính xác cho tất cả. Server là trung gian (giống stand coords): gộp + ghi Firestore
+# THROTTLE → không bung quota Spark (client chỉ gọi Render API, không tự đọc/ghi Firestore).
+FLOW_SYNC_ENABLED = os.environ.get("FLOW_SYNC_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+FLOW_CELL_DEG = float(os.environ.get("FLOW_CELL_DEG", "0.03"))          # PHẢI khớp CELL_DEG client
+FLOW_SYNC_RADIUS_KM = float(os.environ.get("FLOW_SYNC_RADIUS_KM", "80"))  # chỉ gộp/serve ô quanh DAD
+FLOW_GRID_MAX_CELLS = int(os.environ.get("FLOW_GRID_MAX_CELLS", "6000"))  # chặn kích thước doc Firestore
+FLOW_N_CAP = int(os.environ.get("FLOW_N_CAP", "480"))                   # trần n để lưới luôn còn thích nghi
+FLOW_POST_MAX_CELLS = int(os.environ.get("FLOW_POST_MAX_CELLS", "5000"))  # chặn 1 POST quá lớn
+FLOW_GRID_DOC = os.environ.get("FLOW_GRID_DOC", "config/radarFlowGrid")
+FLOW_GRID_RELOAD_MS = int(os.environ.get("FLOW_GRID_RELOAD_MS", str(6 * 3600 * 1000)))   # nạp lại mỗi 6h
+FLOW_GRID_PERSIST_MS = int(os.environ.get("FLOW_GRID_PERSIST_MS", str(5 * 60 * 1000)))   # ghi tối đa mỗi 5'
+# Lưới gộp ở RAM. key = "la_lo_hb" (như client); value = {n,turn,spd,brg,updated_ms}.
+FLOW_GRID: dict[str, dict] = {}
+FLOW_GRID_REV = 0
+FLOW_GRID_DIRTY = False
+FLOW_GRID_LOADED = False
+LAST_FLOW_GRID_LOAD_MS = 0
+LAST_FLOW_GRID_PERSIST_MS = 0
+_flow_lock = threading.Lock()
 _FIRESTORE_CLIENT = None
 ETAS_REVISION = 0
 ETAS_INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
@@ -1680,6 +1704,156 @@ def _maybe_persist_stand_coords(force: bool = False) -> None:
         log.info("Stand-snap: đã ghi %d bến vào %s (đủ tin: %d)", len(stands_out), STAND_COORDS_DOC, _trusted_stand_count())
     except Exception as e:
         log.warning("persist stand coords failed: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LƯỚI HỌC CHUYỂN ĐỘNG DÙNG CHUNG — gộp từ mọi client + ghi Firestore throttle
+# ══════════════════════════════════════════════════════════════════════════════
+def _flow_cell_center(key: str):
+    """Tâm ô (lat,lng) từ key 'la_lo_hb' (la=round(lat/CELL_DEG)). None nếu key hỏng."""
+    try:
+        la, lo, _hb = str(key).split("_")
+        return (int(la) * FLOW_CELL_DEG, int(lo) * FLOW_CELL_DEG)
+    except Exception:
+        return None
+
+
+def _flow_cell_near_dad(key: str) -> bool:
+    """True nếu ô nằm trong FLOW_SYNC_RADIUS_KM quanh DAD (chỉ gộp/serve vùng quanh sân)."""
+    c = _flow_cell_center(key)
+    if not c:
+        return False
+    try:
+        return _haversine_km(c[0], c[1], DAD_LAT, DAD_LNG) <= FLOW_SYNC_RADIUS_KM
+    except Exception:
+        return False
+
+
+def _circular_mean_deg(b1, w1, b2, w2):
+    """Trung bình hướng có trọng số (vòng tròn) — tránh lỗi quanh 0/360°."""
+    x = w1 * math.cos(math.radians(b1)) + w2 * math.cos(math.radians(b2))
+    y = w1 * math.sin(math.radians(b1)) + w2 * math.sin(math.radians(b2))
+    if x == 0 and y == 0:
+        return b1 % 360.0
+    return math.degrees(math.atan2(y, x)) % 360.0
+
+
+def _flow_cell_valid(n, turn, spd, brg) -> bool:
+    """Lọc nhiễu/rác trước khi gộp (1 client lỗi không làm hỏng lưới chung)."""
+    try:
+        n = float(n); turn = float(turn); spd = float(spd); brg = float(brg)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(n) and math.isfinite(turn) and math.isfinite(spd) and math.isfinite(brg)):
+        return False
+    return n > 0 and -12.0 <= turn <= 12.0 and 0.0 <= spd <= 400.0 and -0.01 <= brg <= 360.01
+
+
+def _merge_flow_cell(key: str, n, turn, spd, brg, now_ms: int) -> bool:
+    """Gộp 1 ô client vào FLOW_GRID (trọng số theo n, trần FLOW_N_CAP). Trả True nếu có đổi.
+    Gọi TRONG _flow_lock."""
+    global FLOW_GRID_DIRTY
+    if not _flow_cell_valid(n, turn, spd, brg) or not _flow_cell_near_dad(key):
+        return False
+    n = min(float(n), FLOW_N_CAP); turn = float(turn); spd = float(spd); brg = float(brg) % 360.0
+    cur = FLOW_GRID.get(key)
+    if cur is None:
+        FLOW_GRID[key] = {"n": n, "turn": turn, "spd": spd, "brg": brg, "updated_ms": now_ms}
+        FLOW_GRID_DIRTY = True
+        return True
+    wa = float(cur.get("n") or 0.0); wb = n
+    tot = wa + wb
+    if tot <= 0:
+        return False
+    cur["turn"] = (cur.get("turn", 0.0) * wa + turn * wb) / tot
+    cur["spd"] = (cur.get("spd", 0.0) * wa + spd * wb) / tot
+    cur["brg"] = _circular_mean_deg(cur.get("brg", brg), wa, brg, wb)
+    cur["n"] = min(tot, FLOW_N_CAP)
+    cur["updated_ms"] = now_ms
+    FLOW_GRID_DIRTY = True
+    return True
+
+
+def _prune_flow_grid_locked() -> None:
+    """Giữ tối đa FLOW_GRID_MAX_CELLS ô nhiều mẫu nhất (chặn doc Firestore phình)."""
+    if len(FLOW_GRID) <= FLOW_GRID_MAX_CELLS:
+        return
+    items = sorted(FLOW_GRID.items(), key=lambda kv: float(kv[1].get("n") or 0))
+    for k, _ in items[: len(FLOW_GRID) - FLOW_GRID_MAX_CELLS]:
+        FLOW_GRID.pop(k, None)
+
+
+def _refresh_flow_grid_from_firestore(force: bool = False) -> None:
+    """Nạp lưới gộp từ Firestore (lúc khởi động + định kỳ 6h). Render ngủ dậy có lại lưới cũ."""
+    global FLOW_GRID_LOADED, LAST_FLOW_GRID_LOAD_MS, FLOW_GRID_REV
+    if not FLOW_SYNC_ENABLED:
+        return
+    now_ms = int(time.time() * 1000)
+    if not (force or (not FLOW_GRID_LOADED) or (now_ms - LAST_FLOW_GRID_LOAD_MS) >= FLOW_GRID_RELOAD_MS):
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        col, _, doc = FLOW_GRID_DOC.partition("/")
+        snap = db.collection(col).document(doc).get()
+        LAST_FLOW_GRID_LOAD_MS = now_ms
+        FLOW_GRID_LOADED = True
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        cells = data.get("cells")
+        loaded = 0
+        if isinstance(cells, dict):
+            with _flow_lock:
+                for k, v in cells.items():
+                    # Lưu dạng mảng [n,turn,spd,brg] cho gọn doc.
+                    if isinstance(v, (list, tuple)) and len(v) >= 4:
+                        n, turn, spd, brg = v[0], v[1], v[2], v[3]
+                    elif isinstance(v, dict):
+                        n, turn, spd, brg = v.get("n"), v.get("turn"), v.get("spd"), v.get("brg")
+                    else:
+                        continue
+                    if _flow_cell_valid(n, turn, spd, brg) and _flow_cell_near_dad(k):
+                        FLOW_GRID[k] = {"n": min(float(n), FLOW_N_CAP), "turn": float(turn),
+                                        "spd": float(spd), "brg": float(brg) % 360.0, "updated_ms": now_ms}
+                        loaded += 1
+                _prune_flow_grid_locked()
+            FLOW_GRID_REV = int(data.get("rev") or FLOW_GRID_REV)
+        log.info("Flow-grid: nạp %d ô từ %s (rev=%d)", loaded, FLOW_GRID_DOC, FLOW_GRID_REV)
+    except Exception as e:
+        log.warning("load flow grid failed: %s", e)
+
+
+def _maybe_persist_flow_grid(force: bool = False) -> None:
+    """Ghi lưới gộp lên Firestore (throttle 5', chỉ khi có thay đổi)."""
+    global FLOW_GRID_DIRTY, LAST_FLOW_GRID_PERSIST_MS
+    if not FLOW_SYNC_ENABLED:
+        return
+    if not FLOW_GRID_DIRTY and not force:
+        return
+    now_ms = int(time.time() * 1000)
+    if not force and LAST_FLOW_GRID_PERSIST_MS and (now_ms - LAST_FLOW_GRID_PERSIST_MS) < FLOW_GRID_PERSIST_MS:
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        with _flow_lock:
+            _prune_flow_grid_locked()
+            cells_out = {k: [round(float(r.get("n") or 0), 1), round(float(r.get("turn") or 0), 4),
+                             round(float(r.get("spd") or 0), 2), round(float(r.get("brg") or 0), 1)]
+                         for k, r in FLOW_GRID.items()}
+            rev = FLOW_GRID_REV
+        col, _, doc = FLOW_GRID_DOC.partition("/")
+        db.collection(col).document(doc).set({
+            "cells": cells_out, "rev": rev, "count": len(cells_out),
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "updatedByName": "server-radar-flowlearn",
+        }, merge=False)
+        LAST_FLOW_GRID_PERSIST_MS = now_ms
+        FLOW_GRID_DIRTY = False
+        log.info("Flow-grid: đã ghi %d ô vào %s (rev=%d)", len(cells_out), FLOW_GRID_DOC, rev)
+    except Exception as e:
+        log.warning("persist flow grid failed: %s", e)
 
 
 def _terminal_age_ms(entry: Optional["FlightEntry"], now_ms: int) -> int:
@@ -3527,6 +3701,14 @@ def poll_loop() -> None:
                     ns = _finalize_parked_from_live(int(time.time() * 1000), stand_only=True)
                     if ns:
                         log.info("Server chốt-tại-bến: %d chuyến chốt giờ vào bến", ns)
+                # Lưới học chuyển động dùng chung: nạp lại (6h) + ghi Firestore phần client đã góp
+                # (throttle 5'). Chỉ server online nhận POST /api/flowgrid nên chỉ persist ở đây.
+                if FLOW_SYNC_ENABLED:
+                    try:
+                        _refresh_flow_grid_from_firestore(force=False)
+                        _maybe_persist_flow_grid()
+                    except Exception as _e:
+                        log.warning("flow-grid loop error: %s", _e)
             else:
                 if FETCHER_PHU:
                     # Máy phụ: đợi tới điểm giữa khoảng trống của máy chính rồi mới poll.
@@ -4672,6 +4854,54 @@ def get_all_etas():
     return jsonify(build_etas_payload(body.get("known_revision") or request.args.get("known_revision")))
 
 
+@app.route("/api/flowgrid", methods=["GET", "POST"])
+def flow_grid():
+    """Lưới HỌC chuyển động DÙNG CHUNG cho radarMotion (web).
+      GET  ?rev=N  → trả lưới gộp {cells:{key:[n,turn,spd,brg]}, rev}. rev khớp → not_modified (nhẹ).
+      POST {cells:[[key,n,turn,spd,brg],...]} → gộp phần client vừa học vào lưới chung.
+    Mọi máy dùng web đều góp → app càng dùng càng mượt/chính xác cho TẤT CẢ. Server gộp + ghi
+    Firestore throttle (xem _maybe_persist_flow_grid) nên KHÔNG bung quota."""
+    global FLOW_GRID_REV
+    if (err := require_api_key()):
+        return err
+    if not FLOW_SYNC_ENABLED:
+        return jsonify({"status": "disabled", "cells": {}, "rev": 0})
+    _refresh_flow_grid_from_firestore(force=False)
+
+    if request.method == "GET":
+        try:
+            client_rev = int(request.args.get("rev"))
+        except (TypeError, ValueError):
+            client_rev = None
+        with _flow_lock:
+            rev = FLOW_GRID_REV
+            if client_rev is not None and client_rev == rev:
+                return jsonify({"status": "success", "not_modified": True, "rev": rev, "count": len(FLOW_GRID)})
+            cells = {k: [round(float(r.get("n") or 0), 1), round(float(r.get("turn") or 0), 4),
+                         round(float(r.get("spd") or 0), 2), round(float(r.get("brg") or 0), 1)]
+                     for k, r in FLOW_GRID.items()}
+        return jsonify({"status": "success", "not_modified": False, "rev": rev, "count": len(cells), "cells": cells})
+
+    # POST — gộp đóng góp của 1 client.
+    body = request.get_json(silent=True) or {}
+    rows = body.get("cells")
+    if not isinstance(rows, list):
+        return jsonify({"status": "error", "message": "cells phải là mảng"}), 400
+    now_ms = int(time.time() * 1000)
+    merged = 0
+    with _flow_lock:
+        for row in rows[:FLOW_POST_MAX_CELLS]:
+            if not isinstance(row, (list, tuple)) or len(row) < 5:
+                continue
+            if _merge_flow_cell(str(row[0]), row[1], row[2], row[3], row[4], now_ms):
+                merged += 1
+        if merged:
+            _prune_flow_grid_locked()
+            FLOW_GRID_REV += 1
+        rev = FLOW_GRID_REV
+    return jsonify({"status": "success", "merged": merged, "rev": rev, "count": len(FLOW_GRID)})
+
+
 @app.route("/api/schedule", methods=["POST"])
 def post_schedule():
     """Nhận lịch bay từ app: list mã + SIBT cho mỗi mã.
@@ -5300,6 +5530,12 @@ def _start_poller():
 _init_firestore_client()
 # Nạp sẵn toạ độ bến seed AIP để stand-snap chính xác ngay từ poll đầu tiên (kể cả poll tức thời).
 _ensure_seed_coords()
+# Nạp lưới học chuyển động dùng chung để phục vụ GET /api/flowgrid ngay (web mở là có lưới gộp).
+if RADAR_ROLE == "server" and FLOW_SYNC_ENABLED:
+    try:
+        _refresh_flow_grid_from_firestore(force=True)
+    except Exception as _e:
+        log.warning("nạp flow grid lúc khởi động lỗi: %s", _e)
 _start_poller()
 
 
