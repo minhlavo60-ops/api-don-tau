@@ -227,11 +227,19 @@ LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
 LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", "300000"))
 LANDING_TO_PARK_FALLBACK_WIDEBODY_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_WIDEBODY_MS", "420000"))
 
+# Bù trễ cho cơ chế chốt theo radar thật của máy CHÍNH.
+# Máy chính thường nhận PARKED muộn hơn thực tế khoảng 2-3 phút do FR24/ground_speed
+# cập nhật trễ, nên khi GHI Firestore từ nguồn ground_stop thì lùi mốc lưu lại 2 phút.
+# Chỉ áp dụng cho nguồn radar ground_stop tin cậy cao, KHÔNG áp dụng fallback landing+N
+# để tránh quay lại lỗi Render chốt sớm 7-8 phút.
+PARKED_WRITE_OFFSET_MS = int(os.environ.get("PARKED_WRITE_OFFSET_MS", "120000"))
+PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS = int(os.environ.get("PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS", "60000"))
+
 # ── [chot-fix] SỬA LẠI GIỜ CHỐT FALLBACK trên SERVER ONLINE (không cần đụng fetcher) ──
 # Nguyên tắc: KHÔNG BAO GIỜ ghi TRỄ; hụt sớm 1-2 phút thì chấp nhận. Vì vậy dùng CẬN DƯỚI
 # taxi-in học theo TỪNG BẾN (percentile thấp từ ca radar-thật) → chốt ≤ giờ thật ⇒ không trễ,
 # chỉ hụt phần dao động (E4/E6). Bến lấy từ record HOẶC lịch bay. CHỈ kéo SỚM, không đẩy muộn.
-CHOT_FIX_ENABLED = os.environ.get("CHOT_FIX_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+CHOT_FIX_ENABLED = os.environ.get("CHOT_FIX_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 CHOT_FIX_PCTL = int(os.environ.get("CHOT_FIX_PCTL", "10"))                   # percentile THẤP (cận dưới) — nhỏ = an toàn không trễ
 CHOT_FIX_FLAT_NB_MS = int(os.environ.get("CHOT_FIX_FLAT_NB_MS", "150000"))   # 2.5 phút (thân hẹp) — hậu phương cuối, thấp để không trễ
 CHOT_FIX_FLAT_WB_MS = int(os.environ.get("CHOT_FIX_FLAT_WB_MS", "180000"))   # 3 phút (thân rộng) — hậu phương cuối
@@ -933,6 +941,29 @@ def _sync_manual_tracking_from_firestore(force: bool = False, trigger_poll: bool
         return 0
 
 
+
+def _parked_write_millis(entry) -> tuple[int, int, int]:
+    """Trả về (mốc_lưu_firestore, mốc_gốc_radar, offset_đã_trừ).
+
+    Contract:
+      - PARKED logic vẫn dùng mốc radar gốc để theo dõi/unpark/chống chốt nhầm.
+      - Chỉ khi ghi Firestore mới lùi 2 phút cho nguồn ground_stop của radar thật.
+      - Không lùi fallback landing+N/signal_lost để tránh chốt sớm khi thiếu bằng chứng bến.
+      - Nếu có landed_at thì không cho mốc lưu sớm hơn landed_at + 1 phút.
+    """
+    raw_ms = int(entry.parked_at_millis)
+    source = str(getattr(entry, "parked_source", "") or "ground_stop")
+    if PARKED_WRITE_OFFSET_MS <= 0 or source != "ground_stop":
+        return raw_ms, raw_ms, 0
+
+    adjusted_ms = raw_ms - int(PARKED_WRITE_OFFSET_MS)
+    landed_ms = _to_int_ms(getattr(entry, "landed_at_millis", None))
+    if landed_ms:
+        adjusted_ms = max(adjusted_ms, int(landed_ms) + int(PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS))
+    applied = max(0, raw_ms - adjusted_ms)
+    return int(adjusted_ms), raw_ms, int(applied)
+
+
 def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> bool:
     """Ghi giờ dừng bến vào pickups/{date}/flights/{code} bằng server, không cần web đang mở."""
     global LAST_FIRESTORE_PARKED_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
@@ -942,7 +973,8 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if db is None:
         return False
 
-    hint = _select_schedule_hint_for_event(code, int(entry.parked_at_millis) if entry.parked_at_millis else None)
+    stored_parked_ms, raw_parked_ms, applied_offset_ms = _parked_write_millis(entry)
+    hint = _select_schedule_hint_for_event(code, stored_parked_ms)
 
     # ====== TẦNG 3 SANITY GATES ======
     # Nếu logic upstream (Tầng 1 + 2) có bug regression, tầng này vẫn từ chối ghi sai.
@@ -970,23 +1002,23 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     # Gate B: kiểm tra với SIBT. Tàu không thể vào bến trước SIBT > 60 phút hoặc sau SIBT > 12 giờ.
     sibt = hint.get("sibt_millis")
     if isinstance(sibt, int):
-        if entry.parked_at_millis < sibt - PARKED_SANITY_BEFORE_SIBT_MS:
+        if stored_parked_ms < sibt - PARKED_SANITY_BEFORE_SIBT_MS:
             log.error(
                 "REFUSE parked write %s: parked_at=%s is %dmin before SIBT=%s",
-                code, entry.parked_at_millis,
-                (sibt - entry.parked_at_millis) // 60000, sibt,
+                code, stored_parked_ms,
+                (sibt - stored_parked_ms) // 60000, sibt,
             )
             return False
-        if entry.parked_at_millis > sibt + PARKED_SANITY_AFTER_SIBT_MS:
+        if stored_parked_ms > sibt + PARKED_SANITY_AFTER_SIBT_MS:
             log.error(
                 "REFUSE parked write %s: parked_at=%s is %dh after SIBT=%s",
-                code, entry.parked_at_millis,
-                (entry.parked_at_millis - sibt) // (3600_000), sibt,
+                code, stored_parked_ms,
+                (stored_parked_ms - sibt) // (3600_000), sibt,
             )
             return False
     # ====================================================================
 
-    date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(entry.parked_at_millis)
+    date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(stored_parked_ms)
     doc_id = _clean_code(code)
     if not date_key or not doc_id:
         return False
@@ -994,7 +1026,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     # Nguồn + cờ "đã xác nhận" là một phần của khóa: cùng mốc nhưng từ TẠM → ĐÃ XÁC NHẬN
     # (hoặc fallback LOW → ground_stop HIGH) vẫn được phép ghi lại đúng một lần để chốt.
     confirmed = bool(getattr(entry, "parked_confirmed", False))
-    sync_key = f"{date_key}:{doc_id}:{entry.parked_at_millis}:{entry.parked_source or ''}:{int(confirmed)}"
+    sync_key = f"{date_key}:{doc_id}:{stored_parked_ms}:{raw_parked_ms}:{entry.parked_source or ''}:{int(confirmed)}"
     if sync_key in PARKED_FIRESTORE_SYNCED:
         return False
 
@@ -1052,16 +1084,16 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
 
-        parked_hhmm = _format_hhmm(entry.parked_at_millis)
-        parked_hhmmss = _format_hhmmss(entry.parked_at_millis)
+        parked_hhmm = _format_hhmm(stored_parked_ms)
+        parked_hhmmss = _format_hhmmss(stored_parked_ms)
         # Lưu lat/lng tại thời điểm chốt PARKED + delta taxi-in để học per-stand
         # coords/taxi-time về sau. Chỉ thêm khi có vị trí thật (HIGH confidence).
         parked_lat = entry.latitude if isinstance(entry.latitude, (int, float)) else None
         parked_lng = entry.longitude if isinstance(entry.longitude, (int, float)) else None
         taxi_delta_ms = None
-        if entry.landed_at_millis and entry.parked_at_millis:
+        if entry.landed_at_millis and stored_parked_ms:
             try:
-                taxi_delta_ms = max(0, int(entry.parked_at_millis) - int(entry.landed_at_millis))
+                taxi_delta_ms = max(0, int(stored_parked_ms) - int(entry.landed_at_millis))
             except (TypeError, ValueError):
                 taxi_delta_ms = None
         # STAND-SNAP LEARN: chỉ học từ mốc radar ground-stop tin cậy cao (đã qua Gate A vị trí
@@ -1080,7 +1112,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "actualLandedSource": entry.landed_source,
             "actualParkedByRadar": new_source != "server_landing_plus_3min",
             "actualParkedByLandingFallback": new_source == "server_landing_plus_3min",
-            "actualParkedAtMillis": int(entry.parked_at_millis),
+            "actualParkedAtMillis": int(stored_parked_ms),
             "actualParkedTime": parked_hhmm,
             "actualParkedTimeFull": parked_hhmmss,
             "actualParkedSource": new_source,
@@ -1091,6 +1123,9 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "actualParkedLat": parked_lat,
             "actualParkedLng": parked_lng,
             "taxiInDurationMs": taxi_delta_ms,
+            "actualParkedRawAtMillis": int(raw_parked_ms),
+            "actualParkedOffsetMs": int(applied_offset_ms),
+            "actualParkedOffsetReason": "main_pc_ground_stop_minus_2min" if applied_offset_ms else None,
             "radarState": entry.state,
             "radarGroundSpeedKt": entry.ground_speed_kt,
             "radarDistanceKm": entry.distance_km,
@@ -1113,7 +1148,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                 "stand": old_stand,
                 "completedTime": parked_hhmm,
                 "completedTimeFull": parked_hhmmss,
-                "completedAtMillis": int(entry.parked_at_millis),
+                "completedAtMillis": int(stored_parked_ms),
                 "completedDateIso": date_key,
                 "completedAt": firebase_firestore.SERVER_TIMESTAMP,
                 "completedSource": new_source,
@@ -1132,7 +1167,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
                     "pickerName": old_picker_name,
                     "stand": old_stand,
                     "completedTime": parked_hhmm,
-                    "completedAtMillis": int(entry.parked_at_millis),
+                    "completedAtMillis": int(stored_parked_ms),
                     "source": new_source,
                     "confidence": new_confidence,
                     "changedByUid": "server-radar",
@@ -2913,15 +2948,13 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 code, candidate_ms, miss_count, aircraft_type or "?",
             )
         elif miss_count >= LANDED_MISS_TO_PARKED and fallback_parked:
-            # Mất tín hiệu đủ lâu + đã qua taxi buffer → chốt landing+N
+            # Mất tín hiệu đủ lâu + đã qua taxi buffer → mới được chốt landing+N.
+            # Không dùng min(landing+buffer, now) nữa, vì nó làm Render/online chốt sớm
+            # ngay khi vừa mất tín hiệu sau hạ cánh.
             parked_at = fallback_parked
             new_source = "landing_plus_3min"
-        elif miss_count >= LANDED_MISS_TO_PARKED:
-            # Mất tín hiệu nhưng chưa qua buffer → cap landed+N, không vượt now
-            parked_at = min(int(landed_at) + taxi_buffer_ms, now_ms)
-            new_source = "landing_plus_3min"
         else:
-            # Chưa đủ miss để chốt — giữ state cũ, bump counter
+            # Chưa đủ miss HOẶC chưa qua taxi buffer → giữ state cũ, không ghi actualParked.
             return FlightEntry(
                 state=old.state,
                 eta_millis=old.eta_millis,
@@ -3684,28 +3717,35 @@ def poll_loop() -> None:
                 # Server (Render) không gọi FR24; dữ liệu /api/etas lấy từ radarLive khi có
                 # request. Ngoài ra, khi BẬT cờ và máy chính (PC cơ quan) TẮT, server tự dò đỗ
                 # từ radarLive (box cấp vị trí) rồi chốt giờ vào bến — không cần ai mở web.
-                did_full_finalize = False
-                if SERVER_FINALIZE_FROM_LIVE:
+                if SERVER_FINALIZE_ALL:
+                    # SERVER ONLINE = BỘ NÃO: xử lý TOÀN BỘ dò đỗ + chốt giờ vào bến + chốt khi
+                    # MẤT TÍN HIỆU (process_missed) từ radarLive ĐÃ GỘP nhiều máy. Chạy MỖI nhịp,
+                    # ĐỘC LẬP máy chính còn sống hay không. Đây là cách "mọi xử lý ở online" — máy
+                    # chính/phụ chỉ cần cấp vị trí, KHÔNG cần cập nhật để có đầy đủ tính năng.
                     _refresh_schedule_from_firestore(force=False)
                     _refresh_stand_coords_from_firestore(force=False)
-                    server_now_ms = int(time.time() * 1000)
-                    _server_quan_sat_chinh()
-                    if not _server_chinh_dang_song(server_now_ms) and not _server_sample_chinh(12_000):
-                        n = _finalize_parked_from_live(int(time.time() * 1000))
-                        did_full_finalize = True
-                        if n:
-                            log.info("Server finalize-from-live: %d chuyến chốt giờ vào bến", n)
-                # CHỐT TẠI BẾN ở server online — chạy MỖI nhịp, độc lập máy chính/phụ: chỉ chốt
-                # các chuyến đã DỪNG ngay trong tọa độ một bến đã biết (không đụng mốc tạm đường
-                # lăn / landing+N). Đây là cách "chốt bến luôn ở server online" mà không cần cập
-                # nhật máy box. Chỉ đọc radarLive (đã cache 8s) — không thêm read meta máy chính.
-                # Bỏ qua khi bản fallback đầy đủ vừa chạy (đã bao gồm cả bến).
-                if SERVER_FINALIZE_AT_STAND and not did_full_finalize:
-                    _refresh_schedule_from_firestore(force=False)
-                    _refresh_stand_coords_from_firestore(force=False)
-                    ns = _finalize_parked_from_live(int(time.time() * 1000), stand_only=True)
-                    if ns:
-                        log.info("Server chốt-tại-bến: %d chuyến chốt giờ vào bến", ns)
+                    n = _finalize_parked_from_live(int(time.time() * 1000), process_missed=True)
+                    if n:
+                        log.info("Server xử-lý-tất-cả: %d chuyến chốt giờ vào bến", n)
+                else:
+                    # (CHẾ ĐỘ CŨ — giữ làm dự phòng nếu tắt SERVER_FINALIZE_ALL)
+                    did_full_finalize = False
+                    if SERVER_FINALIZE_FROM_LIVE:
+                        _refresh_schedule_from_firestore(force=False)
+                        _refresh_stand_coords_from_firestore(force=False)
+                        server_now_ms = int(time.time() * 1000)
+                        _server_quan_sat_chinh()
+                        if not _server_chinh_dang_song(server_now_ms) and not _server_sample_chinh(12_000):
+                            n = _finalize_parked_from_live(int(time.time() * 1000))
+                            did_full_finalize = True
+                            if n:
+                                log.info("Server finalize-from-live: %d chuyến chốt giờ vào bến", n)
+                    if SERVER_FINALIZE_AT_STAND and not did_full_finalize:
+                        _refresh_schedule_from_firestore(force=False)
+                        _refresh_stand_coords_from_firestore(force=False)
+                        ns = _finalize_parked_from_live(int(time.time() * 1000), stand_only=True)
+                        if ns:
+                            log.info("Server chốt-tại-bến: %d chuyến chốt giờ vào bến", ns)
                 # Lưới học chuyển động dùng chung: nạp lại (6h) + ghi Firestore phần client đã góp
                 # (throttle 5'). Chỉ server online nhận POST /api/flowgrid nên chỉ persist ở đây.
                 if FLOW_SYNC_ENABLED:
@@ -3888,10 +3928,12 @@ RADAR_LIVE_READ_CACHE_MS = int(os.environ.get("RADAR_LIVE_READ_CACHE_MS", "8000"
 # FR24 chặn IP Render nên Render không tự lấy vị trí, nhưng box/PC đã đẩy vị trí lên
 # radarLive — đủ để chạy dò đỗ (ground_stop). Mặc định TẮT; bật bằng env trên Render.
 SERVER_FINALIZE_FROM_LIVE = os.environ.get("SERVER_FINALIZE_FROM_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
-# CHỐT TẠI BẾN ngay ở server online: chốt HẲN giờ vào bến cho tàu đã dừng đúng trong tọa độ một
-# bến đã biết, độc lập máy chính/phụ (chạy mỗi nhịp). Mặc định BẬT — chỉ động vào chuyến dừng ở
-# bến nên an toàn; tắt bằng env nếu cần. Đây là điểm "chốt bến luôn ở server online" không cần box.
-SERVER_FINALIZE_AT_STAND = os.environ.get("SERVER_FINALIZE_AT_STAND", "1").strip().lower() in ("1", "true", "yes", "on")
+# CHỐT TẠI BẾN ngay ở server online: chế độ cũ cho phép Render tự ghi giờ vào bến từ radarLive.
+# Bản này mặc định TẮT để nguồn chốt chính quay về máy tính CHÍNH; chỉ bật thủ công nếu cần dự phòng.
+SERVER_FINALIZE_AT_STAND = os.environ.get("SERVER_FINALIZE_AT_STAND", "0").strip().lower() in ("1", "true", "yes", "on")
+# SERVER ONLINE = BỘ NÃO: tự xử lý TOÀN BỘ nghiệp vụ giờ vào bến từ radarLive đã gộp.
+# Bản này mặc định TẮT để tránh lỗi Render tự chốt sớm; máy chính/fetcher là source-of-truth.
+SERVER_FINALIZE_ALL = os.environ.get("SERVER_FINALIZE_ALL", "0").strip().lower() in ("1", "true", "yes", "on")
 SERVER_LOOP_SLEEP_S = int(os.environ.get("SERVER_LOOP_SLEEP_S", "25"))
 # Server tự chốt từ radarLive (box cấp vị trí, độ tin thấp hơn FR24 đầy đủ của PC) nên SIẾT thêm
 # bằng chứng "thật sự dưới đất", chống "chưa hạ đã chốt giờ":
@@ -4399,18 +4441,28 @@ def _correct_fallback_chots(now_ms: int) -> int:
     return fixed
 
 
-def _finalize_parked_from_live(now_ms: int, stand_only: bool = False) -> int:
+def _finalize_parked_from_live(now_ms: int, stand_only: bool = False, process_missed: bool = False) -> int:
     """Server: dò đỗ + chốt giờ vào bến từ radarLive (box/PC cấp vị trí). Tái dùng
     nguyên _update_parked_candidate (giống fetcher) và _sync_parked_entries_to_firestore
     (đầy đủ sanity gate + dedup). Trả số chuyến vừa ghi giờ vào bến.
 
+    Dùng bản ĐÃ GỘP nhiều máy (chống flicker khi 3 máy thay phiên ghi radarLive) làm nguồn.
+
     stand_only=True: CHỈ ghi các chuyến đã CHỐT HẲN ngay trong tọa độ một bến đã biết
-    (parked_confirmed=True ⇔ dừng tại bến ở đường live này). Dùng cho server online chạy
-    MỖI vòng lặp, độc lập máy chính: chốt bến luôn ở server online mà không đụng các mốc tạm
-    (đường lăn / landing+N) — phần đó để bản fallback đầy đủ (khi máy chính tắt) hoặc máy chính lo."""
-    flights, _meta = _load_live_from_firestore()
-    if not flights:
+    (parked_confirmed=True ⇔ dừng tại bến). Chế độ thận trọng (chạy cạnh máy chính bản cũ).
+
+    process_missed=True: sau khi xử lý tàu CÒN trong feed, xử lý nốt tàu đã RỚT khỏi feed
+    (mất tín hiệu trên đường lăn / tắt transponder tại bến) qua _process_miss → chốt giờ vào
+    bến cho cả ca radar bắt hụt. Đây là phần "bộ não" để ẩn/chốt không phải đợi máy chính."""
+    raw, _meta = _load_live_from_firestore()
+    # GỘP đa máy ngay trên đường này: tàu còn được BẤT KỲ máy nào thấy trong TTL coi là còn sống
+    # → "rớt khỏi feed" mới đúng nghĩa mất tín hiệu (không phải do 1 máy ghi đè thiếu tàu).
+    _merge_live_snapshot_into_store(raw or {}, (_meta or {}).get("_doc_write_ms") or 0, now_ms)
+    merged = _server_merge_snapshot_view()
+    flights = merged if merged else (raw or {})
+    if not flights and not (process_missed and SERVER_TRACKED):
         return 0
+    seen_codes = set(flights.keys())   # mã còn được ÍT NHẤT 1 máy thấy (đã gộp) = còn sống
     updates: dict = {}
     for code, d in flights.items():
         if not isinstance(d, dict):
@@ -4483,6 +4535,23 @@ def _finalize_parked_from_live(now_ms: int, stand_only: bool = False) -> int:
             if stand_only and not entry.parked_confirmed:
                 continue
             updates[code] = entry
+
+    # XỬ LÝ TÀU RỚT KHỎI FEED (mất tín hiệu): mã đang theo dõi nhưng không còn máy nào thấy.
+    # _process_miss tự: PARKED+mất sóng → chốt cứng; LANDED/TAXIING+đủ miss → chốt landing+N /
+    # signal-cutoff; EN_ROUTE rớt → LOST (KHÔNG chốt). Sanity gate ở _sync chặn ghi sai (xa DAD).
+    # Đây là phần giúp ca "vào bến rồi mất sóng trên đường lăn" được chốt + ẩn mà không cần máy chính.
+    if process_missed:
+        for code in list(SERVER_TRACKED.keys()):
+            if code in seen_codes:
+                continue
+            new = _process_miss(code, SERVER_TRACKED.get(code), now_ms)
+            if new is None:
+                SERVER_TRACKED.pop(code, None)
+                continue
+            SERVER_TRACKED[code] = new
+            if new.state == "PARKED" and new.parked_at_millis:
+                updates[code] = new
+
     if updates:
         return _sync_parked_entries_to_firestore(updates)
     return 0
@@ -5582,17 +5651,20 @@ def _start_poller():
         tm.start()
 
 
-# Khởi tạo Firestore sớm để log trạng thái ngay khi deploy. Poller vẫn sẽ retry nếu credentials chưa sẵn sàng.
-_init_firestore_client()
-# Nạp sẵn toạ độ bến seed AIP để stand-snap chính xác ngay từ poll đầu tiên (kể cả poll tức thời).
-_ensure_seed_coords()
-# Nạp lưới học chuyển động dùng chung để phục vụ GET /api/flowgrid ngay (web mở là có lưới gộp).
-if RADAR_ROLE == "server" and FLOW_SYNC_ENABLED:
-    try:
-        _refresh_flow_grid_from_firestore(force=True)
-    except Exception as _e:
-        log.warning("nạp flow grid lúc khởi động lỗi: %s", _e)
-_start_poller()
+# NKDT_IMPORT_ONLY=1: cho phép import app.py để test/đọc hàm thuần (vd _process_miss) mà KHÔNG
+# kết nối Firestore / khởi động luồng nền. Dùng bởi các file _test_*.py.
+if os.environ.get("NKDT_IMPORT_ONLY") != "1":
+    # Khởi tạo Firestore sớm để log trạng thái ngay khi deploy. Poller vẫn sẽ retry nếu credentials chưa sẵn sàng.
+    _init_firestore_client()
+    # Nạp sẵn toạ độ bến seed AIP để stand-snap chính xác ngay từ poll đầu tiên (kể cả poll tức thời).
+    _ensure_seed_coords()
+    # Nạp lưới học chuyển động dùng chung để phục vụ GET /api/flowgrid ngay (web mở là có lưới gộp).
+    if RADAR_ROLE == "server" and FLOW_SYNC_ENABLED:
+        try:
+            _refresh_flow_grid_from_firestore(force=True)
+        except Exception as _e:
+            log.warning("nạp flow grid lúc khởi động lỗi: %s", _e)
+    _start_poller()
 
 
 if __name__ == "__main__":
