@@ -216,6 +216,18 @@ STAND_SEED_COORDS = {
     "32": (16.049983, 108.202203), "33": (16.048886, 108.202736), "34": (16.048836, 108.202383),
     "35": (16.048789, 108.202031), "36": (16.048742, 108.201681),
 }
+# ── VÀO BẾN THẬT (at-stand chốt) — chống "đợi 5 phút rồi chốt theo công thức" ──
+# Vấn đề thực tế: _is_parked_on_ground đòi gs ≤ PARKED_GS_KT (3kt). Nhưng trên SÂN ĐỖ
+# FR24/ADS-B hay báo tốc độ DƯ 4–10kt khi tàu đã áp bến, HOẶC đóng băng vị trí ở bến mà
+# ngừng cập nhật mốc giờ → ground_stop KHÔNG BAO GIỜ kích dù tàu đã thật sự vào bến →
+# đợi rớt sóng rồi chốt "hạ + 5 phút" (sai, nhất là bến giữa/thoát ly E4 lăn ngắn).
+# GIẢI PHÁP: khi tàu đã NẰM TRONG toạ độ một bến đã biết (≤ STAND_SNAP_M) và tốc độ
+# đã CHẬM (≤ AT_STAND_GS_KT) → coi như đã vào bến, KHÔNG đòi đúng ≤3kt. Vị trí tại bến
+# chính là bằng chứng vào bến. An toàn: vẫn cần đứng yên ≥ STAND_SNAP_CONFIRM_MS (20s)
+# + anchor drift ≤ PARKED_ANCHOR_DRIFT_M (80m), nên tàu LĂN QUA bến (đi >80m trong 20s
+# ở tốc độ này) tự bị reset candidate → không chốt nhầm. Tắt được bằng env nếu cần.
+AT_STAND_CHOT_ENABLED = os.environ.get("AT_STAND_CHOT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+AT_STAND_GS_KT = int(os.environ.get("AT_STAND_GS_KT", "10"))
 # Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
 # 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
 LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
@@ -226,6 +238,21 @@ LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
 # Tên source vẫn giữ "landing_plus_3min" để không phá lịch sử Firestore.
 LANDING_TO_PARK_FALLBACK_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_MS", "300000"))
 LANDING_TO_PARK_FALLBACK_WIDEBODY_MS = int(os.environ.get("LANDING_TO_PARK_FALLBACK_WIDEBODY_MS", "420000"))
+
+# ── ƯỚC LƯỢNG THEO KHOẢNG CÁCH khi MẤT TÍN HIỆU GIỮA ĐƯỜNG LĂN (chưa tới bến) ──
+# Thay "hạ + N phút" PHẲNG bằng ước lượng dựa VỊ TRÍ THẬT cuối + khoảng cách tới BẾN:
+# mất sóng GẦN bến (thoát ly E4 lăn ngắn) → cộng ÍT; mất sóng XA bến → cộng NHIỀU. Tự
+# phân biệt E4/E6 qua hình học mà không cần biết tên thoát ly. Bến đích lấy theo lịch bay,
+# thiếu thì lấy bến seed GẦN vị trí cuối nhất. Bias "KHÔNG TRỄ": tốc độ lăn hơi cao → hụt
+# sớm còn hơn ghi muộn. Ước lượng là giờ TẠM (provisional) → có lại tín hiệu thì gỡ, bám lại.
+TAXI_EST_ENABLED = os.environ.get("TAXI_EST_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+TAXI_EST_SPEED_KT = float(os.environ.get("TAXI_EST_SPEED_KT", "12"))      # tốc độ lăn hiệu dụng (hơi cao = không trễ)
+TAXI_EST_PATH_FACTOR = float(os.environ.get("TAXI_EST_PATH_FACTOR", "1.2"))  # đường lăn không thẳng
+TAXI_EST_MIN_MS = int(os.environ.get("TAXI_EST_MIN_MS", "60000"))         # tối thiểu 1 phút lăn còn lại
+TAXI_EST_MAX_MS = int(os.environ.get("TAXI_EST_MAX_MS", "600000"))        # tối đa 10 phút (chặn outlier)
+# Sau khi đã ghi ước lượng, giữ TẠM bao lâu cho tín hiệu kịp quay lại sửa; quá ngưỡng = MẤT HẲN
+# → chốt (confirmed). Đo từ mốc ước lượng (giờ vào bến dự kiến đã qua).
+TAXI_EST_CONFIRM_MS = int(os.environ.get("TAXI_EST_CONFIRM_MS", "120000"))
 
 # Bù trễ cho cơ chế chốt theo radar thật của máy CHÍNH.
 # Máy chính thường nhận PARKED muộn hơn thực tế khoảng 2-3 phút do FR24/ground_speed
@@ -1037,6 +1064,10 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     elif entry.parked_source == "landing_plus_3min":
         new_source = "server_landing_plus_3min"
         new_confidence = "MEDIUM"
+    elif entry.parked_source == "taxi_to_stand":
+        # Ước lượng theo khoảng cách khi mất sóng giữa đường lăn (tốt hơn landing+N phẳng).
+        new_source = "server_taxi_to_stand"
+        new_confidence = "MEDIUM"
     else:
         new_source = "server_radar_ground_stop"
         new_confidence = "HIGH"
@@ -1072,6 +1103,8 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "landing_plus_3min",
             "web_landing_plus_3min",
             "server_landing_plus_3min",
+            "taxi_to_stand",
+            "server_taxi_to_stand",
         }
         # Mốc cũ đang TẠM (provisional) thì luôn cho ghi đè bằng mốc mới (cập nhật khi tàu
         # lăn tiếp rồi dừng lại, hoặc khi chốt lúc tắt radar).
@@ -1527,6 +1560,44 @@ def _fallback_parked_from_landing(
     buffer = int(buffer_ms) if buffer_ms is not None and buffer_ms > 0 else LANDING_TO_PARK_FALLBACK_MS
     fallback = int(landed_at_millis) + buffer
     return fallback if now_ms >= fallback else None
+
+
+def _taxi_estimate_parked_ms(old, hint, landed_at_millis):
+    """Ước lượng giờ vào bến khi MẤT TÍN HIỆU GIỮA ĐƯỜNG LĂN (vị trí cuối CHƯA tới bến).
+
+    = giờ thấy cuối + thời_gian_lăn(khoảng cách vị-trí-cuối → BẾN). Bến đích: theo lịch bay,
+    thiếu thì bến seed GẦN vị trí cuối nhất. Bias "không trễ" (tốc độ lăn hơi cao). Trả est_ms
+    hoặc None nếu thiếu dữ liệu (không có vị trí cuối / chưa đủ coverage bến). Forward-ref tới
+    _stand_key/_stand_coord/_nearest_trusted_stand_m (định nghĩa dưới, gọi lúc runtime nên OK).
+    """
+    if not (TAXI_EST_ENABLED and old is not None):
+        return None
+    last_lat = old.latitude
+    last_lng = old.longitude
+    last_ms = old.updated_at
+    if not (isinstance(last_lat, (int, float)) and isinstance(last_lng, (int, float)) and last_ms):
+        return None
+    # Bến đích: ưu tiên bến theo lịch (gồm cả bến người dùng nhập vào SCHEDULE_HINTS), thiếu thì
+    # bến seed gần vị trí cuối nhất (tàu thường đang lăn về bến gần đó).
+    target = None
+    stand_raw = (hint or {}).get("stand")
+    stand_key = _stand_key(stand_raw) if stand_raw else ""
+    if stand_key:
+        target = _stand_coord(stand_key)
+    if target is None:
+        nk, _nd = _nearest_trusted_stand_m(last_lat, last_lng)
+        if nk:
+            target = _stand_coord(nk)
+    if target is None:
+        return None
+    dist_m = _haversine_km(last_lat, last_lng, target[0], target[1]) * 1000.0
+    speed_mps = max(1.0, TAXI_EST_SPEED_KT * 0.514444)
+    remaining_ms = int(dist_m * TAXI_EST_PATH_FACTOR / speed_mps * 1000.0)
+    remaining_ms = max(TAXI_EST_MIN_MS, min(remaining_ms, TAXI_EST_MAX_MS))
+    est = int(last_ms) + remaining_ms
+    if landed_at_millis:
+        est = max(est, int(landed_at_millis) + CHOT_FIX_MIN_TAXI_MS)  # sanity: ≥ hạ + 1 phút
+    return est
 
 
 # ===========================================================
@@ -2565,6 +2636,15 @@ def _update_parked_candidate(code, old, state, lat, lng, gs_kt, dist_km, now_ms)
                 parked_anchor_lat, parked_anchor_lng, parked_source, parked_confirmed).
     """
     parking_signal = _is_parked_on_ground(gs_kt, dist_km)
+    # VÀO BẾN THẬT: đã nằm trong toạ độ một bến đã biết + tốc độ đã chậm = đã áp bến,
+    # kể cả khi FR24 chưa báo đủ ≤PARKED_GS_KT (hay đọc dư 5–10kt / đóng băng tại bến).
+    # Bắt được ca "vào bến đứng đó nhưng gs dư" thay vì đợi rớt sóng → "hạ + 5 phút".
+    # Anchor-drift 80m + cửa ổn định 20s ở dưới tự loại tàu LĂN QUA bến (xem _stand_snap_status).
+    if (AT_STAND_CHOT_ENABLED and not parking_signal
+            and gs_kt is not None and gs_kt <= AT_STAND_GS_KT):
+        _near_now, _ = _stand_snap_status(lat, lng)
+        if _near_now:
+            parking_signal = True
     parked_at_millis = old.parked_at_millis if old else None
     parked_candidate_since_ms = old.parked_candidate_since_ms if old else None
     parked_anchor_lat = old.parked_anchor_lat if old else None
@@ -2583,10 +2663,18 @@ def _update_parked_candidate(code, old, state, lat, lng, gs_kt, dist_km, now_ms)
             drift_resume_m = _haversine_km(cur_lat, cur_lng, old.parked_anchor_lat, old.parked_anchor_lng) * 1000
         moving_drift = drift_resume_m is not None and drift_resume_m > PARKED_RESUME_DRIFT_M
         still_near_dad = _is_at_dad_airport(dist_km)
-        if (not old.parked_confirmed) and still_near_dad and (moving_gs or moving_drift):
+        # CÓ LẠI TÍN HIỆU sau ước lượng taxi (provisional): nếu vị trí về cho thấy tàu CHƯA thật sự
+        # ở trong bến (vẫn đang lăn/chờ trên đường lăn) → gỡ ước lượng, bám lại để lấy giờ vào bến THẬT.
+        est_resume = False
+        if (old.parked_source == "taxi_to_stand" and not old.parked_confirmed and still_near_dad
+                and cur_lat is not None and cur_lng is not None):
+            _near_ret, _ = _stand_snap_status(cur_lat, cur_lng)
+            est_resume = not _near_ret
+        if (not old.parked_confirmed) and still_near_dad and (moving_gs or moving_drift or est_resume):
             log.info(
-                "%s: UNPARK — tàu lăn tiếp sau khi dừng tạm (gs=%s kt, drift=%s m); gỡ giờ tạm, theo dõi lại",
-                code, gs_kt,
+                "%s: UNPARK — %s (gs=%s kt, drift=%s m); gỡ giờ tạm, theo dõi lại",
+                code, "tín hiệu về, chưa ở trong bến" if est_resume and not (moving_gs or moving_drift)
+                else "tàu lăn tiếp sau khi dừng tạm", gs_kt,
                 f"{drift_resume_m:.0f}" if drift_resume_m is not None else "?",
             )
             state = "TAXIING"
@@ -2899,7 +2987,16 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             log.info("%s: drop stale PARKED entry from RAM after %d minutes", code, _terminal_age_ms(old, now_ms) // 60000)
             return None
         if not old.parked_confirmed:
-            # Đã PARKED rồi mất tín hiệu = transponder off tại bến → XÁC NHẬN (chốt) giờ vào bến.
+            # Ước lượng taxi (mất sóng giữa đường lăn) còn TẠM: chờ tín hiệu kịp quay lại sửa trong
+            # TAXI_EST_CONFIRM_MS tính từ mốc dự kiến. Chưa hết cửa sổ → giữ provisional (không chốt
+            # vội, phòng tàu còn lăn/chờ rồi tín hiệu về). Hết cửa sổ = MẤT HẲN → chốt.
+            if old.parked_source == "taxi_to_stand":
+                base_ms = int(old.parked_at_millis or old.updated_at or now_ms)
+                if now_ms - base_ms < TAXI_EST_CONFIRM_MS:
+                    return replace(old, miss_count=old.miss_count + 1)
+                log.info("%s: ước lượng taxi + mất hẳn (>%ds) → CHỐT giờ vào bến", code, TAXI_EST_CONFIRM_MS // 1000)
+                return replace(old, parked_confirmed=True, miss_count=old.miss_count + 1)
+            # Đã PARKED (radar thật / at-stand) rồi mất tín hiệu = transponder off tại bến → CHỐT.
             log.info("%s: PARKED + mất tín hiệu → XÁC NHẬN giờ vào bến (chốt)", code)
             return replace(old, parked_confirmed=True, miss_count=old.miss_count + 1)
         return old
@@ -2919,6 +3016,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         aircraft_type = str(hint.get("aircraft") or "").upper().strip()
         taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
         fallback_parked = _fallback_parked_from_landing(landed_at, now_ms, taxi_buffer_ms)
+        # Ước lượng theo KHOẢNG CÁCH (mất sóng giữa đường lăn, chưa tới bến) — thay landing+N phẳng.
+        taxi_est_ms = _taxi_estimate_parked_ms(old, hint, landed_at)
         # Tier B: signal cutoff confirms stop.
         # Khi tàu có candidate đứng yên (đã ≥ 1 cycle xác nhận trước đó) và sau đó
         # radar mất tín hiệu, đó chính là pattern "tàu đỗ → engine shutdown → transponder off".
@@ -2935,10 +3034,24 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         # STAND-SNAP: nếu anchor (chỗ dừng lúc mất sóng) XA mọi bến đã học → "mất tín hiệu = đã đỗ"
         # kém tin (có thể là dừng tạm trên đường lăn rồi mất sóng) → bỏ Tier B, rơi xuống landing+N.
         # Cold-start / chưa đủ coverage → far=False → giữ nguyên hành vi cũ.
-        _, _anchor_far_from_stands = _stand_snap_status(old.parked_anchor_lat, old.parked_anchor_lng)
+        # Anchor lấy chỗ dừng candidate, thiếu thì lấy vị trí THẬT cuối cùng (mẫu tươi gần nhất).
+        _anchor_lat = old.parked_anchor_lat if old.parked_anchor_lat is not None else old.latitude
+        _anchor_lng = old.parked_anchor_lng if old.parked_anchor_lng is not None else old.longitude
+        _anchor_near_stand, _anchor_far_from_stands = _stand_snap_status(_anchor_lat, _anchor_lng)
         if old.parked_at_millis:
             parked_at = old.parked_at_millis
             new_source = old.parked_source or "ground_stop"
+        elif (AT_STAND_CHOT_ENABLED and _anchor_near_stand and miss_count >= 1
+              and (candidate_ms is not None or old.updated_at)):
+            # VÀO BẾN THẬT khi mất sóng: vị trí cuối NẰM TRONG toạ độ bến đã biết = đã vào bến,
+            # kể cả khi feed đóng băng/rớt NGAY (chưa kịp đủ 30s ổn định như Tier B cũ). Chốt theo
+            # mốc tới bến (candidate) hoặc mốc thấy cuối — KHÔNG rơi xuống "hạ + 5 phút".
+            parked_at = int(candidate_ms if candidate_ms is not None else old.updated_at)
+            new_source = "ground_stop"
+            log.info(
+                "%s: signal cutoff AT KNOWN STAND → PARKED at %s (miss=%d, ac=%s)",
+                code, parked_at, miss_count, aircraft_type or "?",
+            )
         elif candidate_stable_before_loss and not _anchor_far_from_stands and miss_count >= 1:
             # Tier B: tin tưởng cao nhất khi không thể chờ 240s stable
             parked_at = int(candidate_ms)
@@ -2947,10 +3060,22 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 "%s: signal cutoff confirms stop → PARKED at candidate %s (miss=%d, ac=%s)",
                 code, candidate_ms, miss_count, aircraft_type or "?",
             )
+        elif (TAXI_EST_ENABLED and miss_count >= LANDED_MISS_TO_PARKED
+              and taxi_est_ms is not None and now_ms >= taxi_est_ms):
+            # MẤT TÍN HIỆU GIỮA ĐƯỜNG LĂN: ước lượng giờ vào bến theo khoảng cách vị-trí-cuối → bến
+            # (gần bến/thoát E4 → cộng ít; xa → cộng nhiều). Chỉ ghi khi mốc dự kiến ĐÃ QUA (không
+            # ghi giờ tương lai). Là giờ TẠM (provisional) → có lại tín hiệu thì gỡ + bám lại; mất
+            # hẳn thì confirm sau TAXI_EST_CONFIRM_MS. Tốt hơn "hạ + 5 phút" phẳng cho bến giữa.
+            parked_at = int(taxi_est_ms)
+            new_source = "taxi_to_stand"
+            log.info(
+                "%s: signal lost mid-taxi → ƯỚC LƯỢNG vào bến %s (provisional, miss=%d, ac=%s)",
+                code, parked_at, miss_count, aircraft_type or "?",
+            )
         elif miss_count >= LANDED_MISS_TO_PARKED and fallback_parked:
-            # Mất tín hiệu đủ lâu + đã qua taxi buffer → mới được chốt landing+N.
-            # Không dùng min(landing+buffer, now) nữa, vì nó làm Render/online chốt sớm
-            # ngay khi vừa mất tín hiệu sau hạ cánh.
+            # Mất tín hiệu đủ lâu + đã qua taxi buffer + KHÔNG ước lượng được (thiếu vị trí cuối) →
+            # hậu phương cuối: landing+N. Không dùng min(landing+buffer, now) nữa, vì nó làm
+            # Render/online chốt sớm ngay khi vừa mất tín hiệu sau hạ cánh.
             parked_at = fallback_parked
             new_source = "landing_plus_3min"
         else:
@@ -3009,7 +3134,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             parked_source=new_source,
             parked_anchor_lat=old.parked_anchor_lat,
             parked_anchor_lng=old.parked_anchor_lng,
-            parked_confirmed=True,
+            # Ước lượng taxi = giờ TẠM (chưa chắc đã tới bến) → confirmed=False để có-lại-tín-hiệu
+            # gỡ + bám lại được. Các nguồn khác (ground_stop / landing+N hậu phương) chốt luôn.
+            parked_confirmed=(new_source != "taxi_to_stand"),
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
