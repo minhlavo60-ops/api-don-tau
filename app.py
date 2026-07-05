@@ -261,6 +261,13 @@ TAXI_EST_CONFIRM_MS = int(os.environ.get("TAXI_EST_CONFIRM_MS", "120000"))
 # để tránh quay lại lỗi Render chốt sớm 7-8 phút.
 PARKED_WRITE_OFFSET_MS = int(os.environ.get("PARKED_WRITE_OFFSET_MS", "120000"))
 PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS = int(os.environ.get("PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS", "60000"))
+# NGOẠI LỆ AT-STAND: offset 2 phút ở trên được đo TRƯỚC khi có lớp "vào bến thật" (at-stand
+# chốt, 28/06). At-stand kích ngay khi tàu áp toạ độ bến (≤ STAND_SNAP_M, gs ≤ 10kt) nên mốc
+# ground_stop khi đó ĐÃ LÀ giờ thật — lùi thêm 2 phút nữa sẽ ghi SỚM hệ thống ~2 phút.
+# Vì vậy: anchor đỗ nằm trong toạ độ một bến đã biết → chỉ lùi AT_STAND_WRITE_OFFSET_MS
+# (mặc định 0 = giữ nguyên giờ thật). Ca dừng XA bến (bến chưa học/detector gs≤3kt cũ,
+# vốn hay trễ 2-3 phút vì gs nhiễu) vẫn lùi 2 phút như trước.
+AT_STAND_WRITE_OFFSET_MS = int(os.environ.get("AT_STAND_WRITE_OFFSET_MS", "0"))
 
 # ── [chot-fix] SỬA LẠI GIỜ CHỐT FALLBACK trên SERVER ONLINE (không cần đụng fetcher) ──
 # Nguyên tắc: KHÔNG BAO GIỜ ghi TRỄ; hụt sớm 1-2 phút thì chấp nhận. Vì vậy dùng CẬN DƯỚI
@@ -969,26 +976,42 @@ def _sync_manual_tracking_from_firestore(force: bool = False, trigger_poll: bool
 
 
 
-def _parked_write_millis(entry) -> tuple[int, int, int]:
-    """Trả về (mốc_lưu_firestore, mốc_gốc_radar, offset_đã_trừ).
+def _parked_write_millis(entry) -> tuple[int, int, int, bool]:
+    """Trả về (mốc_lưu_firestore, mốc_gốc_radar, offset_đã_trừ, tại_bến_đã_biết).
 
     Contract:
       - PARKED logic vẫn dùng mốc radar gốc để theo dõi/unpark/chống chốt nhầm.
       - Chỉ khi ghi Firestore mới lùi 2 phút cho nguồn ground_stop của radar thật.
+      - AT-STAND: anchor đỗ nằm trong toạ độ bến đã biết → mốc đã là giờ thật (lớp at-stand
+        bắt ngay lúc áp bến) → chỉ lùi AT_STAND_WRITE_OFFSET_MS (mặc định 0 = không lùi).
       - Không lùi fallback landing+N/signal_lost để tránh chốt sớm khi thiếu bằng chứng bến.
       - Nếu có landed_at thì không cho mốc lưu sớm hơn landed_at + 1 phút.
     """
     raw_ms = int(entry.parked_at_millis)
     source = str(getattr(entry, "parked_source", "") or "ground_stop")
-    if PARKED_WRITE_OFFSET_MS <= 0 or source != "ground_stop":
-        return raw_ms, raw_ms, 0
+    if source != "ground_stop":
+        return raw_ms, raw_ms, 0, False
 
-    adjusted_ms = raw_ms - int(PARKED_WRITE_OFFSET_MS)
+    # Bằng chứng TẠI BẾN: anchor đỗ (thiếu thì vị trí cuối) trong toạ độ bến đã biết.
+    # Chỉ tin khi lớp at-stand đang bật — tắt lớp đó thì detector cũ (gs≤3kt) vẫn trễ
+    # 2-3 phút kể cả tại bến nên phải giữ offset cũ. _stand_snap_status là forward-ref
+    # (định nghĩa phía dưới, gọi lúc runtime nên OK — cùng kiểu _taxi_estimate_parked_ms).
+    at_known_stand = False
+    if AT_STAND_CHOT_ENABLED:
+        _lat = entry.parked_anchor_lat if getattr(entry, "parked_anchor_lat", None) is not None else getattr(entry, "latitude", None)
+        _lng = entry.parked_anchor_lng if getattr(entry, "parked_anchor_lng", None) is not None else getattr(entry, "longitude", None)
+        at_known_stand, _ = _stand_snap_status(_lat, _lng)
+
+    offset_ms = int(AT_STAND_WRITE_OFFSET_MS) if at_known_stand else int(PARKED_WRITE_OFFSET_MS)
+    if offset_ms <= 0:
+        return raw_ms, raw_ms, 0, at_known_stand
+
+    adjusted_ms = raw_ms - offset_ms
     landed_ms = _to_int_ms(getattr(entry, "landed_at_millis", None))
     if landed_ms:
         adjusted_ms = max(adjusted_ms, int(landed_ms) + int(PARKED_WRITE_OFFSET_MIN_AFTER_LANDING_MS))
     applied = max(0, raw_ms - adjusted_ms)
-    return int(adjusted_ms), raw_ms, int(applied)
+    return int(adjusted_ms), raw_ms, int(applied), at_known_stand
 
 
 def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> bool:
@@ -1000,7 +1023,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if db is None:
         return False
 
-    stored_parked_ms, raw_parked_ms, applied_offset_ms = _parked_write_millis(entry)
+    stored_parked_ms, raw_parked_ms, applied_offset_ms, parked_at_known_stand = _parked_write_millis(entry)
     hint = _select_schedule_hint_for_event(code, stored_parked_ms)
 
     # ====== TẦNG 3 SANITY GATES ======
@@ -1158,7 +1181,12 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "taxiInDurationMs": taxi_delta_ms,
             "actualParkedRawAtMillis": int(raw_parked_ms),
             "actualParkedOffsetMs": int(applied_offset_ms),
-            "actualParkedOffsetReason": "main_pc_ground_stop_minus_2min" if applied_offset_ms else None,
+            # at_stand_exact = mốc bắt tại toạ độ bến đã biết → giữ nguyên giờ thật, không lùi.
+            "actualParkedOffsetReason": (
+                ("at_stand_minus_offset" if parked_at_known_stand else "main_pc_ground_stop_minus_2min")
+                if applied_offset_ms
+                else ("at_stand_exact" if parked_at_known_stand else None)
+            ),
             "radarState": entry.state,
             "radarGroundSpeedKt": entry.ground_speed_kt,
             "radarDistanceKm": entry.distance_km,
