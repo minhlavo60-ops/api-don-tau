@@ -1017,13 +1017,23 @@ def _parked_write_millis(entry) -> tuple[int, int, int, bool]:
 def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> bool:
     """Ghi giờ dừng bến vào pickups/{date}/flights/{code} bằng server, không cần web đang mở."""
     global LAST_FIRESTORE_PARKED_WRITE_MS, LAST_FIRESTORE_SYNC_ERROR
-    if not entry or entry.state != "PARKED" or not entry.parked_at_millis:
+    # v77 — ĐẠI TU: chốt/ghi giờ theo GIỜ HẠ CÁNH (mốc radar báo hạ), không còn dùng
+    # stand-snap "giờ vào bến". Dữ liệu radar thô nên chỉ mốc hạ mới đủ chính xác. Fire ngay
+    # khi có mốc hạ (LANDED/TAXIING/PARKED) — không chờ tàu dừng hẳn ở bến nữa.
+    if not entry or not entry.landed_at_millis:
+        return False
+    if entry.state not in ("LANDED", "TAXIING", "PARKED"):
         return False
     db = _init_firestore_client()
     if db is None:
         return False
 
-    stored_parked_ms, raw_parked_ms, applied_offset_ms, parked_at_known_stand = _parked_write_millis(entry)
+    # Mốc THẬT = giờ hạ cánh (đã qua gate khoảng cách trong _resolve_landed_at_millis). Bỏ
+    # offset/stand-snap của giờ vào bến. Giữ 4 biến để phần dưới không phải đổi.
+    stored_parked_ms = int(entry.landed_at_millis)
+    raw_parked_ms = int(entry.landed_at_millis)
+    applied_offset_ms = 0
+    parked_at_known_stand = False
     hint = _select_schedule_hint_for_event(code, stored_parked_ms)
 
     # ====== TẦNG 3 SANITY GATES ======
@@ -1075,25 +1085,15 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
 
     # Nguồn + cờ "đã xác nhận" là một phần của khóa: cùng mốc nhưng từ TẠM → ĐÃ XÁC NHẬN
     # (hoặc fallback LOW → ground_stop HIGH) vẫn được phép ghi lại đúng một lần để chốt.
-    confirmed = bool(getattr(entry, "parked_confirmed", False))
-    sync_key = f"{date_key}:{doc_id}:{stored_parked_ms}:{raw_parked_ms}:{entry.parked_source or ''}:{int(confirmed)}"
+    # Giờ hạ cánh là mốc DỨT KHOÁT → coi như đã xác nhận, cho phép auto-finalize ngay khi hạ.
+    confirmed = True
+    sync_key = f"{date_key}:{doc_id}:{stored_parked_ms}:landed:{int(confirmed)}"
     if sync_key in PARKED_FIRESTORE_SYNCED:
         return False
 
-    # Phân biệt nguồn để dễ dọn rác và để web hiển thị mức tin cậy.
-    if entry.parked_source == "signal_lost":
-        new_source = "server_radar_signal_lost"
-        new_confidence = "LOW"
-    elif entry.parked_source == "landing_plus_3min":
-        new_source = "server_landing_plus_3min"
-        new_confidence = "MEDIUM"
-    elif entry.parked_source == "taxi_to_stand":
-        # Ước lượng theo khoảng cách khi mất sóng giữa đường lăn (tốt hơn landing+N phẳng).
-        new_source = "server_taxi_to_stand"
-        new_confidence = "MEDIUM"
-    else:
-        new_source = "server_radar_ground_stop"
-        new_confidence = "HIGH"
+    # v77: nguồn duy nhất = giờ hạ cánh radar (mốc thật, đã qua gate khoảng cách) → luôn HIGH.
+    new_source = "server_radar_landed"
+    new_confidence = "HIGH"
 
     try:
         ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
@@ -1128,6 +1128,10 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             "server_landing_plus_3min",
             "taxi_to_stand",
             "server_taxi_to_stand",
+            # v77: cho phép ghi đè mốc "giờ vào bến" cũ (stand-snap) bằng GIỜ HẠ CÁNH.
+            "server_radar_ground_stop",
+            "radar_actual_parked",
+            "server_radar_landed",
         }
         # Mốc cũ đang TẠM (provisional) thì luôn cho ghi đè bằng mốc mới (cập nhật khi tàu
         # lăn tiếp rồi dừng lại, hoặc khi chốt lúc tắt radar).
@@ -1135,8 +1139,8 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
             if old_source not in overwritable_sources:
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
-            # Mốc cũ là dự phòng. Chỉ ghi đè khi mốc mới có chất lượng cao hơn.
-            if new_source != "server_radar_ground_stop":
+            # v77: mốc mới = giờ hạ cánh radar (HIGH) → cho ghi đè các mốc ước lượng/vào-bến cũ.
+            if new_source != "server_radar_landed":
                 PARKED_FIRESTORE_SYNCED.add(sync_key)
                 return False
 
@@ -1201,7 +1205,7 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
         # Nếu bản trước đã được auto-finalize bằng mốc LOW do mất tín hiệu, khi có mốc HIGH hơn thì cập nhật lại giờ chốt.
         should_refresh_auto_finalized_time = bool(
             (old.get("autoFinalizedByRadar") or old.get("autoFinalizedByLandingFallback"))
-            and new_source == "server_radar_ground_stop"
+            and new_source == "server_radar_landed"
             and confirmed
         )
         if should_auto_finalize or should_refresh_auto_finalized_time:
@@ -4149,19 +4153,17 @@ def build_etas_payload(known_revision=None) -> dict:
                     public["outside_schedule"] = True
                     public.setdefault("discovery_source", "feed_dad_arrival")
                 public = _decorate_outside_schedule_public(code, public)
-                # Cắt lat/lng cho chuyến đã chốt từ lâu để client không vẽ marker treo trên map.
-                # Mốc giờ + state vẫn được giữ để app tra cứu / đồng bộ Firestore.
-                hide_marker = False
-                if entry.state == "PARKED" and entry.parked_at_millis:
-                    if now_ms - entry.parked_at_millis > PARKED_MAP_HIDE_AFTER_MS:
-                        hide_marker = True
-                elif entry.state in GROUND_ACTIVE_STATES and entry.landed_at_millis:
-                    if now_ms - entry.landed_at_millis > LANDED_MAP_HIDE_AFTER_MS:
-                        hide_marker = True
+                # v77: HẠ CÁNH → ẩn marker NGAY. Radar thô nên chỉ theo dõi tới lúc hạ; có mốc
+                # hạ (đã qua gate khoảng cách) hoặc đã đỗ → cắt toạ độ khỏi map luôn, không chờ
+                # 15'/PARKED. Mốc giờ + state vẫn giữ để app tra cứu / đồng bộ Firestore.
+                hide_marker = bool(
+                    entry.landed_at_millis and entry.state in ("LANDED", "TAXIING", "PARKED")
+                ) or bool(entry.state == "PARKED" and entry.parked_at_millis)
                 if hide_marker:
                     public["latitude"] = None
                     public["longitude"] = None
                     public["map_hidden"] = True
+                    public["map_hidden_reason"] = "landed"
                 result[code] = public
         not_modified = known_revision is not None and known_revision == feed_revision
         if not_modified:
@@ -5140,10 +5142,21 @@ def _hide_parked_at_stand_live(flights: dict, now_ms: int) -> dict:
     result = {}
     for code, d in flights.items():
         if isinstance(d, dict):
+            state = str(d.get("state") or "").upper()
+            landed_ms = (d.get("actual_landed_at_millis")
+                         or d.get("landed_at_millis") or d.get("touchdown_millis"))
             lat = d.get("latitude")
             lng = d.get("longitude")
             gs = d.get("ground_speed_kt")
-            if (lat is not None and lng is not None
+            # v77: HẠ CÁNH → ẩn marker NGAY (radar thô, chỉ theo dõi tới lúc hạ). landed_ms đã
+            # qua gate khoảng cách nên tin được; PARKED cũng ẩn.
+            if landed_ms or state in ("LANDED", "TAXIING", "PARKED"):
+                d = dict(d)
+                d["latitude"] = None
+                d["longitude"] = None
+                d["map_hidden"] = True
+                d["map_hidden_reason"] = "landed"
+            elif (lat is not None and lng is not None
                     and isinstance(gs, (int, float)) and gs <= PARKED_GS_KT):
                 near_stand, _ = _stand_snap_status(lat, lng)
                 if near_stand:
