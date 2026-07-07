@@ -2045,6 +2045,43 @@ def _is_reused_code_live_after_parked(old: Optional["FlightEntry"], sensors: dic
     return False
 
 
+def _is_airborne_fix_after_parked(old: Optional["FlightEntry"], sensors: dict) -> bool:
+    """PARKED nhưng fix mới chứng minh tàu còn bay thì phải gỡ ngay.
+
+    Ca thực tế: mất sóng ở APPROACH/FINAL bị fallback thành PARKED, sau đó FR24 có
+    lại tín hiệu cao/tốc độ lớn. Nếu giữ sticky PARKED, web sẽ ẩn marker như đã vào
+    bến dù tàu vẫn còn ngoài trời.
+    """
+    if not old or old.state != "PARKED":
+        return False
+    dist_km = sensors.get("distance_km")
+    gs_kt = sensors.get("gs_kt")
+    alt_ft = sensors.get("alt_ft")
+    on_ground = bool(sensors.get("on_ground"))
+    if on_ground or _is_parked_on_ground(gs_kt, dist_km):
+        return False
+    if isinstance(dist_km, (int, float)) and dist_km > FINAL_DIST_KM:
+        return True
+    if isinstance(alt_ft, (int, float)) and alt_ft > FINAL_ALT_FT:
+        return True
+    if isinstance(gs_kt, (int, float)) and gs_kt > TOUCHDOWN_GS_KT:
+        return True
+    return False
+
+
+def _missed_signal_can_mean_landed(entry: Optional["FlightEntry"]) -> bool:
+    """Chỉ suy mất sóng = đã hạ khi fix cuối thật sự ở short final DAD."""
+    if not entry:
+        return False
+    dist_km = entry.distance_km
+    alt_ft = entry.altitude_ft
+    if isinstance(dist_km, (int, float)) and dist_km > FINAL_DIST_KM:
+        return False
+    if isinstance(alt_ft, (int, float)) and alt_ft > FINAL_ALT_FT:
+        return False
+    return True
+
+
 def _classify_state(
     on_ground: bool,
     alt_ft: Optional[int],
@@ -2593,6 +2630,13 @@ def _extract_sensors(flight) -> dict:
     vs = getattr(flight, "vertical_speed", None)
     heading = getattr(flight, "heading", None)
     on_ground = (getattr(flight, "on_ground", 0) or 0) == 1
+    # Mốc TELEMETRY thật của vị trí (FR24 feed trả epoch giây). Trước đây bị vứt bỏ
+    # và updated_at đóng dấu now_ms lúc poll → client tưởng fix "trẻ" hơn thực tế
+    # ~5-15s, bù tuổi thiếu → marker chạy sau tàu thật.
+    ts_ms = None
+    t_raw = getattr(flight, "time", None)
+    if isinstance(t_raw, (int, float)) and t_raw > 0:
+        ts_ms = int(t_raw * 1000) if t_raw < 1e12 else int(t_raw)
 
     # Giá trị ≤0 thường là sentinel "không có data"
     if isinstance(alt, (int, float)) and alt <= 0:
@@ -2625,7 +2669,78 @@ def _extract_sensors(flight) -> dict:
         "lat": lat_clean,
         "lng": lng_clean,
         "heading": heading,
+        "ts_ms": ts_ms,
     }
+
+
+def _refine_sensors_from_trail(sensors: dict, details: Optional[dict], now_ms: int) -> dict:
+    """LẤY LẠI TỌA ĐỘ ĐẦY ĐỦ từ details.trail[0].
+
+    Đo 06/07/2026: FR24 LÀM THÔ tọa độ bounds-feed về 2 số lẻ (~lưới 1.1km) cho IP
+    poll dày (máy ghi chạy 24/7) — vì thế tàu "chưa bao giờ" nằm đúng đường băng/lăn
+    trên map, stand-snap chốt giờ cũng mất chuẩn. get_flight_details (vẫn gọi để lấy
+    ETA) trả trail điểm MỚI NHẤT với độ phân giải đầy đủ + mốc telemetry riêng.
+    Ưu tiên trail khi nó tươi (≤120s — tàu đỗ/mất sóng thì trail đứng im, giữ bounds)
+    và không cũ hơn hẳn bản bounds (>30s). An toàn: details=None → giữ nguyên."""
+    if not isinstance(details, dict) or sensors.get("lat") is None:
+        return sensors
+    trail = details.get("trail") or []
+    p = trail[0] if trail and isinstance(trail[0], dict) else None
+    if p is None:
+        return sensors
+    lat, lng, ts = p.get("lat"), p.get("lng"), p.get("ts")
+    if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float)) and isinstance(ts, (int, float)) and ts > 0):
+        return sensors
+    ts_ms = int(ts * 1000) if ts < 1e12 else int(ts)
+    if now_ms - ts_ms > 120_000:
+        return sensors
+    base_ts = sensors.get("ts_ms")
+    if isinstance(base_ts, int) and ts_ms < base_ts - 30_000:
+        return sensors
+    out = dict(sensors)
+    out["lat"] = float(lat)
+    out["lng"] = float(lng)
+    out["ts_ms"] = max(ts_ms, base_ts or 0)
+    out["distance_km"] = _haversine_km(out["lat"], out["lng"], DAD_LAT, DAD_LNG)
+    spd = p.get("spd")
+    hd = p.get("hd")
+    alt = p.get("alt")
+    if isinstance(spd, (int, float)) and spd >= 0:
+        out["gs_kt"] = int(spd)
+    if isinstance(hd, (int, float)):
+        out["heading"] = int(hd) % 360
+    if isinstance(alt, (int, float)) and alt > 0:
+        out["alt_ft"] = int(alt)
+    return out
+
+
+def _looks_grid_coarse(lat, lng) -> bool:
+    """True nếu toạ độ trông như bị FR24 làm thô về lưới 0.01° (~1.1km)."""
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return False
+    return (abs(lat * 100 - round(lat * 100)) < 1e-6
+            and abs(lng * 100 - round(lng * 100)) < 1e-6)
+
+
+def _keep_fine_position_if_bounds_coarse(sensors: dict, old, now_ms: int) -> dict:
+    """Chu kỳ KHÔNG fetch details: bounds thô (lưới 1.1km) mà entry cũ đang giữ vị trí
+    MỊN còn tươi (≤90s) → giữ vị trí mịn cũ ("cycle này không có thông tin vị trí mới"),
+    tránh marker nhảy về điểm lưới thô rồi lại nhảy về đúng khi details kế tiếp về.
+    Tốc độ/hướng/alt từ bounds vẫn dùng bình thường (không bị làm thô)."""
+    if old is None or old.latitude is None or old.longitude is None:
+        return sensors
+    if not _looks_grid_coarse(sensors.get("lat"), sensors.get("lng")):
+        return sensors
+    if _looks_grid_coarse(old.latitude, old.longitude):
+        return sensors
+    if not old.updated_at or now_ms - old.updated_at > 90_000:
+        return sensors
+    out = dict(sensors)
+    out["lat"] = old.latitude
+    out["lng"] = old.longitude
+    out["ts_ms"] = old.updated_at
+    out["distance_km"] = _haversine_km(old.latitude, old.longitude, DAD_LAT, DAD_LNG)
+    return out
 
 
 def _extract_eta_from_details(details: dict):
@@ -2795,11 +2910,22 @@ def _process_match(
     hoặc chưa cập nhật destination cho chuyến mới khởi hành.
     """
     sensors = _extract_sensors(flight)
+    # Bounds-feed bị FR24 làm thô tọa độ (~1.1km) cho IP poll dày → lấy lại vị trí
+    # đầy đủ độ phân giải từ details.trail khi có (details=None thì giữ nguyên).
+    sensors = _refine_sensors_from_trail(sensors, details, now_ms)
+    # Chu kỳ giãn details: bounds vẫn thô → giữ vị trí mịn cũ còn tươi thay vì nhảy lưới.
+    sensors = _keep_fine_position_if_bounds_coarse(sensors, old, now_ms)
 
     # Nếu mã chuyến đã PARKED từ trước nhưng FR24 hiện lại cùng mã đang bay/còn xa DAD,
     # đó là chuyến mới dùng lại số hiệu. Reset entry cũ để không dính "Vào bến" giả.
     if _is_reused_code_live_after_parked(old, sensors, now_ms):
         log.info("%s: reset stale PARKED entry; same flight code is live again", code)
+        old = None
+    elif _is_airborne_fix_after_parked(old, sensors):
+        log.warning(
+            "%s: UNPARK — PARKED cũ bị gỡ vì fix mới còn bay (dist=%s km, alt=%s ft, gs=%s kt)",
+            code, sensors.get("distance_km"), sensors.get("alt_ft"), sensors.get("gs_kt"),
+        )
         old = None
 
     fr24_eta_ms = None
@@ -2918,7 +3044,7 @@ def _process_match(
                 latitude=sensors["lat"] if sensors["lat"] is not None else (old.latitude if old else None),
                 longitude=sensors["lng"] if sensors["lng"] is not None else (old.longitude if old else None),
                 heading=sensors["heading"] if sensors["heading"] is not None else (old.heading if old else None),
-                updated_at=now_ms,
+                updated_at=(sensors.get("ts_ms") or now_ms),
                 history=old.history[:] if old else [],
                 miss_count=0,
                 landed=(state in ("LANDED", "TAXIING", "PARKED")),
@@ -2975,7 +3101,7 @@ def _process_match(
         latitude=sensors["lat"] if sensors["lat"] is not None else (old.latitude if old else None),
         longitude=sensors["lng"] if sensors["lng"] is not None else (old.longitude if old else None),
         heading=sensors["heading"] if sensors["heading"] is not None else (old.heading if old else None),
-        updated_at=now_ms,
+        updated_at=(sensors.get("ts_ms") or now_ms),
         history=history,
         miss_count=0,
         landed=(state in ("LANDED", "TAXIING", "PARKED")),
@@ -3168,7 +3294,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
-    if old.state == "FINAL" and miss_count >= MISS_LANDED_FROM_FINAL:
+    if old.state == "FINAL" and miss_count >= MISS_LANDED_FROM_FINAL and _missed_signal_can_mean_landed(old):
         log.info("%s: FINAL → LANDED (missed %d cycles)", code, miss_count)
         return FlightEntry(
             state="LANDED",
@@ -3198,7 +3324,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
 
     # Vượt ngưỡng drop
     if miss_count >= MISS_DROP_THRESHOLD:
-        if old.state == "APPROACH":
+        if old.state == "APPROACH" and _missed_signal_can_mean_landed(old):
             log.info("%s: APPROACH + missed %d → LANDED", code, miss_count)
             return FlightEntry(
                 state="LANDED",
@@ -4166,9 +4292,9 @@ def _load_live_from_firestore():
 # RIÊNG của máy đó. Server chỉ đọc ô đó nên mỗi lúc thấy 1 máy → máy nào ghi thiếu tàu
 # thì web MẤT tàu; máy phụ "non" ghi snapshot rỗng thì web báo "chưa có dữ liệu tàu".
 # CÁCH SỬA (CHỈ ở server online, KHÔNG đụng máy fetcher): đọc radarLive DÀY (mỗi vài
-# giây) rồi GỘP theo mã — mốc telemetry (updated_at_millis) mới nhất thắng; mã rỗng/
-# PENDING (không mốc) KHÔNG đè được mã đang có vị trí; mã vắng mặt khỏi mọi máy giữ
-# tới khi quá TTL. Nhờ vậy web mượt + dùng được dữ liệu của cả 3 máy.
+# giây) rồi GỘP theo mã. Khi còn bay: mốc telemetry mới nhất thắng. Khi đã chạm đất:
+# khóa nguồn tạm theo từng chuyến để 2 máy không thay phiên báo TAXIING/PARKED lệch
+# vị trí làm marker nhảy loạn. Mã rỗng/PENDING không đè được mã đang có vị trí.
 SERVER_LIVE_MERGE: dict = {}
 SERVER_LIVE_MERGE_LOCK = threading.Lock()
 SERVER_LIVE_MERGE_REV = 0
@@ -4176,6 +4302,204 @@ SERVER_LIVE_MERGE_LAST_MS = 0
 SERVER_MERGE_LAST_DOC_WRITE_MS = 0  # update_time của lần GHI doc gần nhất ĐÃ gộp (chống bơm tàu ma khi radar chết)
 SERVER_LIVE_MERGE_TTL_MS = int(os.environ.get("SERVER_LIVE_MERGE_TTL_MS", "90000"))
 SERVER_MERGE_READ_INTERVAL_S = float(os.environ.get("SERVER_MERGE_READ_INTERVAL_S", "6"))
+SERVER_MERGE_GROUND_LOCK_MS = int(os.environ.get("SERVER_MERGE_GROUND_LOCK_MS", "240000"))
+SERVER_MERGE_ACCEPT_NEWER_MS = int(os.environ.get("SERVER_MERGE_ACCEPT_NEWER_MS", "45000"))
+SERVER_MERGE_MAX_GROUND_JUMP_M = float(os.environ.get("SERVER_MERGE_MAX_GROUND_JUMP_M", "450"))
+SERVER_MERGE_AIRBORNE_ALT_FT = int(os.environ.get("SERVER_MERGE_AIRBORNE_ALT_FT", "1000"))
+SERVER_MERGE_AIRBORNE_DIST_KM = float(os.environ.get("SERVER_MERGE_AIRBORNE_DIST_KM", "6"))
+SERVER_MERGE_GROUND_STATES = {"LANDED", "TAXIING", "PARKED"}
+SERVER_MERGE_AIR_STATES = {"EN_ROUTE", "APPROACH", "FINAL"}
+SERVER_MERGE_EMPTY_STATES = {"", "PENDING", "SCHEDULED", "LOST"}
+
+
+def _merge_float(value) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _merge_entry_state(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("state") or "").strip().upper()
+
+
+def _merge_state_rank(state: str) -> int:
+    return {
+        "": 0,
+        "PENDING": 0,
+        "SCHEDULED": 0,
+        "LOST": 0,
+        "EN_ROUTE": 1,
+        "APPROACH": 2,
+        "FINAL": 3,
+        "LANDED": 4,
+        "TAXIING": 5,
+        "PARKED": 6,
+    }.get(str(state or "").upper(), 0)
+
+
+def _merge_entry_lat_lng(entry: dict) -> tuple[Optional[float], Optional[float]]:
+    if not isinstance(entry, dict):
+        return None, None
+    lat = _merge_float(entry.get("latitude"))
+    lng = _merge_float(entry.get("longitude"))
+    if lat is None or lng is None:
+        return None, None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None, None
+    return lat, lng
+
+
+def _merge_entry_has_position(entry: dict) -> bool:
+    lat, lng = _merge_entry_lat_lng(entry)
+    return lat is not None and lng is not None
+
+
+def _merge_entry_distance_m(a: dict, b: dict) -> Optional[float]:
+    alat, alng = _merge_entry_lat_lng(a)
+    blat, blng = _merge_entry_lat_lng(b)
+    if alat is None or alng is None or blat is None or blng is None:
+        return None
+    try:
+        return _haversine_km(alat, alng, blat, blng) * 1000.0
+    except Exception:
+        return None
+
+
+def _merge_entry_landed_ms(entry: dict) -> Optional[int]:
+    if not isinstance(entry, dict):
+        return None
+    for k in ("actual_landed_at_millis", "landed_at_millis", "touchdown_millis"):
+        v = _to_int_ms(entry.get(k))
+        if v:
+            return v
+    return None
+
+
+def _merge_entry_parked_ms(entry: dict) -> Optional[int]:
+    if not isinstance(entry, dict):
+        return None
+    for k in ("actual_parked_at_millis", "parked_at_millis", "in_block_millis", "on_block_millis", "stand_arrival_millis"):
+        v = _to_int_ms(entry.get(k))
+        if v:
+            return v
+    return None
+
+
+def _merge_entry_is_ground(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    state = _merge_entry_state(entry)
+    return (
+        state in SERVER_MERGE_GROUND_STATES
+        or bool(entry.get("landed"))
+        or bool(entry.get("taxiing"))
+        or bool(entry.get("parked"))
+        or bool(_merge_entry_landed_ms(entry))
+    )
+
+
+def _merge_entry_is_parked(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return _merge_entry_state(entry) == "PARKED" or bool(entry.get("parked")) or bool(_merge_entry_parked_ms(entry))
+
+
+def _merge_entry_airborne_override(entry: dict) -> bool:
+    """Bằng chứng đủ mạnh để phá khóa mặt đất (vd go-around/cùng mã bay mới)."""
+    if not isinstance(entry, dict):
+        return False
+    state = _merge_entry_state(entry)
+    if state not in SERVER_MERGE_AIR_STATES:
+        return False
+    alt_ft = _merge_float(entry.get("altitude_ft"))
+    dist_km = _merge_float(entry.get("distance_km"))
+    return (
+        (alt_ft is not None and alt_ft >= SERVER_MERGE_AIRBORNE_ALT_FT)
+        or (dist_km is not None and dist_km >= SERVER_MERGE_AIRBORNE_DIST_KM)
+    )
+
+
+def _merge_entry_for_store(entry: dict, source: str, vai_tro: str, reason: str) -> dict:
+    out = dict(entry)
+    if source:
+        out["merge_source"] = source
+    if vai_tro:
+        out["merge_vai_tro"] = vai_tro
+    if reason:
+        out["merge_reason"] = reason
+    return out
+
+
+def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, now_ms: int, source: str) -> tuple[bool, str]:
+    if cur is None:
+        return True, "new"
+
+    cur_entry = cur.get("entry") or {}
+    cur_ts = int(cur.get("ts") or 0)
+    cur_source = str(cur.get("source") or "")
+    cur_accepted_ms = int(cur.get("accepted_ms") or cur.get("seen_ms") or 0)
+    cur_state = _merge_entry_state(cur_entry)
+    inc_state = _merge_entry_state(entry)
+
+    if inc_ts <= 0 and cur_ts > 0:
+        return False, "no-telemetry"
+    if cur_ts <= 0:
+        return True, "replace-empty-current"
+    if inc_ts < cur_ts:
+        return False, "older-telemetry"
+    if inc_state in SERVER_MERGE_EMPTY_STATES:
+        if inc_ts <= 0:
+            return False, "empty-state"
+        # Một máy có thể MISS/LOST khi máy khác vẫn đang thấy tàu. Khi nguồn hiện tại
+        # còn tươi thì không cho trạng thái rỗng từ nguồn khác làm mất marker.
+        if (
+            source and cur_source and source != cur_source
+            and cur_accepted_ms
+            and now_ms - cur_accepted_ms <= SERVER_LIVE_MERGE_TTL_MS
+        ):
+            return False, "empty-state-source-lock"
+
+    # Cùng một máy tự sửa trạng thái của chính nó thì cho đi qua: đây là cách giữ
+    # được logic provisional PARKED -> TAXIING khi tàu chỉ dừng tạm trên taxiway.
+    if source and cur_source and source == cur_source:
+        return True, "same-source"
+
+    cur_ground = _merge_entry_is_ground(cur_entry)
+    inc_ground = _merge_entry_is_ground(entry)
+    cur_parked = _merge_entry_is_parked(cur_entry)
+    inc_parked = _merge_entry_is_parked(entry)
+
+    if cur_ground and _merge_entry_airborne_override(entry) and not cur_parked:
+        return True, "airborne-override"
+
+    if cur_ground or inc_ground:
+        locked_by_source = bool(
+            source and cur_source and source != cur_source
+            and cur_accepted_ms
+            and now_ms - cur_accepted_ms <= SERVER_MERGE_GROUND_LOCK_MS
+        )
+        if locked_by_source:
+            dist_m = _merge_entry_distance_m(cur_entry, entry)
+            close_time = inc_ts <= cur_ts + SERVER_MERGE_ACCEPT_NEWER_MS
+            big_jump = dist_m is not None and dist_m > SERVER_MERGE_MAX_GROUND_JUMP_M
+            rank_regress = _merge_state_rank(inc_state) < _merge_state_rank(cur_state)
+            parked_flip = (inc_parked and not cur_parked) or (cur_parked and not inc_parked)
+            hidden_parked = cur_parked and not _merge_entry_has_position(cur_entry)
+            if close_time or big_jump or rank_regress or parked_flip or hidden_parked:
+                return False, "ground-source-lock"
+
+        if cur_parked and not _merge_entry_airborne_override(entry):
+            parked_age_ms = now_ms - cur_accepted_ms if cur_accepted_ms else 0
+            if source and cur_source and source != cur_source and parked_age_ms <= SERVER_MERGE_GROUND_LOCK_MS:
+                return False, "parked-sticky"
+
+    return True, "newer-telemetry"
 
 
 def _entry_telemetry_ms(entry: dict) -> int:
@@ -4219,7 +4543,13 @@ def _read_live_raw_for_merge():
         return None, {}, 0
 
 
-def _merge_live_snapshot_into_store(flights: dict, doc_write_ms: int, now_ms: int) -> None:
+def _merge_live_snapshot_into_store(
+    flights: dict,
+    doc_write_ms: int,
+    now_ms: int,
+    source: Optional[str] = None,
+    vai_tro: Optional[str] = None,
+) -> None:
     """Gộp 1 ảnh chụp vào SERVER_LIVE_MERGE. Gọi được từ CẢ luồng nền LẪN đường request
     /api/etas (để chắc chắn chạy dù gunicorn không giữ luồng nền).
 
@@ -4227,10 +4557,13 @@ def _merge_live_snapshot_into_store(flights: dict, doc_write_ms: int, now_ms: in
       máy ghi đè vẫn gộp đúng, không gộp trùng cùng 1 bản ghi nhiều lần.
     - LUÔN prune mã vắng mặt quá TTL — kể cả khi radar chết (doc đứng yên) → tàu hết hạn
       biến mất → web báo 'mất kết nối' đúng lúc, không treo tàu ma.
-    - Trong từng mã: mốc telemetry (updated_at_millis) mới hơn thắng; entry rỗng/PENDING
-      (không mốc) KHÔNG đè được mã đang có vị trí."""
+    - Trong từng mã: mốc telemetry mới hơn thắng, nhưng pha mặt đất có khóa nguồn tạm
+      để chống 2 máy ghi PARKED/TAXIING lệch vị trí làm web nhảy loạn.
+    - Entry rỗng/PENDING (không mốc) KHÔNG đè được mã đang có vị trí."""
     global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS, SERVER_MERGE_LAST_DOC_WRITE_MS
     changed = False
+    source_label = str(source or "").strip()
+    role_label = str(vai_tro or "").strip()
     with SERVER_LIVE_MERGE_LOCK:
         is_new_write = bool(doc_write_ms) and doc_write_ms != SERVER_MERGE_LAST_DOC_WRITE_MS
         if is_new_write and isinstance(flights, dict):
@@ -4240,11 +4573,22 @@ def _merge_live_snapshot_into_store(flights: dict, doc_write_ms: int, now_ms: in
                     continue
                 inc_ts = _entry_telemetry_ms(entry)
                 cur = SERVER_LIVE_MERGE.get(code)
-                if cur is None or inc_ts >= cur["ts"]:
-                    SERVER_LIVE_MERGE[code] = {"entry": entry, "ts": inc_ts, "seen_ms": now_ms}
+                accept, reason = _merge_should_accept_entry(cur, entry, inc_ts, now_ms, source_label)
+                if accept:
+                    SERVER_LIVE_MERGE[code] = {
+                        "entry": _merge_entry_for_store(entry, source_label, role_label, reason),
+                        "ts": inc_ts,
+                        "seen_ms": now_ms,
+                        "accepted_ms": now_ms,
+                        "source": source_label,
+                        "vai_tro": role_label,
+                    }
                     changed = True
                 else:
                     cur["seen_ms"] = now_ms  # mã vẫn được report (dù ảnh cũ hơn) → giữ tươi
+                    cur["last_reject_reason"] = reason
+                    cur["last_reject_source"] = source_label
+                    cur["last_reject_ms"] = now_ms
         # LUÔN dọn mã quá hạn (chạy mọi lần gọi, kể cả khi không có ghi mới).
         for code in [c for c, v in SERVER_LIVE_MERGE.items()
                      if now_ms - v["seen_ms"] > SERVER_LIVE_MERGE_TTL_MS]:
@@ -4269,7 +4613,13 @@ def _server_merge_reader_loop() -> None:
     while True:
         try:
             flights, _meta, doc_write_ms = _read_live_raw_for_merge()
-            _merge_live_snapshot_into_store(flights, doc_write_ms, int(time.time() * 1000))
+            _merge_live_snapshot_into_store(
+                flights,
+                doc_write_ms,
+                int(time.time() * 1000),
+                (_meta or {}).get("source"),
+                (_meta or {}).get("vai_tro"),
+            )
         except Exception as e:
             log.warning("Luồng gộp radarLive lỗi: %s", e)
         time.sleep(max(2.0, SERVER_MERGE_READ_INTERVAL_S))
@@ -4612,7 +4962,13 @@ def _finalize_parked_from_live(now_ms: int, stand_only: bool = False, process_mi
     raw, _meta = _load_live_from_firestore()
     # GỘP đa máy ngay trên đường này: tàu còn được BẤT KỲ máy nào thấy trong TTL coi là còn sống
     # → "rớt khỏi feed" mới đúng nghĩa mất tín hiệu (không phải do 1 máy ghi đè thiếu tàu).
-    _merge_live_snapshot_into_store(raw or {}, (_meta or {}).get("_doc_write_ms") or 0, now_ms)
+    _merge_live_snapshot_into_store(
+        raw or {},
+        (_meta or {}).get("_doc_write_ms") or 0,
+        now_ms,
+        (_meta or {}).get("source"),
+        (_meta or {}).get("vai_tro"),
+    )
     merged = _server_merge_snapshot_view()
     flights = merged if merged else (raw or {})
     if not flights and not (process_missed and SERVER_TRACKED):
@@ -4807,7 +5163,13 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
         flights = {}
     # GỘP NGAY trên đường request: đảm bảo đúng KỂ CẢ khi gunicorn không giữ luồng nền.
     # Hàm tự gate theo doc_write_ms (không gộp trùng với luồng nền) và tự prune.
-    _merge_live_snapshot_into_store(flights, (meta or {}).get("_doc_write_ms") or 0, now_ms)
+    _merge_live_snapshot_into_store(
+        flights,
+        (meta or {}).get("_doc_write_ms") or 0,
+        now_ms,
+        (meta or {}).get("source"),
+        (meta or {}).get("vai_tro"),
+    )
     # Ưu tiên bộ ĐÃ GỘP theo thời gian (mượt, dùng cả 3 máy). Store rỗng lúc vừa khởi động
     # → fallback ảnh thô để không gián đoạn.
     merged = _server_merge_snapshot_view()
