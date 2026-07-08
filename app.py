@@ -4309,6 +4309,13 @@ SERVER_MERGE_ACCEPT_NEWER_MS = int(os.environ.get("SERVER_MERGE_ACCEPT_NEWER_MS"
 SERVER_MERGE_MAX_GROUND_JUMP_M = float(os.environ.get("SERVER_MERGE_MAX_GROUND_JUMP_M", "450"))
 SERVER_MERGE_AIRBORNE_ALT_FT = int(os.environ.get("SERVER_MERGE_AIRBORNE_ALT_FT", "1000"))
 SERVER_MERGE_AIRBORNE_DIST_KM = float(os.environ.get("SERVER_MERGE_AIRBORNE_DIST_KM", "6"))
+# KHỬ GIẬT giữa 2 máy (CHỈ áp cho fix KHÁC NGUỒN — cùng nguồn tin trajectory của nó):
+#   - Chống TELEPORT: bước nhảy > MIN_M mà ngụ ý tốc độ > MAX_KT là bất khả thi → glitch FR24/coast, bỏ.
+SERVER_MERGE_TELEPORT_MIN_M = float(os.environ.get("SERVER_MERGE_TELEPORT_MIN_M", "3000"))
+SERVER_MERGE_MAX_AIR_SPEED_KT = float(os.environ.get("SERVER_MERGE_MAX_AIR_SPEED_KT", "900"))
+#   - Không HẠ CẤP mịn→thô để đổi lấy chút tươi: fix THÔ (toạ độ rơi lưới 0.01° ~1.1km) không đè
+#     fix MỊN còn tươi trong ngần này → hết cảnh marker nhảy qua lại giữa vị trí thô/mịn 2 máy.
+SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "12000"))
 SERVER_MERGE_GROUND_STATES = {"LANDED", "TAXIING", "PARKED"}
 SERVER_MERGE_AIR_STATES = {"EN_ROUTE", "APPROACH", "FINAL"}
 SERVER_MERGE_EMPTY_STATES = {"", "PENDING", "SCHEDULED", "LOST"}
@@ -4360,6 +4367,15 @@ def _merge_entry_lat_lng(entry: dict) -> tuple[Optional[float], Optional[float]]
 def _merge_entry_has_position(entry: dict) -> bool:
     lat, lng = _merge_entry_lat_lng(entry)
     return lat is not None and lng is not None
+
+
+def _merge_entry_is_coarse(entry: dict) -> bool:
+    """True nếu toạ độ rơi ĐÚNG lưới 0.01° (~1.1km) — FR24 làm thô cho IP poll dày.
+    Cùng cách nhận diện với client (looksCoarse) để server ưu tiên giữ fix mịn."""
+    lat, lng = _merge_entry_lat_lng(entry)
+    if lat is None or lng is None:
+        return False
+    return abs(lat * 100 - round(lat * 100)) < 1e-6 and abs(lng * 100 - round(lng * 100)) < 1e-6
 
 
 def _merge_entry_distance_m(a: dict, b: dict) -> Optional[float]:
@@ -4469,8 +4485,20 @@ def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, no
 
     # Cùng một máy tự sửa trạng thái của chính nó thì cho đi qua: đây là cách giữ
     # được logic provisional PARKED -> TAXIING khi tàu chỉ dừng tạm trên taxiway.
+    # (Cùng nguồn = tin trajectory của máy đó — không áp luật chống-teleport/giữ-mịn bên dưới.)
     if source and cur_source and source == cur_source:
         return True, "same-source"
+
+    # ── KHỬ GIẬT giữa 2 máy KHÁC NGUỒN (nguồn chính gây "nhảy nhiều vị trí") ──
+    # (1) Chống TELEPORT: bước nhảy lớn mà ngụ ý tốc độ bất khả thi so với vị trí đang giữ
+    #     → glitch/coast của FR24, KHÔNG cho làm marker teleport. Bỏ qua nếu Δt ≤ 0.
+    if inc_ts > cur_ts:
+        jump_m = _merge_entry_distance_m(cur_entry, entry)
+        if jump_m is not None and jump_m > SERVER_MERGE_TELEPORT_MIN_M:
+            dt_ms = inc_ts - cur_ts
+            implied_kt = (jump_m / 1852.0) / (dt_ms / 3_600_000.0)
+            if implied_kt > SERVER_MERGE_MAX_AIR_SPEED_KT:
+                return False, "teleport-outlier"
 
     cur_ground = _merge_entry_is_ground(cur_entry)
     inc_ground = _merge_entry_is_ground(entry)
@@ -4500,6 +4528,14 @@ def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, no
             parked_age_ms = now_ms - cur_accepted_ms if cur_accepted_ms else 0
             if source and cur_source and source != cur_source and parked_age_ms <= SERVER_MERGE_GROUND_LOCK_MS:
                 return False, "parked-sticky"
+
+    # (2) Trên KHÔNG: KHÔNG hạ cấp mịn→thô để đổi lấy chút tươi. Fix THÔ không đè fix MỊN còn
+    #     tươi trong SERVER_MERGE_FINE_HOLD_MS → hết nhảy qua lại giữa vị trí thô/mịn của 2 máy.
+    #     (Cùng độ chính xác thì "mới nhất thắng" như cũ. Thô quá cũ mới cho thô mới đè.)
+    if not cur_ground and not inc_ground:
+        if _merge_entry_is_coarse(entry) and not _merge_entry_is_coarse(cur_entry) \
+                and (inc_ts - cur_ts) < SERVER_MERGE_FINE_HOLD_MS:
+            return False, "keep-fine-over-coarse"
 
     return True, "newer-telemetry"
 
