@@ -137,6 +137,30 @@ APPROACH_DIST_KM = 100
 TOUCHDOWN_ALT_AGL_FT = 200    # alt - field_elev ≤ 200 ft
 TOUCHDOWN_GS_KT = 80          # ground_speed < 80 kt
 
+# ── HẠ CÁNH: chốt theo VẬN TỐC CHẬM, mất sóng thì dùng GIỜ ƯỚC LƯỢNG ──────────────
+# (Yêu cầu vận hành) Tàu bay lại/go-around thì vận tốc còn CAO; chỉ khi tàu THẬT CHẬM
+# ngay tại DAD (telemetry radar thật, không phải suy đoán mất sóng) mới coi là đã chạm
+# đất → được tự chốt + ẩn. Còn nhanh = còn bay → không chốt.
+#
+# "Mất sóng lúc gần hạ" chỉ là SUY ĐOÁN: KHÔNG lấy giờ lúc mất sóng (sớm ~3 phút, tàu còn
+# đang bay) mà lấy GIỜ HẠ ƯỚC LƯỢNG (ETA) làm giờ TẠM. Chỉ chốt hẳn sau khi đã qua
+# ETA + buffer này mà tàu vẫn mất sóng (không bay lại). Nếu bay lại → gỡ, theo dõi tiếp.
+PROVISIONAL_LANDING_CONFIRM_MS = int(os.environ.get("PROVISIONAL_LANDING_CONFIRM_MS", "120000"))
+# Giờ hạ ước lượng chỉ nhận trong cửa sổ hợp lý quanh lúc mất sóng (tránh ETA lỗi quá xa).
+PROVISIONAL_LANDING_MAX_FUTURE_MS = int(os.environ.get("PROVISIONAL_LANDING_MAX_FUTURE_MS", "360000"))  # ≤ 6 phút tương lai
+PROVISIONAL_LANDING_MAX_PAST_MS = int(os.environ.get("PROVISIONAL_LANDING_MAX_PAST_MS", "1200000"))     # ≤ 20 phút quá khứ
+# Siết điều kiện "mất sóng = đã hạ": fix cuối phải trong tầm FINAL thật (đã vào tiếp cận),
+# không phải cruise/gap xa. Trước đây dùng FINAL_ALT_FT/FINAL_DIST_KM (3000ft/20km). Đo thực tế
+# (Firestore, 16/07): FR24 free hay RỚT ở nhiều khoảng cách → final_missed là đường chốt CHỦ ĐẠO
+# (~73%), nên KHÔNG siết quá gắt kẻo nhiều chuyến rơi thành LOST; chỉ loại ca rõ ràng còn xa/cao
+# (≥2500ft hoặc ≥12km) — nơi ETA còn kém tin & tàu còn có thể vòng lại. Phần chữa "chốt sớm" thật
+# nằm ở GIỜ = ETA (không lấy giờ mất sóng) + hoãn chốt tới ETA+buffer + gỡ go-around. Chỉnh qua env.
+MISSED_LANDED_MAX_ALT_FT = int(os.environ.get("MISSED_LANDED_MAX_ALT_FT", "2500"))
+MISSED_LANDED_MAX_DIST_KM = float(os.environ.get("MISSED_LANDED_MAX_DIST_KM", "12.0"))
+# Go-around/bay lại: sau khi đã ở trạng thái mặt đất (LANDED/TAXIING/PARKED) mà fix mới còn
+# NHANH/CAO/XA rõ ràng = tàu chưa hạ (hoặc hạ hụt bay lại) → gỡ ngay, theo dõi tiếp.
+GOAROUND_GS_KT = int(os.environ.get("GOAROUND_GS_KT", str(TOUCHDOWN_GS_KT)))
+
 # Validate ETA: bỏ qua nếu quá khứ hoặc tương lai quá xa
 ETA_MIN_FUTURE_MS = -60_000           # cho phép lệch 60s do clock skew
 ETA_MAX_FUTURE_MS = 5 * 3600 * 1000   # tối đa 5 tiếng
@@ -480,6 +504,8 @@ FIRESTORE_STATUS = "not_configured"
 FIRESTORE_SCHEDULE_DATES: list[str] = []
 FIRESTORE_MANUAL_TRACKING_DATES: list[str] = []
 PARKED_FIRESTORE_SYNCED: set[str] = set()
+# Dedup mở-lại-hồ-sơ khi tàu bay lại (go-around) sau khi server đã lỡ tự chốt. key = date:code:landed_ms.
+GOAROUND_REOPENED: set[str] = set()
 SCHEDULE_FALLBACK_FIRESTORE_SYNCED: set[str] = set()
 SCHEDULE_FALLBACK_NEXT_CHECK_MS: dict[str, int] = {}
 # Stand-snap: toạ độ bến đã học. key = số bến (vd "25"); value = {lat,lng,n,samples,updated_ms,seed}
@@ -1083,17 +1109,32 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     if not date_key or not doc_id:
         return False
 
-    # Nguồn + cờ "đã xác nhận" là một phần của khóa: cùng mốc nhưng từ TẠM → ĐÃ XÁC NHẬN
-    # (hoặc fallback LOW → ground_stop HIGH) vẫn được phép ghi lại đúng một lần để chốt.
-    # Giờ hạ cánh là mốc DỨT KHOÁT → coi như đã xác nhận, cho phép auto-finalize ngay khi hạ.
-    confirmed = True
+    # "Đã xác nhận" (confirmed) quyết định có được TỰ CHỐT (finalize + ẩn) hay chưa.
+    # (Yêu cầu vận hành) CHỈ chốt khi tàu đã HẠ CHẮC CHẮN, KHÔNG chốt sớm khi còn suy đoán:
+    #   • CHẮC: telemetry radar thật báo tàu chậm/chạm đất tại DAD (state TAXIING/PARKED, hoặc
+    #     landed_source real_arrival/radar_ground) → chốt ngay bằng giờ hạ thật.
+    #   • SUY ĐOÁN (mất sóng lúc gần hạ: final_missed/approach_missed, giờ = ETA ước lượng) →
+    #     CHƯA chốt; chỉ ghi giờ tạm. Đợi qua ETA + PROVISIONAL_LANDING_CONFIRM_MS mà tàu vẫn
+    #     mất sóng (không bay lại) mới chốt hẳn bằng chính giờ ETA đó. Nếu bay lại (go-around),
+    #     _process_match sẽ gỡ trạng thái mặt đất trước khi tới hạn này.
+    _now_ms_confirm = int(time.time() * 1000)
+    _landed_src = str(getattr(entry, "landed_source", "") or "")
+    _confirmed_landing = (
+        entry.state in ("TAXIING", "PARKED")
+        or _landed_src in ("real_arrival", "radar_ground")
+    )
+    _provisional_due = bool(
+        stored_parked_ms
+        and _now_ms_confirm >= int(stored_parked_ms) + PROVISIONAL_LANDING_CONFIRM_MS
+    )
+    confirmed = bool(_confirmed_landing or _provisional_due)
     sync_key = f"{date_key}:{doc_id}:{stored_parked_ms}:landed:{int(confirmed)}"
     if sync_key in PARKED_FIRESTORE_SYNCED:
         return False
 
-    # v77: nguồn duy nhất = giờ hạ cánh radar (mốc thật, đã qua gate khoảng cách) → luôn HIGH.
+    # v77: nguồn = giờ hạ cánh radar. HIGH khi đã xác nhận (hạ chắc / qua hạn); mốc tạm suy đoán = MEDIUM.
     new_source = "server_radar_landed"
-    new_confidence = "HIGH"
+    new_confidence = "HIGH" if confirmed else "MEDIUM"
 
     try:
         ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
@@ -1256,6 +1297,86 @@ def _sync_single_parked_entry_to_firestore(code: str, entry: FlightEntry) -> boo
     except Exception as e:
         LAST_FIRESTORE_SYNC_ERROR = str(e)
         log.warning("Firestore parked write failed %s/%s: %s", date_key, doc_id, e)
+        return False
+
+
+def _reopen_radar_finalized_claim(code: str, old: Optional[FlightEntry], now_ms: int) -> bool:
+    """Tàu BAY LẠI (go-around) sau khi server đã LỠ TỰ CHỐT → mở lại hồ sơ để theo dõi tiếp.
+
+    Chỉ mở khi chốt đó do CHÍNH server radar (autoFinalizedByRadar / autoFinalizedByLandingFallback);
+    TUYỆT ĐỐI không đụng tới chốt tay của người dùng (quickCompleted / chốt qua form). Xoá các mốc
+    giờ hạ/vào bến sai (tàu chưa hạ) để khi tàu hạ THẬT server ghi lại giờ đúng.
+    Máy phụ nhường việc ghi Firestore cho máy chính (giống các nghiệp vụ ghi khác).
+    """
+    if _phu_nhuong_nghiep_vu():
+        return False
+    if old is None or old.state not in ("PARKED", "LANDED", "TAXIING"):
+        return False
+    landed_ms = old.landed_at_millis or old.parked_at_millis
+    if not landed_ms:
+        return False
+    hint = _select_schedule_hint_for_event(code, landed_ms)
+    date_key = str(hint.get("date_key") or "").strip() or _date_key_from_millis(landed_ms)
+    doc_id = _clean_code(code)
+    if not date_key or not doc_id:
+        return False
+    reopen_key = f"{date_key}:{doc_id}:{int(landed_ms)}"
+    if reopen_key in GOAROUND_REOPENED:
+        return False
+    db = _init_firestore_client()
+    if db is None:
+        return False
+    try:
+        ref = db.collection("pickups").document(date_key).collection("flights").document(doc_id)
+        snap = ref.get()
+        if not snap.exists:
+            GOAROUND_REOPENED.add(reopen_key)
+            return False
+        old_doc = snap.to_dict() or {}
+        # Chưa chốt thì không cần mở; chốt TAY của người dùng (quick-complete/form) thì KHÔNG được
+        # đụng. Chỉ mở lại các bản TỰ CHỐT (server radar / fallback / client safety-net).
+        server_auto = bool(
+            old_doc.get("autoFinalizedByRadar")
+            or old_doc.get("autoFinalizedByLandingFallback")
+            or old_doc.get("autoFinalizedByClientSafetyNet")
+        )
+        if not old_doc.get("finalized") or not server_auto:
+            GOAROUND_REOPENED.add(reopen_key)
+            return False
+        ref.set({
+            "finalized": False,
+            "locked": False,
+            "autoFinalizedByRadar": False,
+            "autoFinalizedByLandingFallback": False,
+            "reopenedByGoAround": True,
+            "reopenedByGoAroundAtMillis": int(now_ms),
+            # Xoá mốc giờ hạ/vào bến sai — tàu chưa hạ thật (bay lại). Chốt lại khi hạ thật.
+            "completedTime": None,
+            "completedTimeFull": None,
+            "completedAtMillis": None,
+            "actualLandedAtMillis": None,
+            "landedAtMillis": None,
+            "touchdownMillis": None,
+            "actualLandedTime": None,
+            "actualLandedTimeFull": None,
+            "actualParkedAtMillis": None,
+            "actualParkedTime": None,
+            "actualParkedTimeFull": None,
+            "actualParkedProvisional": True,
+            "lastUpdatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "lastUpdatedByName": "server-radar",
+            "history": firebase_firestore.ArrayUnion([{
+                "action": "reopen_by_go_around",
+                "reason": "airborne_fix_after_ground",
+                "changedByName": "server-radar",
+                "changedAtMillis": int(now_ms),
+            }]),
+        }, merge=True)
+        GOAROUND_REOPENED.add(reopen_key)
+        log.warning("%s: GO-AROUND → mở lại hồ sơ đã tự chốt (%s/%s), theo dõi tiếp", code, date_key, doc_id)
+        return True
+    except Exception as e:
+        log.warning("Reopen-by-go-around failed %s/%s: %s", date_key, doc_id, e)
         return False
 
 
@@ -2050,13 +2171,15 @@ def _is_reused_code_live_after_parked(old: Optional["FlightEntry"], sensors: dic
 
 
 def _is_airborne_fix_after_parked(old: Optional["FlightEntry"], sensors: dict) -> bool:
-    """PARKED nhưng fix mới chứng minh tàu còn bay thì phải gỡ ngay.
+    """Đã ở trạng thái MẶT ĐẤT (LANDED/TAXIING/PARKED) nhưng fix mới chứng minh tàu CÒN BAY
+    thì phải gỡ ngay — xử lý cả GO-AROUND (hạ hụt bay lại) lẫn fallback-nhầm-thành-PARKED.
 
-    Ca thực tế: mất sóng ở APPROACH/FINAL bị fallback thành PARKED, sau đó FR24 có
-    lại tín hiệu cao/tốc độ lớn. Nếu giữ sticky PARKED, web sẽ ẩn marker như đã vào
-    bến dù tàu vẫn còn ngoài trời.
+    Ca thực tế:
+      • Mất sóng ở FINAL bị suy đoán LANDED, sau đó FR24 có lại tín hiệu cao/nhanh → tàu chưa hạ.
+      • Tàu chạm hụt rồi kéo lên bay lại (go-around): vận tốc/độ cao tăng vọt → phải theo dõi tiếp.
+    (Yêu cầu vận hành) Tiêu chí "còn bay" chủ yếu là VẬN TỐC còn cao; kèm độ cao/khoảng cách.
     """
-    if not old or old.state != "PARKED":
+    if not old or old.state not in ("PARKED", "LANDED", "TAXIING"):
         return False
     dist_km = sensors.get("distance_km")
     gs_kt = sensors.get("gs_kt")
@@ -2064,26 +2187,52 @@ def _is_airborne_fix_after_parked(old: Optional["FlightEntry"], sensors: dict) -
     on_ground = bool(sensors.get("on_ground"))
     if on_ground or _is_parked_on_ground(gs_kt, dist_km):
         return False
+    # Vận tốc còn cao = tàu đang bay/chạy tốc độ cất-hạ, chưa chạm-đất-dừng → chưa hạ.
+    if isinstance(gs_kt, (int, float)) and gs_kt > GOAROUND_GS_KT:
+        return True
     if isinstance(dist_km, (int, float)) and dist_km > FINAL_DIST_KM:
         return True
     if isinstance(alt_ft, (int, float)) and alt_ft > FINAL_ALT_FT:
-        return True
-    if isinstance(gs_kt, (int, float)) and gs_kt > TOUCHDOWN_GS_KT:
         return True
     return False
 
 
 def _missed_signal_can_mean_landed(entry: Optional["FlightEntry"]) -> bool:
-    """Chỉ suy mất sóng = đã hạ khi fix cuối thật sự ở short final DAD."""
+    """Chỉ suy mất sóng = đã hạ khi fix cuối THẬT thấp & gần đường băng DAD.
+
+    Siết chặt (MISSED_LANDED_MAX_ALT_FT/DIST_KM ~ 1500ft/6km) thay vì FINAL (3000ft/20km):
+    ở 3000ft/15km tàu còn cách chạm đất vài phút, mất sóng giữa chừng KHÔNG được coi là đã hạ
+    (đó là gap FR24 hoặc bắt đầu go-around). Chỉ short-final thật mới suy đoán "đã hạ".
+    """
     if not entry:
         return False
     dist_km = entry.distance_km
     alt_ft = entry.altitude_ft
-    if isinstance(dist_km, (int, float)) and dist_km > FINAL_DIST_KM:
+    # Thiếu dữ liệu vị trí → không đủ bằng chứng, không suy đoán đã hạ.
+    if dist_km is None or alt_ft is None:
         return False
-    if isinstance(alt_ft, (int, float)) and alt_ft > FINAL_ALT_FT:
+    if isinstance(dist_km, (int, float)) and dist_km > MISSED_LANDED_MAX_DIST_KM:
+        return False
+    if isinstance(alt_ft, (int, float)) and alt_ft > MISSED_LANDED_MAX_ALT_FT:
         return False
     return True
+
+
+def _provisional_landed_ms(old: Optional["FlightEntry"], now_ms: int) -> int:
+    """Giờ hạ TẠM khi MẤT SÓNG lúc gần hạ: dùng GIỜ HẠ ƯỚC LƯỢNG (ETA), KHÔNG lấy giờ mất sóng.
+
+    (Yêu cầu vận hành) Lấy giờ lúc mất sóng là SỚM QUÁ — tàu còn đang bay, còn cả mấy phút mới
+    chạm đất. ETA (giờ hạ dự kiến) do server tính khá sát nên dùng nó làm mốc tạm. Kẹp trong cửa
+    sổ hợp lý quanh 'now' để tránh ETA lỗi (quá xa tương lai / quá khứ) làm lệch giờ chốt.
+    """
+    if old is None:
+        return int(now_ms)
+    eta = old.eta_millis
+    if not isinstance(eta, (int, float)) or eta <= 0:
+        return int(now_ms)
+    lo = int(now_ms) - PROVISIONAL_LANDING_MAX_PAST_MS
+    hi = int(now_ms) + PROVISIONAL_LANDING_MAX_FUTURE_MS
+    return int(max(lo, min(hi, int(eta))))
 
 
 def _classify_state(
@@ -2927,9 +3076,12 @@ def _process_match(
         old = None
     elif _is_airborne_fix_after_parked(old, sensors):
         log.warning(
-            "%s: UNPARK — PARKED cũ bị gỡ vì fix mới còn bay (dist=%s km, alt=%s ft, gs=%s kt)",
-            code, sensors.get("distance_km"), sensors.get("alt_ft"), sensors.get("gs_kt"),
+            "%s: UNPARK/GO-AROUND — trạng thái mặt đất cũ (%s) bị gỡ vì fix mới còn bay "
+            "(dist=%s km, alt=%s ft, gs=%s kt)",
+            code, old.state, sensors.get("distance_km"), sensors.get("alt_ft"), sensors.get("gs_kt"),
         )
+        # Server đã lỡ tự chốt (chốt sớm) rồi tàu bay lại → mở lại hồ sơ Firestore để theo dõi tiếp.
+        _reopen_radar_finalized_claim(code, old, now_ms)
         old = None
 
     fr24_eta_ms = None
@@ -3316,7 +3468,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
             history=old.history,
             miss_count=miss_count,
             landed=True,
-            landed_at_millis=old.landed_at_millis or now_ms,
+            # Mất sóng lúc gần hạ → dùng GIỜ HẠ ƯỚC LƯỢNG (ETA), KHÔNG lấy giờ mất sóng (sớm ~3 phút).
+            # Đây là mốc TẠM (landed_source=final_missed) → không được tự chốt tới khi qua ETA+buffer.
+            landed_at_millis=old.landed_at_millis or _provisional_landed_ms(old, now_ms),
             landed_source=old.landed_source or "final_missed",
             parked_at_millis=old.parked_at_millis,
             parked_candidate_since_ms=old.parked_candidate_since_ms,
@@ -3346,7 +3500,9 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 history=old.history,
                 miss_count=miss_count,
                 landed=True,
-                landed_at_millis=old.landed_at_millis or now_ms,
+                # Mất sóng ở APPROACH → cũng dùng GIỜ HẠ ƯỚC LƯỢNG (ETA) làm mốc TẠM, không lấy
+                # giờ mất sóng. landed_source=approach_missed = suy đoán → chưa được tự chốt.
+                landed_at_millis=old.landed_at_millis or _provisional_landed_ms(old, now_ms),
                 landed_source=old.landed_source or "approach_missed",
                 parked_at_millis=old.parked_at_millis,
                 parked_candidate_since_ms=old.parked_candidate_since_ms,
@@ -5038,6 +5194,12 @@ def _finalize_parked_from_live(now_ms: int, stand_only: bool = False, process_mi
         sensors = {"distance_km": dist, "gs_kt": gs, "alt_ft": alt, "on_ground": on_ground}
         if _is_reused_code_live_after_parked(old, sensors, sample_ms):
             log.info("%s: server reset stale PARKED entry; same code is live again", code)
+            old = None
+        elif _is_airborne_fix_after_parked(old, sensors):
+            # GO-AROUND / hạ hụt bay lại: fix mới còn nhanh/cao sau trạng thái mặt đất → gỡ, theo dõi
+            # tiếp; mở lại hồ sơ nếu server đã lỡ tự chốt (mirror đường fetcher _process_match).
+            log.warning("%s: server UNPARK/GO-AROUND — trạng thái mặt đất cũ (%s) bị gỡ vì fix còn bay", code, old.state)
+            _reopen_radar_finalized_claim(code, old, sample_ms)
             old = None
 
         # TẦNG 1 cho server: KHÔNG tin thẳng state của box. Physics.classify của box chỉ dựa vào cờ
