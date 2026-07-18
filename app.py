@@ -4457,6 +4457,10 @@ SERVER_LIVE_MERGE: dict = {}
 SERVER_LIVE_MERGE_LOCK = threading.Lock()
 SERVER_LIVE_MERGE_REV = 0
 SERVER_LIVE_MERGE_LAST_MS = 0
+SERVER_MERGE_REJECT_COUNTS: dict[str, int] = {}
+SERVER_MERGE_SOURCE_PROFILES: dict[str, dict] = {}
+SERVER_MERGE_SOURCE_CALIBRATION: dict[str, dict] = {}
+SERVER_MERGE_REFINED_COUNT = 0
 SERVER_MERGE_LAST_DOC_WRITE_MS = 0  # update_time của lần GHI doc gần nhất ĐÃ gộp (chống bơm tàu ma khi radar chết)
 SERVER_LIVE_MERGE_TTL_MS = int(os.environ.get("SERVER_LIVE_MERGE_TTL_MS", "90000"))
 SERVER_MERGE_READ_INTERVAL_S = float(os.environ.get("SERVER_MERGE_READ_INTERVAL_S", "6"))
@@ -4468,10 +4472,29 @@ SERVER_MERGE_AIRBORNE_DIST_KM = float(os.environ.get("SERVER_MERGE_AIRBORNE_DIST
 # KHỬ GIẬT giữa 2 máy (CHỈ áp cho fix KHÁC NGUỒN — cùng nguồn tin trajectory của nó):
 #   - Chống TELEPORT: bước nhảy > MIN_M mà ngụ ý tốc độ > MAX_KT là bất khả thi → glitch FR24/coast, bỏ.
 SERVER_MERGE_TELEPORT_MIN_M = float(os.environ.get("SERVER_MERGE_TELEPORT_MIN_M", "3000"))
-SERVER_MERGE_MAX_AIR_SPEED_KT = float(os.environ.get("SERVER_MERGE_MAX_AIR_SPEED_KT", "900"))
+SERVER_MERGE_MAX_AIR_SPEED_KT = float(os.environ.get("SERVER_MERGE_MAX_AIR_SPEED_KT", "750"))
 #   - Không HẠ CẤP mịn→thô để đổi lấy chút tươi: fix THÔ (toạ độ rơi lưới 0.01° ~1.1km) không đè
 #     fix MỊN còn tươi trong ngần này → hết cảnh marker nhảy qua lại giữa vị trí thô/mịn 2 máy.
-SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "12000"))
+SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "90000"))
+SERVER_MERGE_TRUSTED_MAX_AGE_MS = int(os.environ.get("SERVER_MERGE_TRUSTED_MAX_AGE_MS", "120000"))
+SERVER_MERGE_SOURCE_HOLD_MS = int(os.environ.get("SERVER_MERGE_SOURCE_HOLD_MS", "90000"))
+SERVER_MERGE_QUALITY_SWITCH_MARGIN = int(os.environ.get("SERVER_MERGE_QUALITY_SWITCH_MARGIN", "15"))
+SERVER_MERGE_BATCH_MIN_ENTRIES = int(os.environ.get("SERVER_MERGE_BATCH_MIN_ENTRIES", "4"))
+SERVER_MERGE_BATCH_SHARE = float(os.environ.get("SERVER_MERGE_BATCH_SHARE", "0.60"))
+SERVER_MERGE_BATCH_CLOCK_WINDOW_MS = int(os.environ.get("SERVER_MERGE_BATCH_CLOCK_WINDOW_MS", "20000"))
+SERVER_MERGE_DUPLICATE_POSITION_M = float(os.environ.get("SERVER_MERGE_DUPLICATE_POSITION_M", "120"))
+SERVER_MERGE_FINE_RESIDUAL_M = float(os.environ.get("SERVER_MERGE_FINE_RESIDUAL_M", "3500"))
+SERVER_MERGE_COARSE_RESIDUAL_M = float(os.environ.get("SERVER_MERGE_COARSE_RESIDUAL_M", "6500"))
+SERVER_MERGE_ASSIST_START_MS = int(os.environ.get("SERVER_MERGE_ASSIST_START_MS", "45000"))
+SERVER_MERGE_ASSIST_MAX_AGE_MS = int(os.environ.get("SERVER_MERGE_ASSIST_MAX_AGE_MS", "240000"))
+SERVER_MERGE_ASSIST_MAX_RESIDUAL_M = float(os.environ.get("SERVER_MERGE_ASSIST_MAX_RESIDUAL_M", "12000"))
+SERVER_MERGE_CALIBRATION_MAX_LAG_MS = int(os.environ.get("SERVER_MERGE_CALIBRATION_MAX_LAG_MS", "150000"))
+SERVER_MERGE_CALIBRATION_STEP_MS = int(os.environ.get("SERVER_MERGE_CALIBRATION_STEP_MS", "5000"))
+SERVER_MERGE_CALIBRATION_MAX_RESIDUAL_M = float(os.environ.get("SERVER_MERGE_CALIBRATION_MAX_RESIDUAL_M", "2500"))
+SERVER_MERGE_CALIBRATION_MIN_SAMPLES = int(os.environ.get("SERVER_MERGE_CALIBRATION_MIN_SAMPLES", "3"))
+SERVER_MERGE_CALIBRATION_ALPHA = float(os.environ.get("SERVER_MERGE_CALIBRATION_ALPHA", "0.25"))
+SERVER_MERGE_TRACK_SOFT_CORRECTION_M = float(os.environ.get("SERVER_MERGE_TRACK_SOFT_CORRECTION_M", "1800"))
+SERVER_MERGE_TRACK_LIMIT_MAX_M = float(os.environ.get("SERVER_MERGE_TRACK_LIMIT_MAX_M", "25000"))
 SERVER_MERGE_GROUND_STATES = {"LANDED", "TAXIING", "PARKED"}
 SERVER_MERGE_AIR_STATES = {"EN_ROUTE", "APPROACH", "FINAL"}
 SERVER_MERGE_EMPTY_STATES = {"", "PENDING", "SCHEDULED", "LOST"}
@@ -4532,6 +4555,430 @@ def _merge_entry_is_coarse(entry: dict) -> bool:
     if lat is None or lng is None:
         return False
     return abs(lat * 100 - round(lat * 100)) < 1e-6 and abs(lng * 100 - round(lng * 100)) < 1e-6
+
+
+def _merge_snapshot_profile(
+    flights: dict,
+    doc_write_ms: int,
+    source: str,
+    vai_tro: str,
+) -> dict:
+    """Nhận diện chất lượng chung của một snapshot trước khi gộp từng chuyến.
+
+    Fetcher mới giữ timestamp telemetry riêng của từng tàu. Box/fetcher cũ thường đóng dấu
+    cùng một giây cho gần như toàn bộ tàu bằng giờ vừa quét. Dấu giờ kiểu đó chỉ là
+    ``received_at`` và không được dùng để thắng một fix telemetry thật.
+    """
+    positioned = 0
+    coarse = 0
+    timestamp_buckets: dict[int, int] = {}
+    if isinstance(flights, dict):
+        for entry in flights.values():
+            if not isinstance(entry, dict) or not _merge_entry_has_position(entry):
+                continue
+            state = _merge_entry_state(entry)
+            if state in SERVER_MERGE_EMPTY_STATES:
+                continue
+            positioned += 1
+            if _merge_entry_is_coarse(entry):
+                coarse += 1
+            ts = _entry_telemetry_ms(entry)
+            if ts > 0:
+                bucket = int(round(ts / 1000.0))
+                timestamp_buckets[bucket] = timestamp_buckets.get(bucket, 0) + 1
+
+    dominant_bucket = 0
+    dominant_count = 0
+    if timestamp_buckets:
+        dominant_bucket, dominant_count = max(timestamp_buckets.items(), key=lambda item: item[1])
+    dominant_ms = dominant_bucket * 1000 if dominant_bucket else 0
+    dominant_share = (dominant_count / positioned) if positioned else 0.0
+    source_lower = str(source or "").strip().lower()
+    batch_clock = source_lower.startswith("box-") or bool(
+        positioned >= SERVER_MERGE_BATCH_MIN_ENTRIES
+        and dominant_share >= SERVER_MERGE_BATCH_SHARE
+        and dominant_ms > 0
+        and abs(int(doc_write_ms or 0) - dominant_ms) <= SERVER_MERGE_BATCH_CLOCK_WINDOW_MS
+    )
+    return {
+        "source": str(source or ""),
+        "vai_tro": str(vai_tro or ""),
+        "positioned": positioned,
+        "coarse_share": (coarse / positioned) if positioned else 0.0,
+        "batch_clock": batch_clock,
+        "dominant_share": round(dominant_share, 3),
+        "doc_write_ms": int(doc_write_ms or 0),
+    }
+
+
+def _merge_entry_quality(entry: dict, inc_ts: int, now_ms: int, vai_tro: str, profile: dict) -> dict:
+    has_position = _merge_entry_has_position(entry)
+    coarse = _merge_entry_is_coarse(entry) if has_position else False
+    batch_clock = bool((profile or {}).get("batch_clock"))
+    time_trusted = bool(
+        inc_ts > 0
+        and not batch_clock
+        and inc_ts <= now_ms + SERVER_MERGE_BATCH_CLOCK_WINDOW_MS
+    )
+    role = str(vai_tro or "").strip().lower()
+    score = 0
+    if has_position:
+        score += 10
+        score += 40 if not coarse else 5
+    if time_trusted:
+        score += 30
+    if role == "chinh":
+        score += 25
+    elif role == "chinh-tam":
+        score += 10
+    if _merge_entry_state(entry) in SERVER_MERGE_AIR_STATES | SERVER_MERGE_GROUND_STATES:
+        score += 5
+    return {
+        "score": score,
+        "has_position": has_position,
+        "coarse": coarse,
+        "time_trusted": time_trusted,
+        "batch_clock": batch_clock,
+    }
+
+
+def _merge_entry_speed_kt(entry: dict) -> Optional[float]:
+    speed = _merge_float((entry or {}).get("ground_speed_kt"))
+    if speed is None or speed < 0:
+        return None
+    return min(speed, SERVER_MERGE_MAX_AIR_SPEED_KT)
+
+
+def _merge_project_entry(entry: dict, dt_ms: int) -> Optional[dict]:
+    """Chiếu fix hiện tại theo heading/speed để so residual với fix kế tiếp."""
+    if dt_ms <= 0 or dt_ms > 180_000:
+        return None
+    return _merge_project_entry_signed(entry, dt_ms, 180_000)
+
+
+def _merge_project_entry_signed(entry: dict, dt_ms: int, max_abs_ms: int = 240_000) -> Optional[dict]:
+    """Chiếu xuôi hoặc ngược quỹ đạo thẳng trong một cửa sổ ngắn."""
+    lat, lng = _merge_entry_lat_lng(entry)
+    heading = _merge_float((entry or {}).get("heading"))
+    speed_kt = _merge_entry_speed_kt(entry)
+    if lat is None or lng is None or heading is None or speed_kt is None:
+        return None
+    if abs(int(dt_ms)) > max_abs_ms:
+        return None
+    if dt_ms == 0:
+        return {"latitude": lat, "longitude": lng}
+    distance_km = speed_kt * (dt_ms / 3_600_000.0) * 1.852
+    angular = distance_km / 6371.0
+    bearing = math.radians(heading % 360.0)
+    lat1 = math.radians(lat)
+    lng1 = math.radians(lng)
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(angular)
+        + math.cos(lat1) * math.sin(angular) * math.cos(bearing)
+    )
+    lng2 = lng1 + math.atan2(
+        math.sin(bearing) * math.sin(angular) * math.cos(lat1),
+        math.cos(angular) - math.sin(lat1) * math.sin(lat2),
+    )
+    return {"latitude": math.degrees(lat2), "longitude": math.degrees(lng2)}
+
+
+def _merge_median(values: list[float]) -> Optional[float]:
+    clean = sorted(float(v) for v in values if math.isfinite(float(v)))
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
+def _merge_best_batch_lag(anchor_entry: dict, anchor_ts: int, raw_entry: dict, doc_write_ms: int) -> Optional[dict]:
+    """Tìm độ trễ của mẫu thô so với neo mịn bằng quỹ đạo ngắn hạn."""
+    if anchor_ts <= 0 or doc_write_ms <= 0 or not _merge_entry_has_position(raw_entry):
+        return None
+    best: Optional[dict] = None
+    step_ms = max(1000, SERVER_MERGE_CALIBRATION_STEP_MS)
+    for lag_ms in range(0, SERVER_MERGE_CALIBRATION_MAX_LAG_MS + 1, step_ms):
+        sample_ms = int(doc_write_ms) - lag_ms
+        projected = _merge_project_entry_signed(
+            anchor_entry,
+            sample_ms - int(anchor_ts),
+            SERVER_MERGE_ASSIST_MAX_AGE_MS,
+        )
+        if projected is None:
+            continue
+        residual_m = _merge_entry_distance_m(projected, raw_entry)
+        if residual_m is None:
+            continue
+        if best is None or residual_m < best["residual_m"]:
+            best = {"lag_ms": lag_ms, "residual_m": residual_m}
+    return best
+
+
+def _merge_learn_source_calibration_locked(
+    flights: dict,
+    doc_write_ms: int,
+    now_ms: int,
+    source: str,
+    profile: dict,
+) -> None:
+    """Học độ trễ của một radar batch từ các chuyến đang có neo telemetry mịn."""
+    if not source or not bool((profile or {}).get("batch_clock")) or not isinstance(flights, dict):
+        return
+    lag_samples: list[float] = []
+    residual_samples: list[float] = []
+    for code, raw_entry in flights.items():
+        if not isinstance(raw_entry, dict) or not _merge_entry_is_coarse(raw_entry):
+            continue
+        if _merge_entry_state(raw_entry) not in SERVER_MERGE_AIR_STATES:
+            continue
+        cur = SERVER_LIVE_MERGE.get(code)
+        if not cur or str(cur.get("source") or "") == source:
+            continue
+        cur_entry = cur.get("entry") or {}
+        cur_quality = cur.get("quality") or {}
+        anchor_ts = int(cur.get("ts") or 0)
+        if (
+            not bool(cur.get("time_trusted"))
+            or bool(cur_quality.get("coarse"))
+            or bool(cur_quality.get("estimated"))
+            or _merge_entry_state(cur_entry) not in SERVER_MERGE_AIR_STATES
+            or anchor_ts <= 0
+            or abs(int(doc_write_ms) - anchor_ts) > SERVER_MERGE_ASSIST_MAX_AGE_MS
+        ):
+            continue
+        estimate = _merge_best_batch_lag(cur_entry, anchor_ts, raw_entry, doc_write_ms)
+        if not estimate or estimate["residual_m"] > SERVER_MERGE_CALIBRATION_MAX_RESIDUAL_M:
+            continue
+        lag_samples.append(float(estimate["lag_ms"]))
+        residual_samples.append(float(estimate["residual_m"]))
+
+    if len(lag_samples) < SERVER_MERGE_CALIBRATION_MIN_SAMPLES:
+        return
+    lag_median = _merge_median(lag_samples)
+    residual_median = _merge_median(residual_samples)
+    if lag_median is None or residual_median is None:
+        return
+    old = SERVER_MERGE_SOURCE_CALIBRATION.get(source) or {}
+    old_lag = _merge_float(old.get("latency_ms"))
+    alpha = min(1.0, max(0.05, SERVER_MERGE_CALIBRATION_ALPHA))
+    learned_lag = lag_median if old_lag is None else old_lag + alpha * (lag_median - old_lag)
+    SERVER_MERGE_SOURCE_CALIBRATION[source] = {
+        "latency_ms": int(round(learned_lag)),
+        "last_batch_latency_ms": int(round(lag_median)),
+        "residual_m": int(round(residual_median)),
+        "batch_samples": len(lag_samples),
+        "learning_rounds": int(old.get("learning_rounds") or 0) + 1,
+        "last_seen_ms": int(now_ms),
+    }
+
+
+def _merge_refine_aux_entry(
+    cur: Optional[dict],
+    entry: dict,
+    inc_ts: int,
+    now_ms: int,
+    doc_write_ms: int,
+    source: str,
+    profile: dict,
+) -> Optional[tuple[dict, int, dict]]:
+    """Biến fix thô thành estimate mịn liên tục, nhưng vẫn công khai là estimated."""
+    if not cur or not _merge_entry_has_position(entry):
+        return None
+    if not (_merge_entry_is_coarse(entry) or bool((profile or {}).get("batch_clock"))):
+        return None
+    cur_entry = cur.get("entry") or {}
+    if not _merge_entry_has_position(cur_entry):
+        return None
+    if _merge_entry_state(entry) not in SERVER_MERGE_AIR_STATES or _merge_entry_state(cur_entry) not in SERVER_MERGE_AIR_STATES:
+        return None
+
+    cur_quality = cur.get("quality") or {}
+    cur_accepted_ms = int(cur.get("accepted_ms") or 0)
+    cur_age_ms = now_ms - cur_accepted_ms if cur_accepted_ms else SERVER_MERGE_ASSIST_MAX_AGE_MS + 1
+    continuing_estimate = bool(cur_quality.get("estimated"))
+    if not continuing_estimate and cur_age_ms < SERVER_MERGE_ASSIST_START_MS:
+        return None
+    if cur_age_ms > SERVER_MERGE_ASSIST_MAX_AGE_MS:
+        return None
+
+    batch_clock = bool((profile or {}).get("batch_clock"))
+    calibration = SERVER_MERGE_SOURCE_CALIBRATION.get(source) or {}
+    learned_lag_ms = int(calibration.get("latency_ms") or 0) if batch_clock else 0
+    target_ms = int(doc_write_ms or now_ms) - learned_lag_ms if batch_clock else int(inc_ts or doc_write_ms or now_ms)
+    cur_ts = int(cur.get("ts") or cur.get("doc_write_ms") or cur_accepted_ms or 0)
+    if target_ms <= 0 or cur_ts <= 0 or target_ms <= cur_ts:
+        return None
+    predicted = _merge_project_entry_signed(cur_entry, target_ms - cur_ts, SERVER_MERGE_ASSIST_MAX_AGE_MS)
+    if predicted is None:
+        return None
+    residual_m = _merge_entry_distance_m(predicted, entry)
+    if residual_m is None or residual_m > SERVER_MERGE_ASSIST_MAX_RESIDUAL_M:
+        return None
+
+    if continuing_estimate:
+        measurement_weight = 0.35
+    else:
+        span = max(1, SERVER_MERGE_ASSIST_MAX_AGE_MS - SERVER_MERGE_ASSIST_START_MS)
+        measurement_weight = 0.12 + 0.38 * min(1.0, max(0.0, (cur_age_ms - SERVER_MERGE_ASSIST_START_MS) / span))
+    pred_lat, pred_lng = _merge_entry_lat_lng(predicted)
+    raw_lat, raw_lng = _merge_entry_lat_lng(entry)
+    if pred_lat is None or pred_lng is None or raw_lat is None or raw_lng is None:
+        return None
+
+    out = dict(entry)
+    out["latitude"] = pred_lat + measurement_weight * (raw_lat - pred_lat)
+    out["longitude"] = pred_lng + measurement_weight * (raw_lng - pred_lng)
+    out["updated_at_millis"] = target_ms
+    out["last_seen_millis"] = target_ms
+    out["server_seen_millis"] = int(doc_write_ms or now_ms)
+    out["merge_refined"] = True
+    out["merge_raw_position_quality"] = "coarse"
+    out["merge_refine_weight"] = round(measurement_weight, 3)
+    out["merge_refine_residual_m"] = int(round(residual_m))
+    out["merge_calibrated_lag_ms"] = learned_lag_ms
+    quality = _merge_entry_quality(out, target_ms, now_ms, "", profile or {})
+    quality.update({"estimated": True, "assisted": True, "coarse": False, "raw_coarse": True})
+    quality["score"] = min(int(quality.get("score") or 0), 75 if quality.get("time_trusted") else 60)
+    return out, target_ms, quality
+
+
+def _merge_limit_track_correction(
+    cur: Optional[dict],
+    entry: dict,
+    inc_ts: int,
+    now_ms: int,
+    vai_tro: str,
+    profile: dict,
+    quality: dict,
+) -> Optional[tuple[dict, int, dict]]:
+    """Giới hạn phần hiệu chỉnh tức thời khi telemetry mịn tái bắt quỹ đạo.
+
+    Quãng đường tàu thật bay giữa hai timestamp được giữ nguyên; chỉ residual
+    giữa vị trí dự đoán và fix mới bị giới hạn. Nhờ vậy marker không snap 3-5km
+    khi đổi hai nguồn đều có dữ liệu tốt, nhưng vẫn hội tụ dần về fix thật.
+    """
+    if not cur or bool(quality.get("assisted")):
+        return None
+    if not bool(quality.get("time_trusted")):
+        return None
+    cur_entry = cur.get("entry") or {}
+    if _merge_entry_state(entry) not in SERVER_MERGE_AIR_STATES or _merge_entry_state(cur_entry) not in SERVER_MERGE_AIR_STATES:
+        return None
+    if not _merge_entry_has_position(entry) or not _merge_entry_has_position(cur_entry):
+        return None
+    cur_ts = int(cur.get("ts") or 0)
+    if cur_ts <= 0 or inc_ts < cur_ts:
+        return None
+    compare_ms = max(int(inc_ts), int(now_ms))
+    predicted = _merge_project_entry_signed(
+        cur_entry,
+        compare_ms - cur_ts,
+        SERVER_MERGE_ASSIST_MAX_AGE_MS,
+    )
+    incoming_display = _merge_project_entry_signed(
+        entry,
+        compare_ms - inc_ts,
+        SERVER_MERGE_ASSIST_MAX_AGE_MS,
+    )
+    if predicted is None or incoming_display is None:
+        return None
+    residual_m = _merge_entry_distance_m(predicted, incoming_display)
+    if (
+        residual_m is None
+        or residual_m <= SERVER_MERGE_TRACK_SOFT_CORRECTION_M
+        or residual_m > SERVER_MERGE_TRACK_LIMIT_MAX_M
+    ):
+        return None
+    pred_lat, pred_lng = _merge_entry_lat_lng(predicted)
+    display_lat, display_lng = _merge_entry_lat_lng(incoming_display)
+    raw_lat, raw_lng = _merge_entry_lat_lng(entry)
+    if (
+        pred_lat is None or pred_lng is None
+        or display_lat is None or display_lng is None
+        or raw_lat is None or raw_lng is None
+    ):
+        return None
+    correction_weight = SERVER_MERGE_TRACK_SOFT_CORRECTION_M / residual_m
+    out = dict(entry)
+    desired_display_lat = pred_lat + correction_weight * (display_lat - pred_lat)
+    desired_display_lng = pred_lng + correction_weight * (display_lng - pred_lng)
+    out["latitude"] = raw_lat + (desired_display_lat - display_lat)
+    out["longitude"] = raw_lng + (desired_display_lng - display_lng)
+    out["merge_track_limited"] = True
+    out["merge_track_raw_residual_m"] = int(round(residual_m))
+    out["merge_track_correction_m"] = int(round(SERVER_MERGE_TRACK_SOFT_CORRECTION_M))
+    limited_quality = dict(quality)
+    limited_quality["estimated"] = True
+    limited_quality["track_limited"] = True
+    limited_quality["raw_coarse"] = bool(quality.get("coarse"))
+    limited_quality["coarse"] = False
+    limited_quality["score"] = max(0, int(limited_quality.get("score") or 0) - 10)
+    return out, inc_ts, limited_quality
+
+
+def _merge_motion_reject_reason(cur_entry: dict, entry: dict, dt_ms: int) -> Optional[str]:
+    """Chặn bước nhảy phi vật lý cho CẢ cùng nguồn lẫn khác nguồn."""
+    if dt_ms <= 0:
+        return None
+    jump_m = _merge_entry_distance_m(cur_entry, entry)
+    if jump_m is None or jump_m <= SERVER_MERGE_TELEPORT_MIN_M:
+        return None
+
+    if _merge_entry_is_ground(cur_entry) and _merge_entry_is_ground(entry):
+        reported_ground_kt = max(
+            _merge_entry_speed_kt(cur_entry) or 0.0,
+            _merge_entry_speed_kt(entry) or 0.0,
+        )
+        plausible_ground_m = (
+            reported_ground_kt * 1.852 * (dt_ms / 3_600_000.0) * 1000.0
+            + SERVER_MERGE_MAX_GROUND_JUMP_M
+        )
+        if jump_m > max(800.0, plausible_ground_m):
+            return "ground-teleport"
+
+    coarse = _merge_entry_is_coarse(cur_entry) or _merge_entry_is_coarse(entry)
+    uncertainty_m = 2200.0 if coarse else 500.0
+    effective_jump_m = max(0.0, jump_m - uncertainty_m)
+    implied_kt = (effective_jump_m / 1852.0) / (dt_ms / 3_600_000.0)
+    reported = max(
+        _merge_entry_speed_kt(cur_entry) or 0.0,
+        _merge_entry_speed_kt(entry) or 0.0,
+    )
+    allowed_kt = min(SERVER_MERGE_MAX_AIR_SPEED_KT, max(350.0, reported + 120.0))
+    if implied_kt > allowed_kt:
+        return "teleport-speed"
+
+    predicted = _merge_project_entry(cur_entry, dt_ms)
+    if predicted is not None:
+        residual_m = _merge_entry_distance_m(predicted, entry)
+        residual_limit = SERVER_MERGE_COARSE_RESIDUAL_M if coarse else SERVER_MERGE_FINE_RESIDUAL_M
+        # Chỉ dùng residual làm cổng thứ hai khi tốc độ thô cũng đã đáng ngờ; tránh chặn
+        # một cú rẽ hợp lệ chỉ vì heading cũ chưa kịp đổi.
+        if residual_m is not None and residual_m > residual_limit and implied_kt > allowed_kt * 0.85:
+            return "teleport-trajectory"
+    return None
+
+
+def _merge_same_batch_sample(cur_entry: dict, entry: dict) -> bool:
+    """True khi fetcher chỉ đóng dấu lại đúng mẫu cũ bằng giờ tường mới."""
+    distance_m = _merge_entry_distance_m(cur_entry, entry)
+    if distance_m is None or distance_m > SERVER_MERGE_DUPLICATE_POSITION_M:
+        return False
+    if _merge_entry_state(cur_entry) != _merge_entry_state(entry):
+        return False
+    for key, tolerance in (("ground_speed_kt", 8.0), ("altitude_ft", 300.0), ("heading", 8.0)):
+        old_value = _merge_float((cur_entry or {}).get(key))
+        new_value = _merge_float((entry or {}).get(key))
+        if old_value is None or new_value is None:
+            continue
+        delta = abs(new_value - old_value)
+        if key == "heading":
+            delta = min(delta, 360.0 - delta)
+        if delta > tolerance:
+            return False
+    return True
 
 
 def _merge_entry_distance_m(a: dict, b: dict) -> Optional[float]:
@@ -4599,7 +5046,13 @@ def _merge_entry_airborne_override(entry: dict) -> bool:
     )
 
 
-def _merge_entry_for_store(entry: dict, source: str, vai_tro: str, reason: str) -> dict:
+def _merge_entry_for_store(
+    entry: dict,
+    source: str,
+    vai_tro: str,
+    reason: str,
+    quality: Optional[dict] = None,
+) -> dict:
     out = dict(entry)
     if source:
         out["merge_source"] = source
@@ -4607,31 +5060,73 @@ def _merge_entry_for_store(entry: dict, source: str, vai_tro: str, reason: str) 
         out["merge_vai_tro"] = vai_tro
     if reason:
         out["merge_reason"] = reason
+    if quality:
+        out["merge_quality_score"] = int(quality.get("score") or 0)
+        if quality.get("estimated"):
+            out["merge_position_quality"] = "estimated"
+            out["merge_time_quality"] = "estimated"
+        else:
+            out["merge_position_quality"] = "coarse" if quality.get("coarse") else "fine"
+            out["merge_time_quality"] = "telemetry" if quality.get("time_trusted") else "fetch-time"
     return out
 
 
-def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, now_ms: int, source: str) -> tuple[bool, str]:
+def _merge_should_accept_entry(
+    cur: Optional[dict],
+    entry: dict,
+    inc_ts: int,
+    now_ms: int,
+    source: str,
+    vai_tro: str = "",
+    doc_write_ms: int = 0,
+    profile: Optional[dict] = None,
+    inc_quality_override: Optional[dict] = None,
+) -> tuple[bool, str]:
+    inc_quality = inc_quality_override or _merge_entry_quality(entry, inc_ts, now_ms, vai_tro, profile or {})
+    inc_state = _merge_entry_state(entry)
+
+    # Fix telemetry thật nhưng đã quá cũ không được hồi sinh chỉ vì một máy vừa ghi lại snapshot.
+    # Đây là nguồn của các cú nhảy riêng lẻ 50-100km khi tàu LOST cũ bỗng thắng newest-wins.
+    if (
+        inc_quality["has_position"]
+        and inc_quality["time_trusted"]
+        and inc_state not in SERVER_MERGE_EMPTY_STATES
+        and now_ms - inc_ts > SERVER_MERGE_TRUSTED_MAX_AGE_MS
+    ):
+        return False, "stale-telemetry"
+
     if cur is None:
         return True, "new"
 
     cur_entry = cur.get("entry") or {}
     cur_ts = int(cur.get("ts") or 0)
     cur_source = str(cur.get("source") or "")
+    cur_role = str(cur.get("vai_tro") or "")
     cur_accepted_ms = int(cur.get("accepted_ms") or cur.get("seen_ms") or 0)
+    cur_doc_write_ms = int(cur.get("doc_write_ms") or cur_accepted_ms or 0)
     cur_state = _merge_entry_state(cur_entry)
-    inc_state = _merge_entry_state(entry)
+    cur_quality = cur.get("quality") or _merge_entry_quality(
+        cur_entry,
+        cur_ts,
+        now_ms,
+        cur_role,
+        {"batch_clock": not bool(cur.get("time_trusted", True))},
+    )
+    cur_time_trusted = bool(cur.get("time_trusted", cur_quality.get("time_trusted")))
+    same_source = bool(source and cur_source and source == cur_source)
 
     if inc_ts <= 0 and cur_ts > 0:
         return False, "no-telemetry"
     if cur_ts <= 0:
         return True, "replace-empty-current"
-    if inc_ts < cur_ts:
+    # Chỉ so timestamp trực tiếp khi CẢ HAI là telemetry thật. Dấu giờ theo lô chỉ là
+    # giờ fetch, không có quyền thắng/thua một mốc FR24 thật.
+    if inc_quality["time_trusted"] and cur_time_trusted and inc_ts < cur_ts:
         return False, "older-telemetry"
+
     if inc_state in SERVER_MERGE_EMPTY_STATES:
         if inc_ts <= 0:
             return False, "empty-state"
-        # Một máy có thể MISS/LOST khi máy khác vẫn đang thấy tàu. Khi nguồn hiện tại
-        # còn tươi thì không cho trạng thái rỗng từ nguồn khác làm mất marker.
         if (
             source and cur_source and source != cur_source
             and cur_accepted_ms
@@ -4639,27 +5134,58 @@ def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, no
         ):
             return False, "empty-state-source-lock"
 
-    # Cùng một máy tự sửa trạng thái của chính nó thì cho đi qua: đây là cách giữ
-    # được logic provisional PARKED -> TAXIING khi tàu chỉ dừng tạm trên taxiway.
-    # (Cùng nguồn = tin trajectory của máy đó — không áp luật chống-teleport/giữ-mịn bên dưới.)
-    if source and cur_source and source == cur_source:
-        return True, "same-source"
+    # Fetcher cũ/box có thể trả nguyên vị trí cũ nhưng đóng timestamp=now. Không nhận lại mẫu
+    # này, nếu không web tưởng có telemetry mới rồi dựng lại plan từ một neo đã đứng im.
+    if (
+        same_source
+        and not inc_quality["time_trusted"]
+        and _merge_same_batch_sample(cur_entry, entry)
+    ):
+        return False, "duplicate-fetch-snapshot"
 
-    # ── KHỬ GIẬT giữa 2 máy KHÁC NGUỒN (nguồn chính gây "nhảy nhiều vị trí") ──
-    # (1) Chống TELEPORT: bước nhảy lớn mà ngụ ý tốc độ bất khả thi so với vị trí đang giữ
-    #     → glitch/coast của FR24, KHÔNG cho làm marker teleport. Bỏ qua nếu Δt ≤ 0.
-    if inc_ts > cur_ts:
-        jump_m = _merge_entry_distance_m(cur_entry, entry)
-        if jump_m is not None and jump_m > SERVER_MERGE_TELEPORT_MIN_M:
-            dt_ms = inc_ts - cur_ts
-            implied_kt = (jump_m / 1852.0) / (dt_ms / 3_600_000.0)
-            if implied_kt > SERVER_MERGE_MAX_AIR_SPEED_KT:
-                return False, "teleport-outlier"
+    cur_accept_age_ms = now_ms - cur_accepted_ms if cur_accepted_ms else 10**12
+    cur_telemetry_fresh = not cur_time_trusted or (
+        cur_ts > 0 and now_ms - cur_ts <= SERVER_MERGE_TRUSTED_MAX_AGE_MS
+    )
+    cur_preferred_fresh = cur_accept_age_ms <= SERVER_MERGE_SOURCE_HOLD_MS and cur_telemetry_fresh
+
+    # Nguồn tốt đang tươi được giữ theo TỪNG CHUYẾN: chính+mịn+telemetry thật thắng box/thô,
+    # không phụ thuộc máy nào vừa ghi đè radarLive/current sau cùng.
+    cur_score = int(cur_quality.get("score") or 0)
+    inc_score = int(inc_quality.get("score") or 0)
+    assisted_fallback = bool(inc_quality.get("assisted")) and (
+        bool(cur_quality.get("estimated")) or cur_accept_age_ms >= SERVER_MERGE_ASSIST_START_MS
+    )
+    if (
+        not assisted_fallback
+        and cur_preferred_fresh
+        and cur_score >= inc_score + SERVER_MERGE_QUALITY_SWITCH_MARGIN
+    ):
+        return False, "prefer-higher-quality-source"
 
     cur_ground = _merge_entry_is_ground(cur_entry)
     inc_ground = _merge_entry_is_ground(entry)
     cur_parked = _merge_entry_is_parked(cur_entry)
     inc_parked = _merge_entry_is_parked(entry)
+
+    # Giữ fix mịn theo tuổi NHẬN THỰC TẾ, không lấy hiệu timestamp giả của box - timestamp thật.
+    if (
+        not assisted_fallback
+        and not cur_ground and not inc_ground
+        and inc_quality["coarse"] and not cur_quality.get("coarse")
+        and cur_accept_age_ms <= SERVER_MERGE_FINE_HOLD_MS
+    ):
+        return False, "keep-fine-over-coarse"
+
+    # Cổng chuyển động áp dụng cho CẢ CÙNG NGUỒN. Với timestamp giả dùng thời điểm Firestore
+    # nhận snapshot để không cho một batch cache nhảy 10-40km trong vài giây.
+    if inc_quality["time_trusted"] and cur_time_trusted and inc_ts > cur_ts:
+        motion_dt_ms = inc_ts - cur_ts
+    else:
+        motion_dt_ms = int(doc_write_ms or now_ms) - cur_doc_write_ms
+    motion_reject = _merge_motion_reject_reason(cur_entry, entry, motion_dt_ms)
+    if motion_reject:
+        return False, motion_reject
 
     if cur_ground and _merge_entry_airborne_override(entry) and not cur_parked:
         return True, "airborne-override"
@@ -4685,14 +5211,12 @@ def _merge_should_accept_entry(cur: Optional[dict], entry: dict, inc_ts: int, no
             if source and cur_source and source != cur_source and parked_age_ms <= SERVER_MERGE_GROUND_LOCK_MS:
                 return False, "parked-sticky"
 
-    # (2) Trên KHÔNG: KHÔNG hạ cấp mịn→thô để đổi lấy chút tươi. Fix THÔ không đè fix MỊN còn
-    #     tươi trong SERVER_MERGE_FINE_HOLD_MS → hết nhảy qua lại giữa vị trí thô/mịn của 2 máy.
-    #     (Cùng độ chính xác thì "mới nhất thắng" như cũ. Thô quá cũ mới cho thô mới đè.)
-    if not cur_ground and not inc_ground:
-        if _merge_entry_is_coarse(entry) and not _merge_entry_is_coarse(cur_entry) \
-                and (inc_ts - cur_ts) < SERVER_MERGE_FINE_HOLD_MS:
-            return False, "keep-fine-over-coarse"
-
+    if assisted_fallback:
+        return True, "assisted-fallback"
+    if same_source:
+        return True, "same-source-validated"
+    if inc_score >= cur_score + SERVER_MERGE_QUALITY_SWITCH_MARGIN:
+        return True, "quality-upgrade"
     return True, "newer-telemetry"
 
 
@@ -4755,34 +5279,94 @@ def _merge_live_snapshot_into_store(
       để chống 2 máy ghi PARKED/TAXIING lệch vị trí làm web nhảy loạn.
     - Entry rỗng/PENDING (không mốc) KHÔNG đè được mã đang có vị trí."""
     global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS, SERVER_MERGE_LAST_DOC_WRITE_MS
+    global SERVER_MERGE_REFINED_COUNT
     changed = False
     source_label = str(source or "").strip()
     role_label = str(vai_tro or "").strip()
+    profile = _merge_snapshot_profile(flights, doc_write_ms, source_label, role_label)
     with SERVER_LIVE_MERGE_LOCK:
         is_new_write = bool(doc_write_ms) and doc_write_ms != SERVER_MERGE_LAST_DOC_WRITE_MS
         if is_new_write and isinstance(flights, dict):
             SERVER_MERGE_LAST_DOC_WRITE_MS = doc_write_ms
+            if source_label:
+                SERVER_MERGE_SOURCE_PROFILES[source_label] = dict(profile, last_seen_ms=now_ms)
+            _merge_learn_source_calibration_locked(
+                flights,
+                doc_write_ms,
+                now_ms,
+                source_label,
+                profile,
+            )
             for code, entry in flights.items():
                 if not isinstance(entry, dict):
                     continue
                 inc_ts = _entry_telemetry_ms(entry)
+                quality = _merge_entry_quality(entry, inc_ts, now_ms, role_label, profile)
                 cur = SERVER_LIVE_MERGE.get(code)
-                accept, reason = _merge_should_accept_entry(cur, entry, inc_ts, now_ms, source_label)
+                refined = _merge_refine_aux_entry(
+                    cur,
+                    entry,
+                    inc_ts,
+                    now_ms,
+                    doc_write_ms,
+                    source_label,
+                    profile,
+                )
+                if refined is not None:
+                    entry, inc_ts, quality = refined
+                limited = _merge_limit_track_correction(
+                    cur,
+                    entry,
+                    inc_ts,
+                    now_ms,
+                    role_label,
+                    profile,
+                    quality,
+                )
+                if limited is not None:
+                    entry, inc_ts, quality = limited
+                accept, reason = _merge_should_accept_entry(
+                    cur,
+                    entry,
+                    inc_ts,
+                    now_ms,
+                    source_label,
+                    role_label,
+                    doc_write_ms,
+                    profile,
+                    quality,
+                )
                 if accept:
                     SERVER_LIVE_MERGE[code] = {
-                        "entry": _merge_entry_for_store(entry, source_label, role_label, reason),
+                        "entry": _merge_entry_for_store(entry, source_label, role_label, reason, quality),
                         "ts": inc_ts,
                         "seen_ms": now_ms,
                         "accepted_ms": now_ms,
+                        "doc_write_ms": int(doc_write_ms or now_ms),
                         "source": source_label,
                         "vai_tro": role_label,
+                        "quality": quality,
+                        "time_trusted": bool(quality.get("time_trusted")),
                     }
+                    if quality.get("estimated"):
+                        SERVER_MERGE_REFINED_COUNT += 1
                     changed = True
                 else:
-                    cur["seen_ms"] = now_ms  # mã vẫn được report (dù ảnh cũ hơn) → giữ tươi
-                    cur["last_reject_reason"] = reason
-                    cur["last_reject_source"] = source_label
-                    cur["last_reject_ms"] = now_ms
+                    # Không cho mẫu đứng im/stale/teleport cứ được đóng dấu lại để giữ tàu ma mãi.
+                    if cur is not None:
+                        if reason not in {
+                            "stale-telemetry",
+                            "older-telemetry",
+                            "duplicate-fetch-snapshot",
+                            "teleport-speed",
+                            "teleport-trajectory",
+                            "ground-teleport",
+                        }:
+                            cur["seen_ms"] = now_ms
+                        cur["last_reject_reason"] = reason
+                        cur["last_reject_source"] = source_label
+                        cur["last_reject_ms"] = now_ms
+                    SERVER_MERGE_REJECT_COUNTS[reason] = SERVER_MERGE_REJECT_COUNTS.get(reason, 0) + 1
         # LUÔN dọn mã quá hạn (chạy mọi lần gọi, kể cả khi không có ghi mới).
         for code in [c for c, v in SERVER_LIVE_MERGE.items()
                      if now_ms - v["seen_ms"] > SERVER_LIVE_MERGE_TTL_MS]:
@@ -5419,6 +6003,10 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
 @app.route("/", methods=["GET"])
 def health():
     """Health check public (không yêu cầu API key) để cron-job.org ping keep-alive."""
+    with SERVER_LIVE_MERGE_LOCK:
+        merge_reject_counts = dict(SERVER_MERGE_REJECT_COUNTS)
+        merge_source_profiles = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_PROFILES.items()}
+        merge_source_calibration = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_CALIBRATION.items()}
     with _lock:
         return jsonify({
             "status": "ok",
@@ -5439,6 +6027,11 @@ def health():
             "merge_revision": SERVER_LIVE_MERGE_REV,
             "merge_last_ms": SERVER_LIVE_MERGE_LAST_MS,
             "merge_read_interval_s": SERVER_MERGE_READ_INTERVAL_S,
+            "merge_policy": "quality-first-fusion-v3",
+            "merge_reject_counts": merge_reject_counts,
+            "merge_source_profiles": merge_source_profiles,
+            "merge_source_calibration": merge_source_calibration,
+            "merge_refined_count": SERVER_MERGE_REFINED_COUNT,
             "server_time_millis": int(time.time() * 1000),
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
