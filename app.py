@@ -37,7 +37,7 @@ from FlightRadar24 import FlightRadar24API
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 import base64
@@ -50,6 +50,14 @@ import os
 import random
 import threading
 import time
+import urllib.error
+import urllib.request
+import zlib
+
+try:
+    from radar_ink_map import RadarInkMap, RadarInkOutbox, SCHEMA as RADAR_INK_SCHEMA
+except ImportError:  # Cho phép import dạng package trong bộ test.
+    from .radar_ink_map import RadarInkMap, RadarInkOutbox, SCHEMA as RADAR_INK_SCHEMA
 
 try:
     import firebase_admin
@@ -538,6 +546,47 @@ FLOW_GRID_LOADED = False
 LAST_FLOW_GRID_LOAD_MS = 0
 LAST_FLOW_GRID_PERSIST_MS = 0
 _flow_lock = threading.Lock()
+
+# ── BẢN ĐỒ "CHẤM MỰC" ONLINE ────────────────────────────────────────────────
+# Fetcher tận dụng toàn bộ details.trail đã có sẵn (không gọi FR24 thêm), lưu vào
+# outbox SQLite rồi POST lên Render. Server online tạo đồ thị nhiều nhánh, tự chấm
+# bằng fix kế tiếp và chỉ cấp guidance cho web khi đã tốt hơn bay thẳng đủ mẫu.
+RADAR_INK_ENABLED = os.environ.get("RADAR_INK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+RADAR_INK_ONLINE_URL = os.environ.get("RADAR_INK_ONLINE_URL", "https://api-don-tau.onrender.com").rstrip("/")
+RADAR_INK_OUTBOX_PATH = os.environ.get(
+    "RADAR_INK_OUTBOX_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "radarInkOutbox.sqlite3"),
+)
+RADAR_INK_META_DOC = os.environ.get("RADAR_INK_META_DOC", "config/radarInkMapV1")
+RADAR_INK_SHARD_COLLECTION = os.environ.get("RADAR_INK_SHARD_COLLECTION", "radarInkMapV1")
+# 128 shard để atlas có thể học lâu năm mà mỗi document vẫn cách xa trần 1 MiB.
+# Mỗi batch tối đa 129 writes (128 shard + meta), vẫn dưới giới hạn 500 của Firestore.
+RADAR_INK_SHARD_COUNT = max(8, int(os.environ.get("RADAR_INK_SHARD_COUNT", "128")))
+RADAR_INK_RELOAD_MS = int(os.environ.get("RADAR_INK_RELOAD_MS", str(6 * 3600 * 1000)))
+RADAR_INK_PERSIST_MS = int(os.environ.get("RADAR_INK_PERSIST_MS", str(5 * 60 * 1000)))
+RADAR_INK_UPLOAD_TIMEOUT_S = float(os.environ.get("RADAR_INK_UPLOAD_TIMEOUT_S", "15"))
+RADAR_INK_UPLOAD_MAX_POINTS = int(os.environ.get("RADAR_INK_UPLOAD_MAX_POINTS", "2500"))
+# Kho vệt thật để mở lại từng chuyến và đối chiếu với atlas. Điểm được nén zlib+base64,
+# một document/chuyến nên giữ lâu vẫn nhẹ hơn lưu từng fix thành document riêng.
+RADAR_TRACK_ARCHIVE_COLLECTION = os.environ.get("RADAR_TRACK_ARCHIVE_COLLECTION", "radarTrackArchiveV1")
+RADAR_TRACK_LOOKUP_COLLECTION = os.environ.get("RADAR_TRACK_LOOKUP_COLLECTION", "radarTrackLookupV1")
+RADAR_TRACK_ARCHIVE_MAX_POINTS = max(300, int(os.environ.get("RADAR_TRACK_ARCHIVE_MAX_POINTS", "2400")))
+RADAR_TRACK_WEB_MAX_POINTS = max(200, int(os.environ.get("RADAR_TRACK_WEB_MAX_POINTS", "900")))
+# Mỗi vết thường làm bẩn nhiều shard. 15 phút vẫn đủ tươi cho học, đồng thời giữ
+# tổng write Firestore an toàn khi nhiều máy radar cùng chạy trên quota Spark.
+RADAR_INK_UPLOAD_MIN_MS = int(os.environ.get("RADAR_INK_UPLOAD_MIN_MS", str(15 * 60 * 1000)))
+RADAR_INK_MAP = RadarInkMap(RADAR_INK_SHARD_COUNT)
+RADAR_INK_LOADED = False
+RADAR_INK_ACTIVE_SHARDS: set[int] = set()
+LAST_RADAR_INK_LOAD_MS = 0
+LAST_RADAR_INK_PERSIST_MS = 0
+LAST_RADAR_INK_UPLOAD_MS = 0
+LAST_RADAR_INK_SUCCESS_MS = 0
+LAST_RADAR_INK_ERROR: Optional[str] = None
+_radar_ink_outbox_instance: Optional[RadarInkOutbox] = None
+_radar_ink_outbox_lock = threading.Lock()
+_radar_ink_flush_lock = threading.Lock()
+_radar_ink_update_lock = threading.RLock()
 _FIRESTORE_CLIENT = None
 ETAS_REVISION = 0
 ETAS_INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
@@ -2118,6 +2167,493 @@ def _maybe_persist_flow_grid(force: bool = False) -> None:
         log.info("Flow-grid: đã ghi %d ô vào %s (rev=%d)", len(cells_out), FLOW_GRID_DOC, rev)
     except Exception as e:
         log.warning("persist flow grid failed: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BẢN ĐỒ "CHẤM MỰC" ONLINE — trail thật → đồ thị nhiều nhánh → guidance cho web
+# ═══════════════════════════════════════════════════════════════════════════════
+def _radar_ink_shard_doc_id(shard: int) -> str:
+    return f"shard_{int(shard):02d}"
+
+
+def _refresh_radar_ink_map_from_firestore_locked(force: bool = False) -> None:
+    """Server online nạp atlas đã học; web/fetcher không tự đọc Firestore."""
+    global RADAR_INK_LOADED, RADAR_INK_ACTIVE_SHARDS, LAST_RADAR_INK_LOAD_MS, LAST_RADAR_INK_ERROR
+    if not RADAR_INK_ENABLED or RADAR_ROLE != "server":
+        return
+    now_ms = int(time.time() * 1000)
+    if not (force or not RADAR_INK_LOADED or now_ms - LAST_RADAR_INK_LOAD_MS >= RADAR_INK_RELOAD_MS):
+        return
+    # Không nạp đè atlas đang có phần chưa ghi; chờ lượt persist trước.
+    if RADAR_INK_MAP.dirty_shards() and not force:
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        col, _, doc = RADAR_INK_META_DOC.partition("/")
+        snap = db.collection(col).document(doc).get()
+        meta = (snap.to_dict() or {}) if snap.exists else {}
+        LAST_RADAR_INK_LOAD_MS = now_ms
+        RADAR_INK_LOADED = True
+        if not meta or meta.get("schema") != RADAR_INK_SCHEMA:
+            RADAR_INK_ACTIVE_SHARDS = set()
+            log.info("Radar-ink: chưa có atlas online, bắt đầu bản đồ trắng")
+            return
+        shard_count = max(8, int(meta.get("shard_count") or RADAR_INK_SHARD_COUNT))
+        active = {
+            int(value) for value in (meta.get("active_shards") or range(shard_count))
+            if isinstance(value, (int, float)) and 0 <= int(value) < shard_count
+        }
+        refs = [db.collection(RADAR_INK_SHARD_COLLECTION).document(_radar_ink_shard_doc_id(shard)) for shard in sorted(active)]
+        docs = []
+        if refs:
+            for shard_snap in db.get_all(refs):
+                if shard_snap.exists:
+                    docs.append(shard_snap.to_dict() or {})
+        if RADAR_INK_MAP.load_documents(meta, docs):
+            RADAR_INK_ACTIVE_SHARDS = active
+            LAST_RADAR_INK_ERROR = None
+            stats = RADAR_INK_MAP.stats()
+            log.info(
+                "Radar-ink: nạp %d node/%d edge, rev=%d, shards=%d",
+                stats.get("node_count"), stats.get("edge_count"), stats.get("rev"), len(active),
+            )
+    except Exception as error:
+        LAST_RADAR_INK_ERROR = str(error)
+        log.warning("Radar-ink load failed: %s", error)
+
+
+def _refresh_radar_ink_map_from_firestore(force: bool = False) -> None:
+    # Không cho lượt reload 6 giờ ghi đè một batch ingest vừa tới giữa chừng.
+    with _radar_ink_update_lock:
+        _refresh_radar_ink_map_from_firestore_locked(force)
+
+
+def _maybe_persist_radar_ink_map_locked(force: bool = False) -> None:
+    """Ghi riêng shard bẩn, tối đa mỗi 5 phút để giữ quota Spark thấp."""
+    global LAST_RADAR_INK_PERSIST_MS, LAST_RADAR_INK_ERROR, RADAR_INK_ACTIVE_SHARDS
+    if not RADAR_INK_ENABLED or RADAR_ROLE != "server":
+        return
+    dirty = RADAR_INK_MAP.dirty_shards()
+    if not dirty:
+        return
+    now_ms = int(time.time() * 1000)
+    if not force and LAST_RADAR_INK_PERSIST_MS and now_ms - LAST_RADAR_INK_PERSIST_MS < RADAR_INK_PERSIST_MS:
+        return
+    db = _init_firestore_client()
+    if db is None:
+        return
+    try:
+        meta = RADAR_INK_MAP.export_meta()
+        active = set(RADAR_INK_ACTIVE_SHARDS) | set(dirty)
+        batch = db.batch()
+        for shard in sorted(dirty):
+            ref = db.collection(RADAR_INK_SHARD_COLLECTION).document(_radar_ink_shard_doc_id(shard))
+            payload = RADAR_INK_MAP.export_shard(shard)
+            payload.update({
+                "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+                "updatedByName": "server-radar-ink",
+            })
+            batch.set(ref, payload, merge=False)
+        col, _, doc = RADAR_INK_META_DOC.partition("/")
+        meta_ref = db.collection(col).document(doc)
+        meta.update({
+            "active_shards": sorted(active),
+            "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            "updatedByName": "server-radar-ink",
+        })
+        batch.set(meta_ref, meta, merge=False)
+        batch.commit()
+        RADAR_INK_MAP.mark_persisted(dirty)
+        RADAR_INK_ACTIVE_SHARDS = active
+        LAST_RADAR_INK_PERSIST_MS = now_ms
+        LAST_RADAR_INK_ERROR = None
+        log.info(
+            "Radar-ink: đã ghi %d shard, %d node/%d edge, rev=%d",
+            len(dirty), meta.get("node_count"), meta.get("edge_count"), meta.get("rev"),
+        )
+    except Exception as error:
+        LAST_RADAR_INK_ERROR = str(error)
+        log.warning("Radar-ink persist failed: %s", error)
+
+
+def _maybe_persist_radar_ink_map(force: bool = False) -> None:
+    # Giữ lock xuyên suốt snapshot → Firestore commit → clear dirty. Nếu không,
+    # một request khác có thể chấm thêm vào cùng shard giữa export và mark_persisted.
+    with _radar_ink_update_lock:
+        _maybe_persist_radar_ink_map_locked(force)
+
+
+def _get_radar_ink_outbox() -> Optional[RadarInkOutbox]:
+    """Khởi tạo chậm: server online không tạo file SQLite thừa."""
+    global _radar_ink_outbox_instance, LAST_RADAR_INK_ERROR
+    if not RADAR_INK_ENABLED or RADAR_ROLE != "fetcher":
+        return None
+    if _radar_ink_outbox_instance is not None:
+        return _radar_ink_outbox_instance
+    with _radar_ink_outbox_lock:
+        if _radar_ink_outbox_instance is None:
+            try:
+                _radar_ink_outbox_instance = RadarInkOutbox(RADAR_INK_OUTBOX_PATH)
+            except Exception as error:
+                LAST_RADAR_INK_ERROR = str(error)
+                log.warning("Radar-ink outbox init failed: %s", error)
+    return _radar_ink_outbox_instance
+
+
+def _radar_track_archive_doc_id(track_id: str) -> str:
+    return "track_" + hashlib.sha1(str(track_id or "").encode("utf-8", "ignore")).hexdigest()[:32]
+
+
+def _radar_track_day_key(timestamp_millis: int) -> str:
+    local = datetime.fromtimestamp(int(timestamp_millis) / 1000, VN_TZ)
+    if local.hour < 3:
+        local -= timedelta(days=1)
+    return local.strftime("%Y-%m-%d")
+
+
+def _radar_track_lookup_doc_id(code: str, date_key: str) -> str:
+    clean = _clean_code(code)
+    raw = f"{str(date_key or '').strip()}|{clean}"
+    return "code_" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _normalize_radar_track_points(raw_points) -> list[list]:
+    """Chỉ giữ fix FINE thật và đóng gói gọn để lưu/hiển thị lại đường bay."""
+    now_ms = int(time.time() * 1000)
+    unique = {}
+    for raw in raw_points or []:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+            continue
+        try:
+            ts = int(float(raw[0]))
+            if ts < 1_000_000_000_000:
+                ts *= 1000
+            lat, lng = float(raw[1]), float(raw[2])
+        except (TypeError, ValueError):
+            continue
+        quality = str(raw[6] if len(raw) > 6 else "FINE").upper()
+        if quality != "FINE" or not (-85 <= lat <= 85 and -180 <= lng <= 180):
+            continue
+        if ts < now_ms - 30 * 24 * 3600 * 1000 or ts > now_ms + 10 * 60 * 1000:
+            continue
+        if _haversine_km(lat, lng, DAD_LAT, DAD_LNG) > 2200:
+            continue
+        # Bounds thô đúng lưới 0,01° không được mang tên "đường bay thật".
+        if (abs(lat * 100 - round(lat * 100)) < 1e-7
+                and abs(lng * 100 - round(lng * 100)) < 1e-7):
+            continue
+        alt = round(float(raw[3])) if len(raw) > 3 and isinstance(raw[3], (int, float)) else None
+        spd = round(float(raw[4]), 1) if len(raw) > 4 and isinstance(raw[4], (int, float)) else None
+        heading = round(float(raw[5]) % 360, 1) if len(raw) > 5 and isinstance(raw[5], (int, float)) else None
+        unique[ts] = [ts, round(lat, 7), round(lng, 7), alt, spd, heading]
+    return [unique[key] for key in sorted(unique)]
+
+
+def _thin_radar_track_points(points: list[list], limit: int) -> list[list]:
+    """Rút đều nhưng giữ hai đầu; kho nén giữ 2400 điểm, web mặc định nhận 900 điểm."""
+    rows = list(points or [])
+    limit = max(2, int(limit))
+    if len(rows) <= limit:
+        return rows
+    indices = {round(index * (len(rows) - 1) / (limit - 1)) for index in range(limit)}
+    return [rows[index] for index in sorted(indices)]
+
+
+def _encode_radar_track_points(points: list[list]) -> str:
+    packed = json.dumps(points or [], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(packed, level=9)).decode("ascii")
+
+
+def _decode_radar_track_points(blob: str) -> list[list]:
+    if not blob:
+        return []
+    try:
+        value = json.loads(zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def _persist_radar_track_archives(tracks: list[dict]) -> tuple[bool, int]:
+    """Ghi bền vệt thật trước khi fetcher được phép xóa outbox."""
+    if not tracks:
+        return True, 0
+    db = _init_firestore_client()
+    if db is None or firebase_firestore is None:
+        return False, 0
+    prepared = {}
+    for item in tracks[:20]:
+        if not isinstance(item, dict):
+            continue
+        track_id = str(item.get("track_id") or "").strip()
+        code = _clean_code(item.get("code"))
+        points = _normalize_radar_track_points(item.get("points") or [])
+        if not track_id or not code or not points:
+            continue
+        doc_id = _radar_track_archive_doc_id(track_id)
+        current = prepared.get(doc_id)
+        if current:
+            points = _normalize_radar_track_points([*current["points"], *points])
+        prepared[doc_id] = {"track_id": track_id, "code": code, "points": points, "meta": item}
+    if not prepared:
+        return True, 0
+    try:
+        collection = db.collection(RADAR_TRACK_ARCHIVE_COLLECTION)
+        refs = {doc_id: collection.document(doc_id) for doc_id in prepared}
+        existing = {}
+        for snap in db.get_all(list(refs.values())):
+            if snap.exists:
+                existing[snap.id] = snap.to_dict() or {}
+        now_ms = int(time.time() * 1000)
+        batch = db.batch()
+        latest_by_code = {}
+        for doc_id, row in prepared.items():
+            old = existing.get(doc_id) or {}
+            merged = _normalize_radar_track_points([
+                *_decode_radar_track_points(str(old.get("points_zlib_b64") or "")),
+                *row["points"],
+            ])
+            merged = _thin_radar_track_points(merged, RADAR_TRACK_ARCHIVE_MAX_POINTS)
+            if not merged:
+                continue
+            meta = row["meta"]
+            payload = {
+                "schema": "nkdt-radar-track-v1",
+                "track_id": row["track_id"],
+                "code": row["code"],
+                "origin": str(meta.get("origin") or "")[:8].upper(),
+                "destination": str(meta.get("destination") or "DAD")[:8].upper(),
+                "aircraft": str(meta.get("aircraft") or "")[:16].upper(),
+                "source": str(meta.get("source") or "")[:60],
+                "start_millis": int(merged[0][0]),
+                "end_millis": int(merged[-1][0]),
+                "point_count": len(merged),
+                "points_encoding": "json+zlib+base64",
+                "points_zlib_b64": _encode_radar_track_points(merged),
+                "updated_millis": now_ms,
+                "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            }
+            batch.set(refs[doc_id], payload, merge=False)
+            previous = latest_by_code.get(row["code"])
+            if not previous or payload["end_millis"] >= previous["end_millis"]:
+                latest_by_code[row["code"]] = {"doc_id": doc_id, **payload}
+        lookup_collection = db.collection(RADAR_TRACK_LOOKUP_COLLECTION)
+        for code, row in latest_by_code.items():
+            date_key = _radar_track_day_key(row["end_millis"])
+            batch.set(lookup_collection.document(_radar_track_lookup_doc_id(code, date_key)), {
+                "schema": "nkdt-radar-track-lookup-v1",
+                "code": code,
+                "date_key": date_key,
+                "archive_doc": row["doc_id"],
+                "track_id": row["track_id"],
+                "start_millis": row["start_millis"],
+                "end_millis": row["end_millis"],
+                "updated_millis": now_ms,
+                "updatedAt": firebase_firestore.SERVER_TIMESTAMP,
+            }, merge=False)
+        batch.commit()
+        log.info("Radar-track: đã lưu %d vệt thật (%d lookup)", len(prepared), len(latest_by_code))
+        return True, len(prepared)
+    except Exception as error:
+        global LAST_RADAR_INK_ERROR
+        LAST_RADAR_INK_ERROR = str(error)
+        log.warning("Radar-track persist failed (sẽ retry từ outbox): %s", error)
+        return False, 0
+
+
+def _radar_ink_track_id(code: str, flight, details: Optional[dict], points: list[list]) -> str:
+    """ID ổn định giữa các máy để server không đếm một chuyến nhiều lần."""
+    fr24_id = str(getattr(flight, "id", "") or "").strip()
+    if fr24_id:
+        return f"fr24:{fr24_id}"
+    icao24 = str(getattr(flight, "icao_24bit", "") or "").strip().lower()
+    first_ts = min((int(row[0]) for row in points if row), default=int(time.time() * 1000))
+    day_key = datetime.fromtimestamp(first_ts / 1000, VN_TZ).strftime("%Y%m%d")
+    raw = f"{icao24}|{_clean_code(code)}|{day_key}"
+    return "fallback:" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _queue_radar_ink_trail(code: str, flight, details: Optional[dict]) -> int:
+    """Lấy TOÀN BỘ trail mịn đã có sẵn, không phát sinh request FR24 mới."""
+    if not RADAR_INK_ENABLED or RADAR_ROLE != "fetcher" or not isinstance(details, dict):
+        return 0
+    trail = details.get("trail") or []
+    if not isinstance(trail, list) or not trail:
+        return 0
+    now_ms = int(time.time() * 1000)
+    points = []
+    for raw in trail[:4000]:
+        if not isinstance(raw, dict):
+            continue
+        lat, lng, ts = raw.get("lat"), raw.get("lng"), raw.get("ts")
+        if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))
+                and isinstance(ts, (int, float)) and ts > 0):
+            continue
+        ts_ms = int(ts * 1000) if ts < 1e12 else int(ts)
+        if ts_ms < now_ms - 36 * 3600 * 1000 or ts_ms > now_ms + 10 * 60 * 1000:
+            continue
+        lat_f, lng_f = float(lat), float(lng)
+        # Chỉ trail mịn được chấm mực. Bounds 0,01° vẫn phục vụ marker nhưng không được làm thầy.
+        quality = "COARSE" if _looks_grid_coarse(lat_f, lng_f) else "FINE"
+        if quality != "FINE":
+            continue
+        if _haversine_km(lat_f, lng_f, DAD_LAT, DAD_LNG) > 2200:
+            continue
+        alt = raw.get("alt") if isinstance(raw.get("alt"), (int, float)) else None
+        spd = raw.get("spd") if isinstance(raw.get("spd"), (int, float)) else None
+        hd = raw.get("hd") if isinstance(raw.get("hd"), (int, float)) else None
+        points.append([ts_ms, round(lat_f, 7), round(lng_f, 7), alt, spd, hd, "FINE"])
+    if len(points) < 2:
+        return 0
+    track_id = _radar_ink_track_id(code, flight, details, points)
+    airport = details.get("airport") or {}
+    origin = (((airport.get("origin") or {}).get("code") or {}).get("iata")
+              or getattr(flight, "origin_airport_iata", "") or "")
+    aircraft = (((details.get("aircraft") or {}).get("model") or {}).get("code")
+                or getattr(flight, "aircraft_code", "") or "")
+    meta = {
+        "code": _clean_code(code),
+        "origin": str(origin).strip().upper(),
+        "destination": TARGET_AIRPORT,
+        "aircraft": str(aircraft).strip().upper(),
+        "icao24": str(getattr(flight, "icao_24bit", "") or "").strip().lower(),
+        "source": RADAR_SOURCE_ID,
+    }
+    outbox = _get_radar_ink_outbox()
+    if outbox is None:
+        return 0
+    try:
+        added = outbox.add(track_id, meta, points)
+        if added:
+            log.info("Radar-ink: chấm %d điểm mịn %s (%s)", added, code, track_id)
+        return added
+    except Exception as error:
+        global LAST_RADAR_INK_ERROR
+        LAST_RADAR_INK_ERROR = str(error)
+        log.warning("Radar-ink queue failed %s: %s", code, error)
+        return 0
+
+
+def _flush_radar_ink_outbox(force: bool = False) -> int:
+    """Gửi một batch lên Render; chỉ đánh dấu xong sau HTTP 2xx."""
+    global LAST_RADAR_INK_UPLOAD_MS, LAST_RADAR_INK_SUCCESS_MS, LAST_RADAR_INK_ERROR
+    outbox = _get_radar_ink_outbox()
+    if outbox is None or not _radar_ink_flush_lock.acquire(blocking=False):
+        return 0
+    try:
+        now_ms = int(time.time() * 1000)
+        if not force and LAST_RADAR_INK_UPLOAD_MS and now_ms - LAST_RADAR_INK_UPLOAD_MS < RADAR_INK_UPLOAD_MIN_MS:
+            return 0
+        tracks, point_ids = outbox.batch(max_points=RADAR_INK_UPLOAD_MAX_POINTS, max_tracks=12)
+        if not tracks:
+            return 0
+        # Đây là mốc THỬ, không phải mốc thành công. Render mất mạng vẫn chỉ retry
+        # mỗi 15 phút thay vì mọi vòng poll 20–60 giây từ nhiều máy cùng lúc.
+        LAST_RADAR_INK_UPLOAD_MS = now_ms
+        body = json.dumps({
+            "schema": RADAR_INK_SCHEMA,
+            "source": RADAR_SOURCE_ID,
+            "tracks": tracks,
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            f"{RADAR_INK_ONLINE_URL}/api/radar_ink/ingest",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": ETA_API_KEY,
+                "User-Agent": "NKDT-RadarInk/1",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=RADAR_INK_UPLOAD_TIMEOUT_S) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            if (response.status < 200 or response.status >= 300
+                    or payload.get("status") != "success" or payload.get("durable") is not True):
+                raise RuntimeError(f"HTTP {response.status}: {payload}")
+        outbox.mark_uploaded(point_ids)
+        LAST_RADAR_INK_SUCCESS_MS = int(time.time() * 1000)
+        LAST_RADAR_INK_ERROR = None
+        log.info("Radar-ink: đã gửi %d điểm/%d vết lên online, rev=%s", len(point_ids), len(tracks), payload.get("rev"))
+        return len(point_ids)
+    except Exception as error:
+        LAST_RADAR_INK_ERROR = str(error)
+        log.warning("Radar-ink upload failed (sẽ tự retry): %s", error)
+        return 0
+    finally:
+        _radar_ink_flush_lock.release()
+
+
+def _flush_radar_ink_outbox_async() -> None:
+    if not RADAR_INK_ENABLED or RADAR_ROLE != "fetcher" or _radar_ink_flush_lock.locked():
+        return
+    threading.Thread(target=_flush_radar_ink_outbox, daemon=True, name="radar_ink_upload").start()
+
+
+def _attach_radar_ink_guidance(flights: dict) -> dict:
+    """Gắn polyline nhỏ vào từng tàu; web không phải tải toàn bộ atlas nặng."""
+    if not RADAR_INK_ENABLED or not flights or not RADAR_INK_MAP.nodes:
+        return flights
+    # Ưu tiên runway vừa được một fix final thật xác nhận trong CÙNG snapshot. Nếu lúc
+    # này chưa có tàu trên final, dùng runway của vệt hạ hoàn chỉnh gần đây làm tie-break
+    # cho downwind/base; nó không có quyền tự biến thành touchdown ở web.
+    initial_hints = {}
+    runway_votes: dict[str, float] = {}
+    for code, entry in flights.items():
+        if not isinstance(entry, dict):
+            continue
+        lat, lng = entry.get("latitude"), entry.get("longitude")
+        if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+            continue
+        hint = RADAR_INK_MAP.context_hint(
+            lat, lng, entry.get("heading"), entry.get("ground_speed_kt"), entry.get("altitude_ft"),
+            movement="ARRIVAL",
+        )
+        initial_hints[code] = hint
+        runway_id = str(hint.get("runway_id") or "")
+        if runway_id and hint.get("phase") in {"INTERCEPT", "FINAL"}:
+            distance_km = float(hint.get("distance_dad_km") or 99.0)
+            runway_votes[runway_id] = runway_votes.get(runway_id, 0.0) + max(0.25, 2.5 - distance_km / 12.0)
+    active_runway = max(runway_votes, key=runway_votes.get) if runway_votes else RADAR_INK_MAP.recent_runway_hint()
+    result = {}
+    for code, entry in flights.items():
+        if not isinstance(entry, dict):
+            result[code] = entry
+            continue
+        lat, lng = entry.get("latitude"), entry.get("longitude")
+        if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+            result[code] = entry
+            continue
+        try:
+            own_hint = initial_hints.get(code) or {}
+            runway_hint = str(own_hint.get("runway_id") or active_runway or "")
+            context = RADAR_INK_MAP.context_hint(
+                lat, lng, entry.get("heading"), entry.get("ground_speed_kt"), entry.get("altitude_ft"),
+                movement="ARRIVAL", runway_hint=runway_hint,
+            )
+            guide = RADAR_INK_MAP.guidance(
+                lat, lng,
+                entry.get("heading"), entry.get("ground_speed_kt"), entry.get("altitude_ft"),
+                entry.get("origin_iata") or entry.get("origin") or "",
+                horizon_s=240,
+                movement="ARRIVAL",
+                runway_hint=str(context.get("runway_id") or runway_hint),
+                phase_hint=str(context.get("phase") or ""),
+            )
+        except Exception as error:
+            log.warning("Radar-ink guidance failed %s: %s", code, error)
+            result[code] = entry
+            continue
+        out = dict(entry)
+        if guide.get("use"):
+            out["radar_ink"] = guide
+        elif guide.get("available"):
+            # Shadow được tự chấm ngay trên server; web không cần polyline dài. Chỉ gửi
+            # trạng thái gọn để payload /api/etas không làm điện thoại yếu bị lag.
+            out["radar_ink"] = {key: value for key, value in guide.items() if key != "path"}
+        result[code] = out
+    return result
 
 
 def _terminal_age_ms(entry: Optional["FlightEntry"], now_ms: int) -> int:
@@ -3702,6 +4238,10 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
                 continue
             log.info("Keep %s in scan (no FR24 dest, schedule-vouched)", code)
 
+        # details.trail là cuộn phim vị trí thật. Chấm TOÀN BỘ lên outbox, không chỉ
+        # lấy trail[0]; SQLite tự khử phần trail bị lặp giữa các vòng poll.
+        _queue_radar_ink_trail(code, flight, details)
+
         with _lock:
             old = TRACKED.get(code)
 
@@ -3741,6 +4281,8 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
                 marked_code = _mark_outside_schedule_code(code, now_ms)
                 if marked_code in OUTSIDE_SCHEDULE_CODES:
                     _merge_outside_schedule_meta(marked_code, staged_meta.get(code))
+
+    _flush_radar_ink_outbox_async()
 
     log.info(
         "Auto-scan arrivals: bounds=%d, candidates=%d, found=%d, add_to_queue=%s, max_minutes=%d",
@@ -3977,6 +4519,12 @@ def _do_poll() -> None:
                 if c not in queue_snapshot:
                     _LAST_DETAIL_MS.pop(c, None)
 
+        # Tận dụng đúng response detail vừa lấy cho ETA; không tăng một request FR24 nào.
+        for code, details in details_map.items():
+            if details:
+                _queue_radar_ink_trail(code, detail_targets.get(code), details)
+        _flush_radar_ink_outbox_async()
+
     now_ms = int(time.time() * 1000)
     updates = {}
     drops = []
@@ -4195,6 +4743,12 @@ def poll_loop() -> None:
                         _maybe_persist_flow_grid()
                     except Exception as _e:
                         log.warning("flow-grid loop error: %s", _e)
+                if RADAR_INK_ENABLED:
+                    try:
+                        _refresh_radar_ink_map_from_firestore(force=False)
+                        _maybe_persist_radar_ink_map()
+                    except Exception as _e:
+                        log.warning("radar-ink loop error: %s", _e)
             else:
                 if FETCHER_PHU:
                     # Máy phụ: đợi tới điểm giữa khoảng trống của máy chính rồi mới poll.
@@ -4309,17 +4863,14 @@ def build_etas_payload(known_revision=None) -> dict:
                     public["outside_schedule"] = True
                     public.setdefault("discovery_source", "feed_dad_arrival")
                 public = _decorate_outside_schedule_public(code, public)
-                # v77: HẠ CÁNH → ẩn marker NGAY. Radar thô nên chỉ theo dõi tới lúc hạ; có mốc
-                # hạ (đã qua gate khoảng cách) hoặc đã đỗ → cắt toạ độ khỏi map luôn, không chờ
-                # 15'/PARKED. Mốc giờ + state vẫn giữ để app tra cứu / đồng bộ Firestore.
-                hide_marker = bool(
-                    entry.landed_at_millis and entry.state in ("LANDED", "TAXIING", "PARKED")
-                ) or bool(entry.state == "PARKED" and entry.parked_at_millis)
+                # LANDED/TAXIING vẫn phải giữ vị trí để web theo dõi rollout và lăn vào bến.
+                # Chỉ cắt marker khi PARKED đã được xác nhận; web còn có gate claim/tuổi riêng.
+                hide_marker = bool(entry.state == "PARKED" and entry.parked_at_millis)
                 if hide_marker:
                     public["latitude"] = None
                     public["longitude"] = None
                     public["map_hidden"] = True
-                    public["map_hidden_reason"] = "landed"
+                    public["map_hidden_reason"] = "parked"
                 result[code] = public
         not_modified = known_revision is not None and known_revision == feed_revision
         if not_modified:
@@ -4479,6 +5030,7 @@ SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "900
 SERVER_MERGE_TRUSTED_MAX_AGE_MS = int(os.environ.get("SERVER_MERGE_TRUSTED_MAX_AGE_MS", "120000"))
 SERVER_MERGE_SOURCE_HOLD_MS = int(os.environ.get("SERVER_MERGE_SOURCE_HOLD_MS", "90000"))
 SERVER_MERGE_QUALITY_SWITCH_MARGIN = int(os.environ.get("SERVER_MERGE_QUALITY_SWITCH_MARGIN", "15"))
+SERVER_MERGE_GROUND_TRANSITION_STALE_MS = int(os.environ.get("SERVER_MERGE_GROUND_TRANSITION_STALE_MS", "45000"))
 SERVER_MERGE_BATCH_MIN_ENTRIES = int(os.environ.get("SERVER_MERGE_BATCH_MIN_ENTRIES", "4"))
 SERVER_MERGE_BATCH_SHARE = float(os.environ.get("SERVER_MERGE_BATCH_SHARE", "0.60"))
 SERVER_MERGE_BATCH_CLOCK_WINDOW_MS = int(os.environ.get("SERVER_MERGE_BATCH_CLOCK_WINDOW_MS", "20000"))
@@ -5046,6 +5598,34 @@ def _merge_entry_airborne_override(entry: dict) -> bool:
     )
 
 
+def _merge_entry_ground_arrival_override(entry: dict) -> bool:
+    """Bằng chứng mặt đất đủ mạnh để thay một fix trên không đã cũ.
+
+    Radar phụ thường còn lấy được bounds hiện tại trong khi nguồn mịn bị kẹt 1–3 phút. Chỉ
+    chấp nhận tín hiệu LANDED/TAXIING/PARKED rất gần DAD, thấp và chậm; nhờ vậy không giữ tàu
+    trên final giả sau khi FR24 đã thấy tàu lăn, nhưng một nhãn hạ cánh sớm vẫn không thắng.
+    """
+    if not isinstance(entry, dict):
+        return False
+    state = _merge_entry_state(entry)
+    if state not in {"LANDED", "TAXIING", "PARKED"}:
+        return False
+    speed_kt = _merge_entry_speed_kt(entry)
+    alt_ft = _merge_float(entry.get("altitude_ft"))
+    dist_km = _merge_float(entry.get("distance_km"))
+    if dist_km is None:
+        lat, lng = _merge_entry_lat_lng(entry)
+        if lat is not None and lng is not None:
+            dist_km = _haversine_km(lat, lng, DAD_LAT, DAD_LNG)
+    return (
+        dist_km is not None and dist_km <= 12.0
+        and (speed_kt is None or speed_kt <= 90.0)
+        and (alt_ft is None or alt_ft <= 1500.0)
+        and (bool(entry.get("on_ground")) or bool(entry.get("taxiing"))
+             or bool(entry.get("parked")) or state in {"TAXIING", "PARKED"})
+    )
+
+
 def _merge_entry_for_store(
     entry: dict,
     source: str,
@@ -5176,6 +5756,19 @@ def _merge_should_accept_entry(
         and cur_accept_age_ms <= SERVER_MERGE_FINE_HOLD_MS
     ):
         return False, "keep-fine-over-coarse"
+
+    # Một nguồn mịn bị đứng ở final không được chặn radar phụ đã thấy tàu thật sự ở mặt đất.
+    # Chờ ít nhất 45s và đòi bằng chứng gần DAD/thấp/chậm để không nhận nhầm nhãn LANDED sớm.
+    cur_observation_age_ms = max(
+        cur_accept_age_ms,
+        max(0, now_ms - cur_ts) if cur_ts > 0 else 0,
+    )
+    if (
+        not cur_ground and inc_ground
+        and cur_observation_age_ms >= SERVER_MERGE_GROUND_TRANSITION_STALE_MS
+        and _merge_entry_ground_arrival_override(entry)
+    ):
+        return True, "ground-arrival-override"
 
     # Cổng chuyển động áp dụng cho CẢ CÙNG NGUỒN. Với timestamp giả dùng thời điểm Firestore
     # nhận snapshot để không cho một batch cache nhảy 10-40km trong vài giây.
@@ -5925,19 +6518,17 @@ def _hide_parked_at_stand_live(flights: dict, now_ms: int) -> dict:
     for code, d in flights.items():
         if isinstance(d, dict):
             state = str(d.get("state") or "").upper()
-            landed_ms = (d.get("actual_landed_at_millis")
-                         or d.get("landed_at_millis") or d.get("touchdown_millis"))
             lat = d.get("latitude")
             lng = d.get("longitude")
             gs = d.get("ground_speed_kt")
-            # v77: HẠ CÁNH → ẩn marker NGAY (radar thô, chỉ theo dõi tới lúc hạ). landed_ms đã
-            # qua gate khoảng cách nên tin được; PARKED cũng ẩn.
-            if landed_ms or state in ("LANDED", "TAXIING", "PARKED"):
+            parked_ms = d.get("actual_parked_at_millis") or d.get("parked_at_millis")
+            # Vừa hạ/lăn vẫn là live. Chỉ PARKED đã xác nhận hoặc đứng đúng bến mới ẩn.
+            if state == "PARKED" and parked_ms:
                 d = dict(d)
                 d["latitude"] = None
                 d["longitude"] = None
                 d["map_hidden"] = True
-                d["map_hidden_reason"] = "landed"
+                d["map_hidden_reason"] = "parked"
             elif (lat is not None and lng is not None
                     and isinstance(gs, (int, float)) and gs <= PARKED_GS_KT):
                 near_stand, _ = _stand_snap_status(lat, lng)
@@ -5973,9 +6564,11 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     fetcher_time = meta.get("server_time_millis")
     stale = (fetcher_time is None) or (now_ms - int(fetcher_time) > RADAR_LIVE_STALE_MS)
     # Revision theo bộ gộp: web biết khi nội dung đổi để xin bản đầy đủ; không đổi → nhẹ.
-    feed_revision = f"merge:{SERVER_LIVE_MERGE_REV}" if merged else (meta.get("feed_revision") or "live:none")
+    base_revision = f"merge:{SERVER_LIVE_MERGE_REV}" if merged else (meta.get("feed_revision") or "live:none")
+    # Atlas đổi thì web cần nhận guidance mới dù snapshot vị trí chưa đổi.
+    feed_revision = f"{base_revision}:ink:{RADAR_INK_MAP.rev}" if RADAR_INK_ENABLED else base_revision
     not_modified = known_revision is not None and known_revision == feed_revision
-    out_flights = {} if not_modified else _hide_parked_at_stand_live(flights, now_ms)
+    out_flights = {} if not_modified else _attach_radar_ink_guidance(_hide_parked_at_stand_live(flights, now_ms))
     return {
         "status": "success",
         "feed_revision": feed_revision,
@@ -5993,6 +6586,8 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
         "merge_size": len(merged),
         "merge_revision": SERVER_LIVE_MERGE_REV,
         "merge_last_ms": SERVER_LIVE_MERGE_LAST_MS,
+        "radar_ink_rev": RADAR_INK_MAP.rev,
+        "radar_ink_nodes": len(RADAR_INK_MAP.nodes),
         "firestore_status": FIRESTORE_STATUS,
         "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
         "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
@@ -6032,6 +6627,17 @@ def health():
             "merge_source_profiles": merge_source_profiles,
             "merge_source_calibration": merge_source_calibration,
             "merge_refined_count": SERVER_MERGE_REFINED_COUNT,
+            "radar_ink_enabled": RADAR_INK_ENABLED,
+            "radar_ink_rev": RADAR_INK_MAP.rev,
+            "radar_ink_nodes": len(RADAR_INK_MAP.nodes),
+            "radar_ink_edges": sum(len(value) for value in RADAR_INK_MAP.edges.values()),
+            "radar_ink_dirty_shards": len(RADAR_INK_MAP.dirty_shards()),
+            "radar_ink_last_attempt_ms": LAST_RADAR_INK_UPLOAD_MS,
+            "radar_ink_last_success_ms": LAST_RADAR_INK_SUCCESS_MS,
+            "radar_ink_pending_points": (
+                _radar_ink_outbox_instance.pending_count() if _radar_ink_outbox_instance is not None else 0
+            ),
+            "radar_ink_last_error": LAST_RADAR_INK_ERROR,
             "server_time_millis": int(time.time() * 1000),
             "last_poll_millis": LAST_POLL_MS,
             "last_poll_duration_ms": LAST_POLL_DURATION_MS,
@@ -6346,6 +6952,162 @@ def flow_grid():
             FLOW_GRID_REV += 1
         rev = FLOW_GRID_REV
     return jsonify({"status": "success", "merged": merged, "rev": rev, "count": len(FLOW_GRID)})
+
+
+@app.route("/api/radar_ink/ingest", methods=["POST"])
+def radar_ink_ingest():
+    """Nhận vết mịn từ các máy radar và ghi bền atlas trước khi báo thành công."""
+    if (err := require_api_key()):
+        return err
+    if not RADAR_INK_ENABLED:
+        return jsonify({"status": "disabled"}), 503
+    if RADAR_ROLE != "server":
+        return jsonify({"status": "error", "message": "Chỉ server online nhận radar-ink."}), 503
+    body = request.get_json(silent=True) or {}
+    if body.get("schema") != RADAR_INK_SCHEMA:
+        return jsonify({"status": "error", "message": "Sai schema radar-ink."}), 400
+    tracks = body.get("tracks")
+    if not isinstance(tracks, list):
+        return jsonify({"status": "error", "message": "tracks phải là mảng."}), 400
+    results = []
+    total_points = 0
+    archive_tracks = []
+    # Một lock bao cả ingest + snapshot + commit: hai fetcher tới cùng lúc không thể
+    # làm clear nhầm cờ dirty của nhau trên cùng Firestore shard.
+    with _radar_ink_update_lock:
+        for item in tracks[:20]:
+            if not isinstance(item, dict):
+                continue
+            points = item.get("points") or []
+            if not isinstance(points, list):
+                continue
+            remaining = max(0, RADAR_INK_UPLOAD_MAX_POINTS - total_points)
+            if remaining <= 0:
+                break
+            points = points[:remaining]
+            total_points += len(points)
+            archive_tracks.append({**item, "points": points})
+            result = RADAR_INK_MAP.ingest_track(
+                str(item.get("track_id") or ""),
+                points,
+                str(item.get("origin") or ""),
+                meta=item,
+            )
+            result["code"] = str(item.get("code") or "")[:16]
+            results.append(result)
+        # Đây là ranh giới durability: phải ghi được CẢ atlas lối mòn lẫn vệt thật đối chiếu
+        # thì fetcher mới được xóa outbox. Lỗi nửa chừng sẽ retry; mọi điểm đều đã khử trùng.
+        archive_durable, archived_tracks = _persist_radar_track_archives(archive_tracks)
+        # Force chỉ xảy ra tối đa theo nhịp upload 15 phút của từng fetcher, không theo từng fix.
+        _maybe_persist_radar_ink_map(force=True)
+        stats = RADAR_INK_MAP.stats()
+    return jsonify({
+        "status": "success",
+        "durable": archive_durable and not bool(RADAR_INK_MAP.dirty_shards()),
+        "received_points": total_points,
+        "archived_tracks": archived_tracks,
+        "tracks": results,
+        "rev": stats.get("rev"),
+        "nodes": stats.get("node_count"),
+        "edges": stats.get("edge_count"),
+    })
+
+
+@app.route("/api/radar_ink/guidance", methods=["POST"])
+def radar_ink_guidance():
+    """API kiểm tra atlas; web thường nhận cùng dữ liệu ngay trong /api/etas."""
+    if (err := require_api_key()):
+        return err
+    body = request.get_json(silent=True) or {}
+    try:
+        guide = RADAR_INK_MAP.guidance(
+            float(body.get("latitude")), float(body.get("longitude")),
+            body.get("heading"), body.get("ground_speed_kt"), body.get("altitude_ft"),
+            str(body.get("origin") or ""), int(body.get("horizon_s") or 180),
+            str(body.get("movement") or "ARRIVAL"),
+            str(body.get("runway_id") or ""),
+            str(body.get("phase") or ""),
+        )
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Thiếu tọa độ hợp lệ."}), 400
+    return jsonify({"status": "success", "guidance": guide})
+
+
+@app.route("/api/radar_track", methods=["POST"])
+def radar_track_archive():
+    """Trả vệt radar thật của một chuyến khi người dùng chủ động bấm xem."""
+    if (err := require_api_key()):
+        return err
+    body = request.get_json(silent=True) or {}
+    requested_code = _clean_code(body.get("code"))
+    date_key = str(body.get("date_key") or "").strip()
+    if not requested_code:
+        return jsonify({"status": "error", "message": "Thiếu mã chuyến."}), 400
+    if not date_key or len(date_key) != 10:
+        date_key = _radar_track_day_key(int(time.time() * 1000))
+    aliases = [requested_code]
+    for raw in body.get("aliases") or []:
+        code = _clean_code(raw)
+        if code and code not in aliases:
+            aliases.append(code)
+        if len(aliases) >= 12:
+            break
+    try:
+        requested_max = int(body.get("max_points") or RADAR_TRACK_WEB_MAX_POINTS)
+    except (TypeError, ValueError):
+        requested_max = RADAR_TRACK_WEB_MAX_POINTS
+    max_points = max(100, min(1500, requested_max))
+    db = _init_firestore_client()
+    if db is None:
+        return jsonify({"status": "error", "message": "Kho vệt bay chưa sẵn sàng."}), 503
+    try:
+        lookups = db.collection(RADAR_TRACK_LOOKUP_COLLECTION)
+        refs = [lookups.document(_radar_track_lookup_doc_id(code, date_key)) for code in aliases]
+        candidates = []
+        for snap in db.get_all(refs):
+            if snap.exists:
+                row = snap.to_dict() or {}
+                if row.get("archive_doc"):
+                    candidates.append(row)
+        if not candidates:
+            return jsonify({
+                "status": "success", "available": False,
+                "code": requested_code, "date_key": date_key, "points": [],
+            })
+        lookup = max(candidates, key=lambda row: int(row.get("end_millis") or 0))
+        snap = db.collection(RADAR_TRACK_ARCHIVE_COLLECTION).document(str(lookup["archive_doc"])).get()
+        if not snap.exists:
+            return jsonify({"status": "success", "available": False, "code": requested_code, "points": []})
+        archive = snap.to_dict() or {}
+        all_points = _decode_radar_track_points(str(archive.get("points_zlib_b64") or ""))
+        points = _thin_radar_track_points(all_points, max_points)
+        return jsonify({
+            "status": "success",
+            "available": bool(points),
+            "schema": "nkdt-radar-track-v1",
+            "code": archive.get("code") or requested_code,
+            "requested_code": requested_code,
+            "date_key": date_key,
+            "track_id": archive.get("track_id"),
+            "origin": archive.get("origin"),
+            "destination": archive.get("destination"),
+            "aircraft": archive.get("aircraft"),
+            "start_millis": archive.get("start_millis"),
+            "end_millis": archive.get("end_millis"),
+            "point_count": len(all_points),
+            "returned_points": len(points),
+            "points": points,
+        })
+    except Exception as error:
+        log.warning("Radar-track read failed %s: %s", requested_code, error)
+        return jsonify({"status": "error", "message": "Không đọc được kho vệt bay."}), 500
+
+
+@app.route("/api/radar_ink/stats", methods=["GET"])
+def radar_ink_stats():
+    if (err := require_api_key()):
+        return err
+    return jsonify({"status": "success", **RADAR_INK_MAP.stats(), "last_error": LAST_RADAR_INK_ERROR})
 
 
 @app.route("/api/schedule", methods=["POST"])
@@ -6985,6 +7747,11 @@ if os.environ.get("NKDT_IMPORT_ONLY") != "1":
             _refresh_flow_grid_from_firestore(force=True)
         except Exception as _e:
             log.warning("nạp flow grid lúc khởi động lỗi: %s", _e)
+    if RADAR_ROLE == "server" and RADAR_INK_ENABLED:
+        try:
+            _refresh_radar_ink_map_from_firestore(force=True)
+        except Exception as _e:
+            log.warning("nạp radar-ink lúc khởi động lỗi: %s", _e)
     _start_poller()
 
 
