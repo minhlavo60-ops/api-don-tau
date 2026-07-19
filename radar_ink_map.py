@@ -1157,7 +1157,13 @@ class RadarInkMap:
                         ]
                         for to_id, edge in outgoing.items()
                     ]
-            return {"schema": SCHEMA, "version": VERSION, "rev": self.rev, "shard": shard, "nodes": nodes, "edges": edges}
+            # Firestore cấm array lồng trong array ("invalid nested entity") nên edges
+            # phải đóng gói thành chuỗi JSON. nodes giữ map->array số (hợp lệ).
+            return {
+                "schema": SCHEMA, "version": VERSION, "rev": self.rev, "shard": shard,
+                "nodes": nodes,
+                "edges_json": json.dumps(edges, separators=(",", ":")),
+            }
 
     def load_documents(self, meta: dict[str, Any], shard_docs: Iterable[dict[str, Any]]) -> bool:
         if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
@@ -1179,7 +1185,15 @@ class RadarInkMap:
                 }
                 nodes[node_id] = row
                 index.setdefault((row["level"], row["ix"], row["iy"]), set()).add(node_id)
-            for from_id, packed_edges in (doc.get("edges") or {}).items():
+            packed_edge_map = doc.get("edges") or {}
+            raw_edges_json = doc.get("edges_json")
+            if isinstance(raw_edges_json, str) and raw_edges_json:
+                # Định dạng mới: edges nằm trong chuỗi JSON (né giới hạn Firestore).
+                try:
+                    packed_edge_map = json.loads(raw_edges_json)
+                except ValueError:
+                    packed_edge_map = {}
+            for from_id, packed_edges in (packed_edge_map or {}).items():
                 outgoing = {}
                 for packed in packed_edges or []:
                     if not isinstance(packed, (list, tuple)) or len(packed) < 7:
