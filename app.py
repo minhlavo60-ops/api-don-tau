@@ -56,8 +56,60 @@ import zlib
 
 try:
     from radar_ink_map import RadarInkMap, RadarInkOutbox, SCHEMA as RADAR_INK_SCHEMA
+    RADAR_INK_IMPORT_OK = True
 except ImportError:  # Cho phép import dạng package trong bộ test.
-    from .radar_ink_map import RadarInkMap, RadarInkOutbox, SCHEMA as RADAR_INK_SCHEMA
+    try:
+        from .radar_ink_map import RadarInkMap, RadarInkOutbox, SCHEMA as RADAR_INK_SCHEMA
+        RADAR_INK_IMPORT_OK = True
+    except ImportError:
+        # Thiếu file radar_ink_map.py cạnh app.py (vd: chỉ upload mỗi app.py lên repo).
+        # Server radar phải SỐNG để cả tổ còn dùng — chỉ tắt phần ink, không chết deploy.
+        RADAR_INK_IMPORT_OK = False
+        RADAR_INK_SCHEMA = "nkdt-radar-ink-v1"
+
+        class RadarInkMap:  # Stub "ink rỗng": mọi API vẫn trả lời, atlas coi như chưa học gì.
+            rev = 0
+
+            def __init__(self, *args, **kwargs):
+                self.nodes = {}
+                self.edges = {}
+
+            def dirty_shards(self):
+                return []
+
+            def load_documents(self, *args, **kwargs):
+                return False
+
+            def export_meta(self):
+                return {}
+
+            def export_shard(self, *args, **kwargs):
+                return {}
+
+            def mark_persisted(self, *args, **kwargs):
+                return None
+
+            def stats(self):
+                return {"nodes": 0, "edges": 0, "stub": True}
+
+            def context_hint(self, *args, **kwargs):
+                return None
+
+            def recent_runway_hint(self):
+                return None
+
+            def guidance(self, *args, **kwargs):
+                return None
+
+            def ingest_track(self, *args, **kwargs):
+                return {}
+
+        class RadarInkOutbox:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def pending_count(self):
+                return 0
 
 try:
     import firebase_admin
@@ -552,6 +604,11 @@ _flow_lock = threading.Lock()
 # outbox SQLite rồi POST lên Render. Server online tạo đồ thị nhiều nhánh, tự chấm
 # bằng fix kế tiếp và chỉ cấp guidance cho web khi đã tốt hơn bay thẳng đủ mẫu.
 RADAR_INK_ENABLED = os.environ.get("RADAR_INK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+if not RADAR_INK_IMPORT_OK:
+    # Ép tắt khi thiếu module để mọi nhánh ink im lặng; log ERROR cho dễ thấy trên Render.
+    RADAR_INK_ENABLED = False
+    log.error("THIEU radar_ink_map.py — server chay che do KHONG ink. "
+              "Upload radar_ink_map.py len repo (canh app.py) roi deploy lai de bat atlas.")
 RADAR_INK_ONLINE_URL = os.environ.get("RADAR_INK_ONLINE_URL", "https://api-don-tau.onrender.com").rstrip("/")
 RADAR_INK_OUTBOX_PATH = os.environ.get(
     "RADAR_INK_OUTBOX_PATH",
