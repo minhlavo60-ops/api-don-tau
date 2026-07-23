@@ -38,8 +38,11 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------- vai trò
-# Render tự đặt env RENDER=true → tự nhận vai "phat", khỏi cấu hình gì thêm.
-MODE = (os.environ.get("RADAR_MODE") or ("phat" if os.environ.get("RENDER") else "ghi")).lower()
+# [thử nghiệm theo yêu cầu] Mặc định vai GHI ở MỌI NƠI, kể cả Render — tự quét FR24
+# trực tiếp, không cần máy tính đẩy dữ liệu, không cần đặt env gì cả.
+# Nếu FR24 chặn IP Render (log 'Feed rỗng' lặp mãi, live luôn 0) thì đặt env
+# RADAR_MODE=phat rồi bật máy ghi ở nhà đẩy lên (xem HUONG-DAN-LEN-RENDER.md).
+MODE = ((os.environ.get("RADAR_MODE") or "ghi").strip().lower() or "ghi")
 
 # Vai ghi: đẩy dữ liệu lên đâu (ví dụ https://api-don-tau.onrender.com). Rỗng = không đẩy.
 PUSH_URL = (os.environ.get("RADAR_PUSH_URL") or "").rstrip("/")
@@ -399,7 +402,7 @@ def poll_loop():
                         state["last_error"] = "FR24 trả feed rỗng (nghi chặn mềm) — đang làm mới phiên"
                     if os.environ.get("RENDER"):
                         print("[!] Đang chạy vai GHI trên Render mà FR24 trả rỗng "
-                              "=> FR24 chặn IP Render. Đổi env RADAR_MODE = ghi + bật máy ghi ở nhà.")
+                              "=> FR24 chặn IP Render. Đổi env RADAR_MODE=phat + bật máy ghi ở nhà.")
                     print(f"[!] Feed rỗng — tạo phiên FR24 mới, nghỉ {empty_backoff}s")
                     fr_api = FlightRadar24API()
                     state["backoff_until"] = time.time() + empty_backoff
