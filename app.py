@@ -393,23 +393,33 @@ def poll_loop():
     global fr_api
     backoff = BACKOFF_START
     empty_backoff = 30
+    empty_streak = 0
     while True:
         if time.time() >= state["backoff_until"]:
             try:
                 total = poll_once()
                 if total == 0:
+                    empty_streak += 1
                     with lock:
-                        state["last_error"] = "FR24 trả feed rỗng (nghi chặn mềm) — đang làm mới phiên"
-                    if os.environ.get("RENDER"):
-                        print("[!] Đang chạy vai GHI trên Render mà FR24 trả rỗng "
-                              "=> FR24 chặn IP Render. Đổi env RADAR_MODE=phat + bật máy ghi ở nhà.")
-                    print(f"[!] Feed rỗng — tạo phiên FR24 mới, nghỉ {empty_backoff}s")
-                    fr_api = FlightRadar24API()
+                        state["last_error"] = (f"FR24 trả feed rỗng lần {empty_streak} "
+                                               "(chặn mềm) — đang chờ FR24 nguôi")
+                    # 2 lần đầu: thử ngay phiên mới (nhiều khi thoát liền).
+                    # Từ lần 3: giữ nguyên phiên + chờ lâu dần — tạo phiên mới liên tục
+                    # từ IP đang bị nghi chỉ khiến FR24 chặn dai hơn.
+                    if empty_streak <= 2 or empty_streak % 3 == 0:
+                        fr_api = FlightRadar24API()
+                        note = "tạo phiên FR24 mới"
+                    else:
+                        note = "giữ phiên, kiên nhẫn chờ"
+                    print(f"[!] Feed rỗng lần {empty_streak} — {note}, nghỉ {empty_backoff}s")
                     state["backoff_until"] = time.time() + empty_backoff
-                    empty_backoff = min(empty_backoff * 2, 300)
+                    empty_backoff = min(int(empty_backoff * 1.7), 600)
                 else:
+                    if empty_streak:
+                        print(f"[i] FR24 đã tha — có dữ liệu lại sau {empty_streak} lần rỗng")
                     backoff = BACKOFF_START
                     empty_backoff = 30
+                    empty_streak = 0
                     push_snapshot()
             except Exception as e:
                 with lock:
@@ -663,11 +673,31 @@ if INGEST_SECRET == "doi-mat-khau-nay-di":
     print("  [!] Đang dùng mật khẩu ingest MẶC ĐỊNH — nhớ đặt RADAR_INGEST_SECRET cả 2 bên!")
 print("=" * 60)
 
-if MODE == "ghi":
-    threading.Thread(target=poll_loop, daemon=True).start()
+# Vòng quét PHẢI chạy trong CHÍNH tiến trình đang trả lời web (gunicorn có thể nạp
+# code ở tiến trình mẹ rồi đẻ con — thread bật lúc nạp sẽ kẹt ở mẹ, con rỗng bộ nhớ).
+# Cách chắc ăn: bật lười ở request đầu tiên — tiến trình nào phục vụ web thì tự quét.
+_poll_started = False
+_poll_start_lock = threading.Lock()
+
+def ensure_poll_thread():
+    global _poll_started
+    if MODE != "ghi" or _poll_started:
+        return
+    with _poll_start_lock:
+        if _poll_started:
+            return
+        _poll_started = True
+        threading.Thread(target=poll_loop, daemon=True).start()
+        print(f"[i] (pid {os.getpid()}) Bật vòng quét FR24 trong tiến trình phục vụ web")
+
+@app.before_request
+def _boot_poller():
+    ensure_poll_thread()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8600"))
     print(f"  Mở: http://localhost:{port}" + ("  •  mini radar: /radar.html" if HAS_STATIC else ""))
+    ensure_poll_thread()   # chạy tay (python server.py): bật quét ngay, khỏi chờ request
     app.run(host="127.0.0.1" if MODE == "ghi" and not os.environ.get("RENDER") else "0.0.0.0",
             port=port, debug=False)
