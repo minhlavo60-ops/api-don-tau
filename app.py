@@ -399,7 +399,7 @@ def poll_loop():
                         state["last_error"] = "FR24 trả feed rỗng (nghi chặn mềm) — đang làm mới phiên"
                     if os.environ.get("RENDER"):
                         print("[!] Đang chạy vai GHI trên Render mà FR24 trả rỗng "
-                              "=> FR24 chặn IP Render. Đổi env RADAR_MODE=phat + bật máy ghi ở nhà.")
+                              "=> FR24 chặn IP Render. Đổi env RADAR_MODE = ghi + bật máy ghi ở nhà.")
                     print(f"[!] Feed rỗng — tạo phiên FR24 mới, nghỉ {empty_backoff}s")
                     fr_api = FlightRadar24API()
                     state["backoff_until"] = time.time() + empty_backoff
