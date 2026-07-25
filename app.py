@@ -5834,8 +5834,28 @@ def _merge_should_accept_entry(
     assisted_fallback = bool(inc_quality.get("assisted")) and (
         bool(cur_quality.get("estimated")) or cur_accept_age_ms >= SERVER_MERGE_ASSIST_START_MS
     )
+    # HAI NGUỒN CÙNG MỊN, CÙNG GIỜ THẬT → CÁI MỚI HƠN THẮNG.
+    # Điểm vai trò (+25 cho "chính") sinh ra để máy chính thắng box/toạ-độ-thô, KHÔNG phải để
+    # chặn một fix MỊN và MỚI HƠN của máy phụ. Trước bản này nó chặn thật: máy phụ ghi chen vào
+    # giữa nhịp máy chính (đúng thiết kế _phu_cho_den_luot) nhưng fix bị bỏ suốt 90s vì
+    # 110 >= 85+15 → web vẫn chỉ tươi theo nhịp máy chính, thêm máy phụ gần như vô ích.
+    # Vẫn AN TOÀN: đòi time_trusted CẢ HAI phía, nên nguồn đóng dấu giờ theo lô (box/fetcher cũ)
+    # không thể lấy timestamp giả để chen lên trước.
+    # Chỉ mở cửa cho toạ độ MỊN THẬT. Bộ gộp có thể "ước lượng" một fix thô thành mịn
+    # (raw_coarse/estimated — xem _merge_limit_track_correction); loại đó KHÔNG được hưởng
+    # ưu đãi này, nếu không máy chạy bản cũ gửi toạ độ thô vẫn chen được lên máy chính.
+    fresher_equal_quality = (
+        inc_quality["has_position"]
+        and not inc_quality["coarse"]
+        and not inc_quality.get("raw_coarse")
+        and not inc_quality.get("estimated")
+        and inc_quality["time_trusted"]
+        and cur_time_trusted
+        and inc_ts > cur_ts
+    )
     if (
         not assisted_fallback
+        and not fresher_equal_quality
         and cur_preferred_fresh
         and cur_score >= inc_score + SERVER_MERGE_QUALITY_SWITCH_MARGIN
     ):
