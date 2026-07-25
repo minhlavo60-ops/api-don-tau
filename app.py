@@ -5060,7 +5060,8 @@ def _load_live_from_firestore():
     if db is None:
         return None, {}
     try:
-        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get()
+        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get(
+            timeout=RADAR_LIVE_READ_TIMEOUT_S)
         LAST_RADAR_LIVE_READ_MS = int(time.time() * 1000)
         LAST_RADAR_LIVE_READ_ERROR = None
         data = snap.to_dict() or {} if snap.exists else {}
@@ -5097,6 +5098,21 @@ SERVER_MERGE_REFINED_COUNT = 0
 SERVER_MERGE_LAST_DOC_WRITE_MS = 0  # update_time của lần GHI doc gần nhất ĐÃ gộp (chống bơm tàu ma khi radar chết)
 SERVER_LIVE_MERGE_TTL_MS = int(os.environ.get("SERVER_LIVE_MERGE_TTL_MS", "90000"))
 SERVER_MERGE_READ_INTERVAL_S = float(os.environ.get("SERVER_MERGE_READ_INTERVAL_S", "6"))
+# Lần gần nhất GỘP ĐƯỢC một ảnh chụp MỚI (khác với SERVER_LIVE_MERGE_LAST_MS = lần gọi hàm gộp).
+# Dùng để biết đường ống còn sống hay không trước khi dọn store — xem chỗ prune.
+SERVER_MERGE_LAST_INGEST_MS = 0
+# Nhịp thở của luồng gộp nền. Luồng chết (gunicorn --preload fork mất thread) hoặc treo cứng ở
+# .get() Firestore đều làm bộ gộp đứng im → web mất tàu. Watchdog dựa vào mốc này để dựng lại.
+SERVER_MERGE_LOOP_HEARTBEAT_MS = 0
+SERVER_MERGE_LOOP_STALL_MS = int(os.environ.get("SERVER_MERGE_LOOP_STALL_MS", "60000"))
+SERVER_MERGE_LOOP_GUARD_LOCK = threading.Lock()
+SERVER_MERGE_LOOP_LAST_SPAWN_MS = 0
+SERVER_MERGE_LOOP_RESPAWNS = 0
+# Đọc Firestore PHẢI có hạn giờ: một lần .get() treo vô hạn là giết luôn luồng gộp vĩnh viễn
+# (đúng triệu chứng đã đo trên Render: merge_last_ms đứng im, last_radar_live_read_error = null).
+RADAR_LIVE_READ_TIMEOUT_S = float(os.environ.get("RADAR_LIVE_READ_TIMEOUT_S", "20"))
+# Dọn cứng theo TUỔI TELEMETRY để store không phình vô hạn khi tạm ngưng dọn theo seen_ms.
+SERVER_LIVE_MERGE_HARD_TTL_MS = int(os.environ.get("SERVER_LIVE_MERGE_HARD_TTL_MS", str(30 * 60 * 1000)))
 SERVER_MERGE_GROUND_LOCK_MS = int(os.environ.get("SERVER_MERGE_GROUND_LOCK_MS", "240000"))
 SERVER_MERGE_ACCEPT_NEWER_MS = int(os.environ.get("SERVER_MERGE_ACCEPT_NEWER_MS", "45000"))
 SERVER_MERGE_MAX_GROUND_JUMP_M = float(os.environ.get("SERVER_MERGE_MAX_GROUND_JUMP_M", "450"))
@@ -5916,7 +5932,8 @@ def _read_live_raw_for_merge():
     if db is None:
         return None, {}, 0
     try:
-        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get()
+        snap = db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).get(
+            timeout=RADAR_LIVE_READ_TIMEOUT_S)
         now = int(time.time() * 1000)
         LAST_RADAR_LIVE_READ_MS = now
         LAST_RADAR_LIVE_READ_ERROR = None
@@ -5954,7 +5971,7 @@ def _merge_live_snapshot_into_store(
       để chống 2 máy ghi PARKED/TAXIING lệch vị trí làm web nhảy loạn.
     - Entry rỗng/PENDING (không mốc) KHÔNG đè được mã đang có vị trí."""
     global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS, SERVER_MERGE_LAST_DOC_WRITE_MS
-    global SERVER_MERGE_REFINED_COUNT
+    global SERVER_MERGE_REFINED_COUNT, SERVER_MERGE_LAST_INGEST_MS
     changed = False
     source_label = str(source or "").strip()
     role_label = str(vai_tro or "").strip()
@@ -6042,11 +6059,23 @@ def _merge_live_snapshot_into_store(
                         cur["last_reject_source"] = source_label
                         cur["last_reject_ms"] = now_ms
                     SERVER_MERGE_REJECT_COUNTS[reason] = SERVER_MERGE_REJECT_COUNTS.get(reason, 0) + 1
-        # LUÔN dọn mã quá hạn (chạy mọi lần gọi, kể cả khi không có ghi mới).
-        for code in [c for c, v in SERVER_LIVE_MERGE.items()
-                     if now_ms - v["seen_ms"] > SERVER_LIVE_MERGE_TTL_MS]:
-            SERVER_LIVE_MERGE.pop(code, None)
-            changed = True
+        if is_new_write and isinstance(flights, dict):
+            SERVER_MERGE_LAST_INGEST_MS = now_ms
+        # Dọn mã quá hạn — NHƯNG chỉ khi ĐƯỜNG ỐNG CÒN SỐNG.
+        # Bẫy cũ: 'seen_ms' chỉ nhích khi server gộp được ảnh mới. Nếu luồng gộp nền chết/treo,
+        # hoặc chẳng ai mở app một lúc, thì seen_ms đứng yên vì SERVER chứ không phải vì tàu
+        # biến mất — dọn lúc đó XOÁ SẠCH store. Người mở app đầu tiên nhận feed rỗng → bản đồ
+        # trắng, rồi phải poll vài phút store mới đầy lại (đúng triệu chứng "lúc mất lúc có").
+        pipeline_alive = bool(SERVER_MERGE_LAST_INGEST_MS) and \
+            (now_ms - SERVER_MERGE_LAST_INGEST_MS) <= SERVER_LIVE_MERGE_TTL_MS
+        for code, v in list(SERVER_LIVE_MERGE.items()):
+            stale_seen = now_ms - v["seen_ms"] > SERVER_LIVE_MERGE_TTL_MS
+            # Tuổi telemetry thật: hết hạn cứng thì bỏ dù đường ống đang thế nào.
+            ts = v.get("ts") or v.get("seen_ms") or 0
+            hard_dead = ts and (now_ms - ts) > SERVER_LIVE_MERGE_HARD_TTL_MS
+            if hard_dead or (stale_seen and pipeline_alive):
+                SERVER_LIVE_MERGE.pop(code, None)
+                changed = True
         SERVER_LIVE_MERGE_LAST_MS = now_ms
         if changed:
             SERVER_LIVE_MERGE_REV += 1
@@ -6062,8 +6091,12 @@ def _server_merge_reader_loop() -> None:
     """Server role: đọc radarLive/current DÀY rồi gộp, để bắt ảnh chụp của MỌI máy fetcher
     dù chúng ghi đè chung 1 ô. Chạy nền, độc lập poll_loop. Hàm gộp tự gate ghi-mới + prune.
     (Đường request /api/etas cũng gọi gộp → đúng kể cả khi gunicorn không giữ luồng nền này.)"""
+    global SERVER_MERGE_LOOP_HEARTBEAT_MS
+    SERVER_MERGE_LOOP_HEARTBEAT_MS = int(time.time() * 1000)
     time.sleep(2)
     while True:
+        # Đập nhịp TRƯỚC khi đọc Firestore: nếu .get() treo, mốc này đứng lại → watchdog thấy.
+        SERVER_MERGE_LOOP_HEARTBEAT_MS = int(time.time() * 1000)
         try:
             flights, _meta, doc_write_ms = _read_live_raw_for_merge()
             _merge_live_snapshot_into_store(
@@ -6076,6 +6109,38 @@ def _server_merge_reader_loop() -> None:
         except Exception as e:
             log.warning("Luồng gộp radarLive lỗi: %s", e)
         time.sleep(max(2.0, SERVER_MERGE_READ_INTERVAL_S))
+
+
+def _ensure_merge_loop_alive() -> None:
+    """WATCHDOG bộ gộp — gọi rẻ từ đường request và từ health ping.
+
+    ĐO ĐƯỢC TRÊN RENDER (25/07): 164 request/30s, container thức hẳn, mà merge_last_ms không
+    nhúc nhích suốt 10 phút → luồng gộp nền KHÔNG chạy. Hai nguyên nhân đều có thật:
+      • gunicorn chạy kèm --preload: thread dựng ở tiến trình cha KHÔNG theo fork sang worker,
+        mà _poller_started đã = True nên _start_poller() không bao giờ dựng lại.
+      • .get() Firestore treo vô hạn (trước khi có timeout) → thread sống nhưng đứng cứng.
+    Không có bộ gộp thì mỗi máy fetcher ghi đè radarLive/current bằng ảnh chụp RIÊNG → web
+    thấy mỗi lúc một máy → TÀU LÚC CÓ LÚC MẤT. Đây là gốc của lỗi đó."""
+    global SERVER_MERGE_LOOP_LAST_SPAWN_MS, SERVER_MERGE_LOOP_RESPAWNS
+    if RADAR_ROLE != "server":
+        return
+    now_ms = int(time.time() * 1000)
+    beat = SERVER_MERGE_LOOP_HEARTBEAT_MS
+    if beat and now_ms - beat <= SERVER_MERGE_LOOP_STALL_MS:
+        return
+    with SERVER_MERGE_LOOP_GUARD_LOCK:
+        # Hai điều kiện phải kiểm TRONG lock để nhiều request đồng thời không đẻ một loạt thread.
+        beat = SERVER_MERGE_LOOP_HEARTBEAT_MS
+        if beat and now_ms - beat <= SERVER_MERGE_LOOP_STALL_MS:
+            return
+        if now_ms - SERVER_MERGE_LOOP_LAST_SPAWN_MS < SERVER_MERGE_LOOP_STALL_MS:
+            return
+        SERVER_MERGE_LOOP_LAST_SPAWN_MS = now_ms
+        SERVER_MERGE_LOOP_RESPAWNS += 1
+        seq = SERVER_MERGE_LOOP_RESPAWNS
+    threading.Thread(target=_server_merge_reader_loop, daemon=True, name=f"merge_reader_{seq}").start()
+    log.warning("Luồng gộp radarLive đứng im %ss — đã dựng lại (lần %d).",
+                (now_ms - beat) // 1000 if beat else "?", seq)
 
 
 # ── SERVER PHỤ: quan sát máy chính & canh lượt poll bù ──────────────────────
@@ -6680,6 +6745,9 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
 @app.route("/", methods=["GET"])
 def health():
     """Health check public (không yêu cầu API key) để cron-job.org ping keep-alive."""
+    # Tiện thể hồi sinh luồng gộp nếu nó chết — ping keep-alive vẫn chạy cả khi không ai mở app,
+    # nên bộ gộp không bao giờ nằm chết chờ người dùng đầu tiên nữa.
+    _ensure_merge_loop_alive()
     with SERVER_LIVE_MERGE_LOCK:
         merge_reject_counts = dict(SERVER_MERGE_REJECT_COUNTS)
         merge_source_profiles = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_PROFILES.items()}
@@ -6704,6 +6772,10 @@ def health():
             "merge_revision": SERVER_LIVE_MERGE_REV,
             "merge_last_ms": SERVER_LIVE_MERGE_LAST_MS,
             "merge_read_interval_s": SERVER_MERGE_READ_INTERVAL_S,
+            # Soi sức khoẻ luồng gộp từ ngoài: heartbeat phải nhích liên tục, respawns nên đứng yên.
+            "merge_loop_heartbeat_ms": SERVER_MERGE_LOOP_HEARTBEAT_MS,
+            "merge_loop_respawns": SERVER_MERGE_LOOP_RESPAWNS,
+            "merge_last_ingest_ms": SERVER_MERGE_LAST_INGEST_MS,
             "merge_policy": "quality-first-fusion-v3",
             "merge_reject_counts": merge_reject_counts,
             "merge_source_profiles": merge_source_profiles,
@@ -6952,6 +7024,7 @@ def scan_arrivals():
 def get_all_etas():
     if (err := require_api_key()):
         return err
+    _ensure_merge_loop_alive()
     _refresh_schedule_from_firestore(force=False)
     _sync_manual_tracking_from_firestore(force=False)
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
