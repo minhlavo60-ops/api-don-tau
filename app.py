@@ -5124,7 +5124,13 @@ SERVER_MERGE_TELEPORT_MIN_M = float(os.environ.get("SERVER_MERGE_TELEPORT_MIN_M"
 SERVER_MERGE_MAX_AIR_SPEED_KT = float(os.environ.get("SERVER_MERGE_MAX_AIR_SPEED_KT", "750"))
 #   - Không HẠ CẤP mịn→thô để đổi lấy chút tươi: fix THÔ (toạ độ rơi lưới 0.01° ~1.1km) không đè
 #     fix MỊN còn tươi trong ngần này → hết cảnh marker nhảy qua lại giữa vị trí thô/mịn 2 máy.
-SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "90000"))
+# 27/07/2026 — HẠ 90s → 35s. ĐO THỰC trên app live (19 tàu, đọc SERVER_META): tuổi fix trung
+# vị 120s, và tàu ở 16km sắp hạ vẫn mang fix 82s tuổi. Máy ghi poll FR24 mỗi 9-23s, Render
+# chuyển tiếp ~10s ⇒ phần lớn độ trễ chính là cửa giữ-mịn 90s này. Đổi chác đúng bản chất:
+# giữ thêm 60s để có toạ độ mịn thì marker sai ~7km với tàu 230kt, trong khi nhận fix THÔ
+# tươi chỉ sai ~1,1km (lưới 0.01°). Tức giữ-mịn-quá-lâu ĐANG LÀM SAI VỊ TRÍ NHIỀU HƠN gấp 6
+# lần so với thứ nó bảo vệ. 35s vẫn đủ khử cảnh marker nhảy qua lại giữa 2 máy trong 1-2 nhịp.
+SERVER_MERGE_FINE_HOLD_MS = int(os.environ.get("SERVER_MERGE_FINE_HOLD_MS", "35000"))
 SERVER_MERGE_TRUSTED_MAX_AGE_MS = int(os.environ.get("SERVER_MERGE_TRUSTED_MAX_AGE_MS", "120000"))
 SERVER_MERGE_SOURCE_HOLD_MS = int(os.environ.get("SERVER_MERGE_SOURCE_HOLD_MS", "90000"))
 SERVER_MERGE_QUALITY_SWITCH_MARGIN = int(os.environ.get("SERVER_MERGE_QUALITY_SWITCH_MARGIN", "15"))
