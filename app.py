@@ -5188,6 +5188,13 @@ SERVER_MERGE_REJECT_COUNTS: dict[str, int] = {}
 SERVER_MERGE_SOURCE_PROFILES: dict[str, dict] = {}
 SERVER_MERGE_SOURCE_CALIBRATION: dict[str, dict] = {}
 SERVER_MERGE_REFINED_COUNT = 0
+# Render chỉ dùng atlas để giải lưới thô sau khi atlas đã tự làm-thô FINE lịch sử
+# và chứng minh sai số nhỏ hơn cách quán tính+lưới hiện tại. Kết quả vẫn là ESTIMATED.
+SERVER_MERGE_ROUTE_REFINE_ENABLED = (
+    os.environ.get("SERVER_MERGE_ROUTE_REFINE_ENABLED", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+SERVER_MERGE_ROUTE_REFINED_COUNT = 0
 # Bảng điều hành radar chỉ đọc heartbeat khi quản lý mở tab Hệ thống. Cache 60s vì
 # heartbeat vốn chỉ ghi mỗi 5 phút; như vậy bấm qua lại không làm tăng Firestore reads.
 RADAR_STATUS_ACTIVE_MS = int(os.environ.get("RADAR_STATUS_ACTIVE_MS", str(15 * 60 * 1000)))
@@ -5530,6 +5537,58 @@ def _merge_learn_source_calibration_locked(
     }
 
 
+def _merge_route_refine_from_atlas(entry: dict, predicted: dict) -> Optional[dict]:
+    """Nhờ atlas FINE đã tự chấm giải tâm ô 0,01° thành vị trí liên tục.
+
+    Đây là tầng cộng thêm trên quán tính hiện có. Nếu atlas chưa đủ mẫu, nhánh
+    mơ hồ hoặc không thắng baseline thì trả None và bộ gộp dùng công thức cũ.
+    """
+    if (
+        not SERVER_MERGE_ROUTE_REFINE_ENABLED
+        or not RADAR_INK_ENABLED
+        or not getattr(RADAR_INK_MAP, "nodes", None)
+        or not hasattr(RADAR_INK_MAP, "resolve_coarse_position")
+    ):
+        return None
+    raw_lat, raw_lng = _merge_entry_lat_lng(entry)
+    ref_lat, ref_lng = _merge_entry_lat_lng(predicted)
+    if raw_lat is None or raw_lng is None or ref_lat is None or ref_lng is None:
+        return None
+    heading = _merge_float(entry.get("heading"))
+    speed_kt = _merge_entry_speed_kt(entry)
+    altitude_ft = _merge_float(entry.get("altitude_ft"))
+    origin = str(entry.get("origin_iata") or entry.get("origin") or "").strip().upper()[:8]
+    try:
+        context = RADAR_INK_MAP.context_hint(
+            raw_lat, raw_lng, heading, speed_kt, altitude_ft,
+            movement="ARRIVAL",
+        )
+        runway_hint = str(
+            context.get("runway_id")
+            or RADAR_INK_MAP.recent_runway_hint()
+            or ""
+        )
+        if runway_hint and not context.get("runway_id"):
+            context = RADAR_INK_MAP.context_hint(
+                raw_lat, raw_lng, heading, speed_kt, altitude_ft,
+                movement="ARRIVAL", runway_hint=runway_hint,
+            )
+        resolved = RADAR_INK_MAP.resolve_coarse_position(
+            raw_lat, raw_lng,
+            ref_lat, ref_lng,
+            heading, speed_kt, altitude_ft,
+            origin=origin,
+            movement="ARRIVAL",
+            runway_hint=str(context.get("runway_id") or runway_hint),
+            phase_hint=str(context.get("phase") or ""),
+            require_approved=True,
+        )
+    except Exception as error:
+        log.warning("Radar-ink giải fix thô lỗi: %s", error)
+        return None
+    return resolved if isinstance(resolved, dict) and resolved.get("use") else None
+
+
 def _merge_refine_aux_entry(
     cur: Optional[dict],
     entry: dict,
@@ -5584,14 +5643,55 @@ def _merge_refine_aux_entry(
         return None
 
     out = dict(entry)
-    out["latitude"] = pred_lat + measurement_weight * (raw_lat - pred_lat)
-    out["longitude"] = pred_lng + measurement_weight * (raw_lng - pred_lng)
+    route_resolved = _merge_route_refine_from_atlas(entry, predicted)
+    if route_resolved is not None:
+        out["latitude"] = float(route_resolved["latitude"])
+        out["longitude"] = float(route_resolved["longitude"])
+        out["merge_route_refined"] = True
+        out["merge_refine_method"] = "fine-atlas-route"
+        out["merge_route_confidence"] = float(route_resolved.get("confidence") or 0.0)
+        out["merge_route_support"] = int(route_resolved.get("support") or 0)
+        out["merge_route_branch_probability"] = float(
+            route_resolved.get("branch_probability") or 0.0
+        )
+        out["merge_route_phase"] = str(route_resolved.get("phase") or "")
+        out["merge_route_runway_id"] = route_resolved.get("runway_id")
+        out["merge_route_level"] = str(route_resolved.get("level") or "")
+        out["merge_route_raw_distance_m"] = int(route_resolved.get("raw_distance_m") or 0)
+        out["merge_route_reference_distance_m"] = int(
+            route_resolved.get("reference_distance_m") or 0
+        )
+        out["merge_route_atlas_rev"] = int(route_resolved.get("rev") or 0)
+        out["merge_route_quality_scope"] = str(route_resolved.get("quality_scope") or "")
+    else:
+        # Ảnh thô đầu vào bình thường không có các khóa này, nhưng chủ động xóa để một payload
+        # trung gian/phiên bản cũ không mang nhầm dấu "đã giải theo vệt" sang fallback quán tính.
+        for key in (
+            "merge_route_refined",
+            "merge_route_confidence",
+            "merge_route_support",
+            "merge_route_branch_probability",
+            "merge_route_phase",
+            "merge_route_runway_id",
+            "merge_route_level",
+            "merge_route_raw_distance_m",
+            "merge_route_reference_distance_m",
+            "merge_route_atlas_rev",
+            "merge_route_quality_scope",
+        ):
+            out.pop(key, None)
+        out["latitude"] = pred_lat + measurement_weight * (raw_lat - pred_lat)
+        out["longitude"] = pred_lng + measurement_weight * (raw_lng - pred_lng)
+        out["merge_refine_method"] = "motion-grid-blend"
     out["updated_at_millis"] = target_ms
     out["last_seen_millis"] = target_ms
     out["server_seen_millis"] = int(doc_write_ms or now_ms)
+    out["distance_km"] = _haversine_km(
+        float(out["latitude"]), float(out["longitude"]), DAD_LAT, DAD_LNG
+    )
     out["merge_refined"] = True
     out["merge_raw_position_quality"] = "coarse"
-    out["merge_refine_weight"] = round(measurement_weight, 3)
+    out["merge_refine_weight"] = 1.0 if route_resolved is not None else round(measurement_weight, 3)
     out["merge_refine_residual_m"] = int(round(residual_m))
     out["merge_calibrated_lag_ms"] = learned_lag_ms
     quality = _merge_entry_quality(out, target_ms, now_ms, "", profile or {})
@@ -6097,7 +6197,8 @@ def _merge_live_snapshot_into_store(
       để chống 2 máy ghi PARKED/TAXIING lệch vị trí làm web nhảy loạn.
     - Entry rỗng/PENDING (không mốc) KHÔNG đè được mã đang có vị trí."""
     global SERVER_LIVE_MERGE_REV, SERVER_LIVE_MERGE_LAST_MS, SERVER_MERGE_LAST_DOC_WRITE_MS
-    global SERVER_MERGE_REFINED_COUNT, SERVER_MERGE_LAST_INGEST_MS
+    global SERVER_MERGE_REFINED_COUNT, SERVER_MERGE_ROUTE_REFINED_COUNT
+    global SERVER_MERGE_LAST_INGEST_MS
     changed = False
     source_label = str(source or "").strip()
     role_label = str(vai_tro or "").strip()
@@ -6168,6 +6269,8 @@ def _merge_live_snapshot_into_store(
                     }
                     if quality.get("estimated"):
                         SERVER_MERGE_REFINED_COUNT += 1
+                    if entry.get("merge_route_refined"):
+                        SERVER_MERGE_ROUTE_REFINED_COUNT += 1
                     changed = True
                 else:
                     # Không cho mẫu đứng im/stale/teleport cứ được đóng dấu lại để giữ tàu ma mãi.
@@ -6912,11 +7015,13 @@ def health():
             "fr24_detail_cloudflare_blocked": FR24_DETAIL_CLOUDFLARE,
             "fr24_detail_other_error": FR24_DETAIL_OTHER_ERR,
             "fr24_detail_last_error": FR24_DETAIL_LAST_ERROR,
-            "merge_policy": "quality-first-fusion-v3",
+            "merge_policy": "quality-first-route-fusion-v4",
             "merge_reject_counts": merge_reject_counts,
             "merge_source_profiles": merge_source_profiles,
             "merge_source_calibration": merge_source_calibration,
             "merge_refined_count": SERVER_MERGE_REFINED_COUNT,
+            "merge_route_refine_enabled": SERVER_MERGE_ROUTE_REFINE_ENABLED,
+            "merge_route_refined_count": SERVER_MERGE_ROUTE_REFINED_COUNT,
             "radar_ink_enabled": RADAR_INK_ENABLED,
             "radar_ink_rev": RADAR_INK_MAP.rev,
             "radar_ink_nodes": len(RADAR_INK_MAP.nodes),
@@ -6967,6 +7072,7 @@ def _radar_status_feed_summary(entries: list[dict]) -> dict:
     fine = 0
     coarse = 0
     estimated = 0
+    route_estimated = 0
     source_counts: dict[str, dict] = {}
     for entry in entries:
         if not isinstance(entry, dict) or not _merge_entry_has_position(entry):
@@ -6977,6 +7083,8 @@ def _radar_status_feed_summary(entries: list[dict]) -> dict:
         quality = str(entry.get("merge_position_quality") or "").strip().lower()
         if quality == "estimated":
             estimated += 1
+            if entry.get("merge_route_refined"):
+                route_estimated += 1
         elif quality == "coarse" or (not quality and _merge_entry_is_coarse(entry)):
             coarse += 1
             quality = "coarse"
@@ -6991,9 +7099,12 @@ def _radar_status_feed_summary(entries: list[dict]) -> dict:
             "fine": 0,
             "coarse": 0,
             "estimated": 0,
+            "route_estimated": 0,
         })
         row["selected"] += 1
         row[quality if quality in {"fine", "coarse", "estimated"} else "fine"] += 1
+        if quality == "estimated" and entry.get("merge_route_refined"):
+            row["route_estimated"] += 1
 
     coarse_share = (coarse / positioned) if positioned else 0.0
     fine_share = (fine / positioned) if positioned else 0.0
@@ -7010,6 +7121,7 @@ def _radar_status_feed_summary(entries: list[dict]) -> dict:
         "fine": fine,
         "coarse": coarse,
         "estimated": estimated,
+        "route_estimated": route_estimated,
         "fine_share": round(fine_share, 3),
         "coarse_share": round(coarse_share, 3),
         "quality": quality_code,
@@ -7134,7 +7246,7 @@ def radar_status():
     feed_summary = _radar_status_feed_summary(feed_entries)
     feed_summary.update({
         "mode": "merged" if merged_entries else "snapshot_fallback",
-        "merge_policy": "quality-first-fusion-v3",
+        "merge_policy": "quality-first-route-fusion-v4",
         "merge_size": merge_size,
         "merge_revision": merge_revision,
         "merge_last_ingest_millis": merge_last_ingest_ms or None,
@@ -7153,6 +7265,8 @@ def radar_status():
         "radar_ink_enabled": RADAR_INK_ENABLED,
         "radar_ink_nodes": len(RADAR_INK_MAP.nodes),
         "radar_ink_edges": sum(len(value) for value in RADAR_INK_MAP.edges.values()),
+        "route_refine_enabled": SERVER_MERGE_ROUTE_REFINE_ENABLED,
+        "route_refined_total": SERVER_MERGE_ROUTE_REFINED_COUNT,
     })
 
     payload = {
