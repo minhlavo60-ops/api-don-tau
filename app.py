@@ -4259,7 +4259,7 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
     """
     max_minutes = max(5, min(int(max_minutes or AUTO_SCAN_DEFAULT_MINUTES), AUTO_SCAN_MAX_MINUTES))
     now_ms = int(time.time() * 1000)
-    fr_api = FlightRadar24API()
+    fr_api = _make_fr_api()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
     # Snapshot schedule hints để dùng làm whitelist khi FR24 thiếu dest
     with _lock:
@@ -4376,11 +4376,104 @@ def _discover_dad_arrivals(max_minutes: int = AUTO_SCAN_DEFAULT_MINUTES, add_to_
 # POLLER
 # ===========================================================
 
-def _safe_get_details(fr_api, flight):
+# ===========================================================
+# FR24 + CLOUDFLARE  (thêm 27/07/2026)
+# ===========================================================
+# FR24 đã dựng Cloudflare bot-management trước endpoint clickhandler (endpoint lấy trail để LÀM MỊN
+# toạ độ). Endpoint feed thì không bị, nên máy vẫn bám tàu — chỉ mất phần mịn, đúng triệu chứng
+# "toạ độ thô 100%" của DESKTOP-DGD535H và "thô 44%" của máy chính.
+#
+# ĐO ĐƯỢC (27/07/2026): gọi clickhandler bằng TLS 1.2 -> HTTP 403, bằng TLS 1.3 -> 200, lặp 4/4 cặp.
+# Nhưng chỉ TLS 1.3 thôi chưa đủ: Cloudflare còn xét DẤU VÂN TAY TLS. Thư viện FlightRadarAPI từ
+# 1.5.x đã chuyển sang curl_cffi và GIẢ LẬP vân tay Chrome (impersonate="chrome136") — đó chính là
+# thứ giúp qua được. Bản 1.3.x cũ vẫn dùng `requests` thường nên CHẮC CHẮN bị chặn.
+# => requirements.txt đã nâng ghim lên >=1.5.1. Máy nào còn bản cũ là thô 100%.
+_FR24_IMPERSONATE = (os.environ.get("FR24_IMPERSONATE") or "").strip()
+
+try:
+    from FlightRadarAPI.request import RetryPolicy as _FrRetryPolicy
+except Exception:  # pragma: no cover - thư viện đời cũ
+    _FrRetryPolicy = None
+
+try:
+    from FlightRadarAPI.errors import CloudflareError as _FrCloudflareError
+except Exception:  # pragma: no cover - thư viện đời cũ
+    _FrCloudflareError = None
+
+try:
+    import curl_cffi as _curl_cffi  # noqa: F401
+    _FR24_HAS_IMPERSONATE = True
+except Exception:
+    _FR24_HAS_IMPERSONATE = False
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _FR24_LIB_VERSION = _pkg_version("FlightRadarAPI")
+except Exception:
+    _FR24_LIB_VERSION = "?"
+
+# Đếm để SOI ĐƯỢC TỪ XA qua endpoint "/" — trước đây _safe_get_details nuốt sạch lỗi nên máy bị
+# Cloudflare chặn suốt mà không ai biết, chỉ thấy "toạ độ thô" mà không hiểu vì sao.
+FR24_DETAIL_OK = 0
+FR24_DETAIL_CLOUDFLARE = 0
+FR24_DETAIL_OTHER_ERR = 0
+FR24_DETAIL_LAST_ERROR = None
+
+if not _FR24_HAS_IMPERSONATE:
+    log.warning(
+        "!!! FlightRadarAPI %s KHONG co curl_cffi. Thu vien doi cu dung `requests` thuong nen "
+        "Cloudflare se chan phan CHI TIET -> TOA DO THO 100%%. "
+        "Chay:  pip install -U -r requirements.txt", _FR24_LIB_VERSION,
+    )
+else:
+    log.info(
+        "FlightRadarAPI %s co gia lap van tay TLS (curl_cffi) — qua duoc Cloudflare.",
+        _FR24_LIB_VERSION,
+    )
+
+
+def _make_fr_api():
+    """Dựng FlightRadar24API có nhịp lùi + cho phép đổi hồ sơ giả lập bằng biến môi trường.
+
+    Mặc định của thư viện là KHÔNG thử lại (max_attempts=1), nên chỉ cần Cloudflare chặn một nhịp
+    là mất luôn dữ liệu mịn của cả chu kỳ đó. Khi FR24 siết thêm mà thư viện chưa kịp ra bản mới,
+    đặt biến môi trường FR24_IMPERSONATE=chrome137 (hoặc mới hơn) là đổi được ngay, không cần sửa mã.
+    """
+    kwargs = {}
+    if _FrRetryPolicy is not None:
+        kwargs["retry"] = _FrRetryPolicy(max_attempts=3, base_delay=2.0, max_delay=20.0)
+    if _FR24_IMPERSONATE:
+        kwargs["impersonate"] = _FR24_IMPERSONATE
     try:
-        return fr_api.get_flight_details(flight)
+        return FlightRadar24API(**kwargs)
+    except TypeError:
+        # Thư viện quá cũ, chưa có mấy tham số này. Vẫn chạy được, nhưng gần như chắc chắn sẽ bị
+        # Cloudflare chặn phần chi tiết -> xem cảnh báo lúc khởi động và fr24_lib_can_impersonate.
+        return FlightRadar24API()
+
+
+def _safe_get_details(fr_api, flight):
+    global FR24_DETAIL_OK, FR24_DETAIL_CLOUDFLARE, FR24_DETAIL_OTHER_ERR, FR24_DETAIL_LAST_ERROR
+    try:
+        details = fr_api.get_flight_details(flight)
+        FR24_DETAIL_OK += 1
+        return details
     except Exception as e:
-        log.warning("get_flight_details exception: %s", e)
+        is_cf = _FrCloudflareError is not None and isinstance(e, _FrCloudflareError)
+        if not is_cf:
+            text = str(e).lower()
+            is_cf = "cloudflare" in text or "just a moment" in text or "403" in text
+        if is_cf:
+            FR24_DETAIL_CLOUDFLARE += 1
+            FR24_DETAIL_LAST_ERROR = "Cloudflare chan bot: %s" % e
+            log.warning(
+                "get_flight_details bi CLOUDFLARE CHAN (lan thu %d) - toa do se bi tho. %s",
+                FR24_DETAIL_CLOUDFLARE, e,
+            )
+        else:
+            FR24_DETAIL_OTHER_ERR += 1
+            FR24_DETAIL_LAST_ERROR = "%s: %s" % (type(e).__name__, e)
+            log.warning("get_flight_details exception: %s", e)
         return None
 
 
@@ -4521,7 +4614,7 @@ def _do_poll() -> None:
     with _lock:
         queue_snapshot = set(QUEUE)
 
-    fr_api = FlightRadar24API()
+    fr_api = _make_fr_api()
     flights = fr_api.get_flights(bounds=BOUNDS_DAD)
 
     # Match codes ổn định. Không dùng trực tiếp number/callsign làm key,
@@ -5095,6 +5188,13 @@ SERVER_MERGE_REJECT_COUNTS: dict[str, int] = {}
 SERVER_MERGE_SOURCE_PROFILES: dict[str, dict] = {}
 SERVER_MERGE_SOURCE_CALIBRATION: dict[str, dict] = {}
 SERVER_MERGE_REFINED_COUNT = 0
+# Bảng điều hành radar chỉ đọc heartbeat khi quản lý mở tab Hệ thống. Cache 60s vì
+# heartbeat vốn chỉ ghi mỗi 5 phút; như vậy bấm qua lại không làm tăng Firestore reads.
+RADAR_STATUS_ACTIVE_MS = int(os.environ.get("RADAR_STATUS_ACTIVE_MS", str(15 * 60 * 1000)))
+RADAR_STATUS_CACHE_TTL_MS = int(os.environ.get("RADAR_STATUS_CACHE_TTL_MS", "60000"))
+RADAR_STATUS_CACHE_LOCK = threading.Lock()
+RADAR_STATUS_CACHE_AT_MS = 0
+RADAR_STATUS_CACHE_PAYLOAD: dict = {}
 SERVER_MERGE_LAST_DOC_WRITE_MS = 0  # update_time của lần GHI doc gần nhất ĐÃ gộp (chống bơm tàu ma khi radar chết)
 SERVER_LIVE_MERGE_TTL_MS = int(os.environ.get("SERVER_LIVE_MERGE_TTL_MS", "90000"))
 SERVER_MERGE_READ_INTERVAL_S = float(os.environ.get("SERVER_MERGE_READ_INTERVAL_S", "6"))
@@ -6802,6 +6902,16 @@ def health():
             "merge_loop_heartbeat_ms": SERVER_MERGE_LOOP_HEARTBEAT_MS,
             "merge_loop_respawns": SERVER_MERGE_LOOP_RESPAWNS,
             "merge_last_ingest_ms": SERVER_MERGE_LAST_INGEST_MS,
+            # Soi từ xa vì sao toạ độ bị thô. fr24_lib_can_impersonate=false nghĩa là máy này còn
+            # thư viện FlightRadarAPI đời cũ (chưa có curl_cffi giả lập vân tay Chrome) -> Cloudflare
+            # chặn sạch phần chi tiết -> thô 100%. Chữa: pip install -U -r requirements.txt
+            "fr24_lib_version": _FR24_LIB_VERSION,
+            "fr24_lib_can_impersonate": _FR24_HAS_IMPERSONATE,
+            "fr24_impersonate_override": _FR24_IMPERSONATE or None,
+            "fr24_detail_ok": FR24_DETAIL_OK,
+            "fr24_detail_cloudflare_blocked": FR24_DETAIL_CLOUDFLARE,
+            "fr24_detail_other_error": FR24_DETAIL_OTHER_ERR,
+            "fr24_detail_last_error": FR24_DETAIL_LAST_ERROR,
             "merge_policy": "quality-first-fusion-v3",
             "merge_reject_counts": merge_reject_counts,
             "merge_source_profiles": merge_source_profiles,
@@ -6838,6 +6948,236 @@ def health():
             "firestore_schedule_dates": FIRESTORE_SCHEDULE_DATES,
             "firestore_manual_tracking_dates": FIRESTORE_MANUAL_TRACKING_DATES,
         })
+
+
+def _radar_status_quality_code(positioned: int, coarse_share: float) -> str:
+    """Nhãn ngắn cho UI; ngưỡng rộng để không kết luận quá đà từ snapshot ít tàu."""
+    if positioned <= 0:
+        return "unknown"
+    if coarse_share <= 0.2:
+        return "fine"
+    if coarse_share >= 0.8:
+        return "coarse"
+    return "mixed"
+
+
+def _radar_status_feed_summary(entries: list[dict]) -> dict:
+    """Đếm đúng các fix Render đã chọn đưa cho web, không đếm snapshot bị loại."""
+    positioned = 0
+    fine = 0
+    coarse = 0
+    estimated = 0
+    source_counts: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not _merge_entry_has_position(entry):
+            continue
+        if _merge_entry_state(entry) in SERVER_MERGE_EMPTY_STATES:
+            continue
+        positioned += 1
+        quality = str(entry.get("merge_position_quality") or "").strip().lower()
+        if quality == "estimated":
+            estimated += 1
+        elif quality == "coarse" or (not quality and _merge_entry_is_coarse(entry)):
+            coarse += 1
+            quality = "coarse"
+        else:
+            fine += 1
+            quality = "fine"
+
+        source = str(entry.get("merge_source") or entry.get("source") or "không rõ").strip()[:80]
+        row = source_counts.setdefault(source, {
+            "source": source,
+            "selected": 0,
+            "fine": 0,
+            "coarse": 0,
+            "estimated": 0,
+        })
+        row["selected"] += 1
+        row[quality if quality in {"fine", "coarse", "estimated"} else "fine"] += 1
+
+    coarse_share = (coarse / positioned) if positioned else 0.0
+    fine_share = (fine / positioned) if positioned else 0.0
+    if positioned <= 0:
+        quality_code = "unknown"
+    elif fine_share >= 0.7:
+        quality_code = "fine"
+    elif coarse_share >= 0.7:
+        quality_code = "coarse"
+    else:
+        quality_code = "mixed"
+    return {
+        "positioned": positioned,
+        "fine": fine,
+        "coarse": coarse,
+        "estimated": estimated,
+        "fine_share": round(fine_share, 3),
+        "coarse_share": round(coarse_share, 3),
+        "quality": quality_code,
+        "sources": sorted(source_counts.values(), key=lambda row: (-row["selected"], row["source"])),
+    }
+
+
+@app.route("/api/radar_status", methods=["GET"])
+def radar_status():
+    """Bảng điều hành chỉ đọc: heartbeat máy radar + chất lượng feed Render đang chọn.
+
+    Không tạo listener. Kết quả cache ngắn trên Render vì heartbeat chỉ đổi mỗi 5 phút.
+    """
+    global RADAR_STATUS_CACHE_AT_MS, RADAR_STATUS_CACHE_PAYLOAD
+    if (err := require_api_key()):
+        return err
+
+    _ensure_merge_loop_alive()
+    now_ms = int(time.time() * 1000)
+    with RADAR_STATUS_CACHE_LOCK:
+        if (
+            RADAR_STATUS_CACHE_PAYLOAD
+            and now_ms - RADAR_STATUS_CACHE_AT_MS < RADAR_STATUS_CACHE_TTL_MS
+        ):
+            cached = dict(RADAR_STATUS_CACHE_PAYLOAD)
+            cached["cache_age_ms"] = max(0, now_ms - RADAR_STATUS_CACHE_AT_MS)
+            cached["cached"] = True
+            return jsonify(cached)
+
+    with SERVER_LIVE_MERGE_LOCK:
+        profiles = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_PROFILES.items()}
+        merged_entries = [
+            dict(value.get("entry") or {})
+            for value in SERVER_LIVE_MERGE.values()
+            if isinstance(value, dict)
+        ]
+        merge_size = len(SERVER_LIVE_MERGE)
+        merge_revision = SERVER_LIVE_MERGE_REV
+        merge_last_ingest_ms = SERVER_MERGE_LAST_INGEST_MS
+        merge_loop_heartbeat_ms = SERVER_MERGE_LOOP_HEARTBEAT_MS
+
+    servers: list[dict] = []
+    current_data: dict = {}
+    scan_error = None
+    db = _init_firestore_client()
+    if db is None:
+        scan_error = FIRESTORE_STATUS or "Firestore chưa sẵn sàng"
+    else:
+        try:
+            for snap in db.collection(RADAR_LIVE_COLLECTION).stream(
+                timeout=RADAR_LIVE_READ_TIMEOUT_S
+            ):
+                data = snap.to_dict() or {}
+                if snap.id == RADAR_LIVE_DOC_ID:
+                    current_data = data
+                    continue
+                if not snap.id.startswith("fetcher_"):
+                    continue
+
+                source = str(data.get("source") or snap.id[len("fetcher_"):]).strip()[:80]
+                seen_ms = _to_int_ms(data.get("last_seen_millis")) or 0
+                if not seen_ms:
+                    try:
+                        seen_ms = int(snap.update_time.timestamp() * 1000)
+                    except Exception:
+                        seen_ms = 0
+                age_ms = max(0, now_ms - seen_ms) if seen_ms else None
+                active = bool(seen_ms and age_ms is not None and age_ms <= RADAR_STATUS_ACTIVE_MS)
+                configured_role = str(data.get("vai_tro") or "phu").strip().lower()
+                current_role = str(data.get("vai_tro_hien_tai") or configured_role).strip().lower()
+
+                profile = profiles.get(source) or {}
+                positioned = max(0, int(profile.get("positioned") or 0))
+                try:
+                    coarse_share = min(1.0, max(0.0, float(profile.get("coarse_share") or 0.0)))
+                except (TypeError, ValueError):
+                    coarse_share = 0.0
+                profile_seen_ms = _to_int_ms(profile.get("last_seen_ms")) or 0
+                quality_fresh = bool(
+                    profile_seen_ms
+                    and now_ms - profile_seen_ms <= RADAR_STATUS_ACTIVE_MS
+                )
+                quality = (
+                    _radar_status_quality_code(positioned, coarse_share)
+                    if quality_fresh else "unknown"
+                )
+                servers.append({
+                    "source": source,
+                    "configured_role": configured_role,
+                    "current_role": current_role,
+                    "yielding_operations": bool(data.get("nhuong_nghiep_vu")),
+                    "last_seen_millis": seen_ms or None,
+                    "age_ms": age_ms,
+                    "active": active,
+                    "quality": quality,
+                    "positioned": positioned if quality_fresh else 0,
+                    "coarse_share": round(coarse_share, 3) if quality_fresh else None,
+                    "batch_clock": bool(profile.get("batch_clock")) if quality_fresh else None,
+                    "quality_sample_millis": profile_seen_ms or None,
+                })
+        except Exception as error:
+            scan_error = str(error)[:240]
+
+    servers.sort(key=lambda row: (
+        not row["active"],
+        row["configured_role"] != "chinh",
+        -(row["last_seen_millis"] or 0),
+        row["source"],
+    ))
+    active_servers = [row for row in servers if row["active"]]
+    active_main_count = sum(1 for row in active_servers if row["configured_role"] == "chinh")
+    takeover_count = sum(1 for row in active_servers if row["current_role"] == "chinh-tam")
+
+    current_flights = current_data.get("flights") or {}
+    if not isinstance(current_flights, dict):
+        current_flights = {}
+    current_time_ms = _to_int_ms(current_data.get("server_time_millis")) or 0
+    current_age_ms = max(0, now_ms - current_time_ms) if current_time_ms else None
+    feed_entries = merged_entries if merged_entries else [
+        dict(entry) for entry in current_flights.values() if isinstance(entry, dict)
+    ]
+    feed_summary = _radar_status_feed_summary(feed_entries)
+    feed_summary.update({
+        "mode": "merged" if merged_entries else "snapshot_fallback",
+        "merge_policy": "quality-first-fusion-v3",
+        "merge_size": merge_size,
+        "merge_revision": merge_revision,
+        "merge_last_ingest_millis": merge_last_ingest_ms or None,
+        "merge_last_ingest_age_ms": (
+            max(0, now_ms - merge_last_ingest_ms) if merge_last_ingest_ms else None
+        ),
+        "merge_loop_heartbeat_millis": merge_loop_heartbeat_ms or None,
+        "merge_loop_age_ms": (
+            max(0, now_ms - merge_loop_heartbeat_ms) if merge_loop_heartbeat_ms else None
+        ),
+        "current_snapshot_source": str(current_data.get("source") or "")[:80] or None,
+        "current_snapshot_count": len(current_flights),
+        "current_snapshot_millis": current_time_ms or None,
+        "current_snapshot_age_ms": current_age_ms,
+        "stale": bool(current_age_ms is None or current_age_ms > RADAR_LIVE_STALE_MS),
+        "radar_ink_enabled": RADAR_INK_ENABLED,
+        "radar_ink_nodes": len(RADAR_INK_MAP.nodes),
+        "radar_ink_edges": sum(len(value) for value in RADAR_INK_MAP.edges.values()),
+    })
+
+    payload = {
+        "status": "success",
+        "generated_at_millis": now_ms,
+        "cached": False,
+        "cache_ttl_ms": RADAR_STATUS_CACHE_TTL_MS,
+        "heartbeat_active_window_ms": RADAR_STATUS_ACTIVE_MS,
+        "server_scan_error": scan_error,
+        "summary": {
+            "active_servers": None if scan_error else len(active_servers),
+            "known_servers": len(servers),
+            "active_main_count": active_main_count,
+            "takeover_count": takeover_count,
+        },
+        "servers": servers,
+        "feed": feed_summary,
+        "firestore_status": FIRESTORE_STATUS,
+        "server_time_millis": now_ms,
+    }
+    if scan_error is None:
+        with RADAR_STATUS_CACHE_LOCK:
+            RADAR_STATUS_CACHE_PAYLOAD = dict(payload)
+            RADAR_STATUS_CACHE_AT_MS = now_ms
+    return jsonify(payload)
 
 
 
