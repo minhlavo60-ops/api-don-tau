@@ -7500,6 +7500,172 @@ def scan_arrivals():
         }), 500
 
 
+# ═════════════ NẠP BÀI HỌC TỪ FR24 — SERVER LÀ ĐẦU MỐI DỮ LIỆU DUY NHẤT ═════════════
+# Web (tab Hệ thống → Sổ học radar, tài khoản đăng nhập) gọi 2 endpoint dưới đây để lấy
+# vệt playback các chuyến ĐÃ HẠ tại DAD rồi TỰ HỌC ở client bằng radar-scenario-learner.
+# Kiến trúc (chốt 29/7/2026): học/thay đổi chỉ ở WEB + đầu mối dữ liệu là SERVER NÀY;
+# các máy fetcher chỉ cấp dữ liệu live như cũ, không tham gia việc học.
+# Playback là endpoint FR24 công khai của trang lịch sử chuyến; gọi THƯA (khoá giãn nhịp
+# + cache) để không đốt "uy tín IP" của server với Cloudflare. Nếu Cloudflare vẫn chặn
+# (IP datacenter), lỗi được trả rõ ràng cho web hiển thị — không nuốt im lặng.
+
+_FR24_SEED_PLAYBACK_URL = "https://api.flightradar24.com/common/v1/flight-playback.json"
+_FR24_SEED_MIN_GAP_S = 1.2          # giãn tối thiểu giữa 2 lần gọi FR24 của nhóm seed
+_fr24_seed_lock = threading.Lock()
+_fr24_seed_last_call = 0.0
+_FR24_SEED_TRACK_CACHE: dict = {}   # hexId -> flight chuẩn hoá (đợt nạp hay bấm lại)
+_FR24_SEED_TRACK_CACHE_MAX = 150
+_FR24_SEED_ARRIVALS_CACHE: dict = {"at": 0.0, "key": None, "data": None}
+_FR24_SEED_ARRIVALS_TTL_S = 120.0
+_FR24_SEED_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _fr24_seed_cho_luot() -> None:
+    """Xếp hàng mọi request FR24 của nhóm seed (không đụng nhịp poll của fetcher)."""
+    global _fr24_seed_last_call
+    with _fr24_seed_lock:
+        wait = _FR24_SEED_MIN_GAP_S - (time.time() - _fr24_seed_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _fr24_seed_last_call = time.time()
+
+
+def _fr24_seed_chuan_hoa_track(playback_json: dict) -> tuple[list, str, str]:
+    """Playback FR24 thô → (points chuẩn hoá cho learner, originIata, số hiệu)."""
+    data = (((playback_json or {}).get("result") or {}).get("response") or {}).get("data") or {}
+    flight = data.get("flight") or {}
+    points = []
+    for p in (flight.get("track") or []):
+        try:
+            lat = float(p["latitude"]); lng = float(p["longitude"]); ts = int(p["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        alt = (p.get("altitude") or {}).get("feet")
+        spd = (p.get("speed") or {}).get("kts")
+        hd = p.get("heading")
+        alt_ft = float(alt) if alt is not None else None
+        spd_kt = float(spd) if spd is not None else None
+        points.append({
+            "t": ts * 1000, "lat": lat, "lng": lng,
+            "altFt": alt_ft, "spdKt": spd_kt,
+            "hd": float(hd) if hd is not None else None,
+            # Playback không có cờ ground — suy từ độ cao + tốc độ là đủ cho classifyTerminal.
+            "ground": bool(alt_ft is not None and alt_ft <= 50 and spd_kt is not None and spd_kt <= 100),
+        })
+    points.sort(key=lambda x: x["t"])
+    origin = ((((flight.get("airport") or {}).get("origin") or {}).get("code") or {}).get("iata")) or ""
+    number = (((flight.get("identification") or {}).get("number") or {}).get("default")) or ""
+    return points, str(origin).upper(), str(number).upper()
+
+
+@app.route("/api/fr24_arrivals", methods=["GET"])
+def fr24_seed_arrivals():
+    """Danh sách chuyến ĐÃ HẠ tại DAD (có id playback) cho web nạp bài học."""
+    if (err := require_api_key()):
+        return err
+    pages_raw = request.args.get("pages", "1,-1,-2")
+    cache_key = pages_raw
+    now = time.time()
+    if (_FR24_SEED_ARRIVALS_CACHE["data"] is not None
+            and _FR24_SEED_ARRIVALS_CACHE["key"] == cache_key
+            and now - _FR24_SEED_ARRIVALS_CACHE["at"] < _FR24_SEED_ARRIVALS_TTL_S):
+        return jsonify({"status": "success", "cached": True,
+                        "flights": _FR24_SEED_ARRIVALS_CACHE["data"], "radar_role": RADAR_ROLE})
+    try:
+        pages = [int(x) for x in str(pages_raw).split(",") if x.strip()][:5]
+    except ValueError:
+        return jsonify({"status": "error", "message": "pages không hợp lệ"}), 400
+    seen: dict = {}
+    api = _make_fr_api()
+    try:
+        for page in pages:
+            _fr24_seed_cho_luot()
+            details = api.get_airport_details("DAD", flight_limit=100, page=page)
+            schedule = ((((details or {}).get("airport") or {}).get("pluginData") or {})
+                        .get("schedule") or {})
+            for row in ((schedule.get("arrivals") or {}).get("data")) or []:
+                f = (row or {}).get("flight") or {}
+                ident = f.get("identification") or {}
+                hex_id = ident.get("id")
+                if not hex_id or hex_id in seen:
+                    continue
+                status = ((f.get("status") or {}).get("generic") or {})
+                status_txt = str(((status.get("status") or {}).get("text")) or "").lower()
+                if bool((f.get("status") or {}).get("live")) or status_txt != "landed":
+                    continue  # chỉ chuyến đã hạ: playback chuyến đang bay còn thiếu đoạn cuối
+                sched = ((f.get("time") or {}).get("scheduled") or {})
+                seen[hex_id] = {
+                    "hexId": hex_id,
+                    "number": str((((ident.get("number") or {}).get("default")) or "")).strip().upper(),
+                    "originIata": str(((((f.get("airport") or {}).get("origin") or {}).get("code") or {})
+                                      .get("iata")) or "").upper(),
+                    "schedTs": sched.get("departure") or sched.get("arrival"),
+                    "landedTs": ((f.get("time") or {}).get("real") or {}).get("arrival"),
+                }
+    except Exception as e:  # Cloudflare chặn / mạng lỗi — trả rõ cho web hiển thị
+        log.warning("fr24_arrivals loi: %s", e)
+        return jsonify({"status": "error", "message": f"FR24 arrivals: {e}"}), 502
+    flights = list(seen.values())
+    _FR24_SEED_ARRIVALS_CACHE.update({"at": now, "key": cache_key, "data": flights})
+    return jsonify({"status": "success", "cached": False, "flights": flights, "radar_role": RADAR_ROLE})
+
+
+@app.route("/api/fr24_playback", methods=["GET"])
+def fr24_seed_playback():
+    """Vệt playback đầy đủ của 1 chuyến đã hạ, chuẩn hoá sẵn cho learner của web."""
+    if (err := require_api_key()):
+        return err
+    hex_id = str(request.args.get("flight") or "").strip()
+    if not hex_id or len(hex_id) > 20:
+        return jsonify({"status": "error", "message": "thiếu ?flight=<hex id>"}), 400
+    cached = _FR24_SEED_TRACK_CACHE.get(hex_id)
+    if cached is not None:
+        return jsonify({"status": "success", "cached": True, "flight": cached})
+    try:
+        from curl_cffi import requests as cf_requests
+    except Exception:
+        return jsonify({"status": "error",
+                        "message": "Thiếu curl_cffi — pip install -U -r requirements.txt"}), 503
+    params = {"flightId": hex_id}
+    ts_raw = request.args.get("ts")
+    if ts_raw:
+        try:
+            params["timestamp"] = int(ts_raw)
+        except ValueError:
+            pass
+    _fr24_seed_cho_luot()
+    try:
+        resp = cf_requests.get(
+            _FR24_SEED_PLAYBACK_URL, params=params, timeout=25,
+            impersonate=_FR24_IMPERSONATE or "chrome",
+            headers={"accept": "application/json",
+                     "origin": "https://www.flightradar24.com",
+                     "referer": "https://www.flightradar24.com/"},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        points, origin, number = _fr24_seed_chuan_hoa_track(resp.json())
+    except Exception as e:
+        log.warning("fr24_playback %s loi: %s", hex_id, e)
+        return jsonify({"status": "error", "message": f"FR24 playback: {e}"}), 502
+    if len(points) < 30:
+        return jsonify({"status": "error", "message": f"vệt quá ngắn ({len(points)} điểm)"}), 422
+    number = str(request.args.get("number") or number or hex_id).strip().upper()
+    day = datetime.fromtimestamp(points[-1]["t"] / 1000, _FR24_SEED_VN_TZ).strftime("%Y-%m-%d")
+    flight_payload = {
+        "flightKey": f"{day}|{number}",   # khớp quy ước flightKey của learner trên web
+        "number": number,
+        "hexId": hex_id,
+        "originIata": str(request.args.get("origin") or origin or "").upper(),
+        "destinationIata": "DAD",
+        "points": points,
+    }
+    if len(_FR24_SEED_TRACK_CACHE) >= _FR24_SEED_TRACK_CACHE_MAX:
+        _FR24_SEED_TRACK_CACHE.pop(next(iter(_FR24_SEED_TRACK_CACHE)), None)
+    _FR24_SEED_TRACK_CACHE[hex_id] = flight_payload
+    return jsonify({"status": "success", "cached": False, "flight": flight_payload})
+
+
 @app.route("/api/etas", methods=["GET", "POST"])
 def get_all_etas():
     if (err := require_api_key()):
