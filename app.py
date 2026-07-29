@@ -7553,6 +7553,18 @@ def _fr24_seed_chuan_hoa_track(playback_json: dict) -> tuple[list, str, str]:
             "ground": bool(alt_ft is not None and alt_ft <= 50 and spd_kt is not None and spd_kt <= 100),
         })
     points.sort(key=lambda x: x["t"])
+    # CẮT ĐUÔI LĂN (thêm 29/07/2026): playback có chuyến kết thúc ngay khi chạm bánh,
+    # có chuyến kèm cả 5-7 phút lăn về bến → mốc "giây tới cuối vệt" của các bin lệch
+    # nhau hàng trăm giây, làm learner chê nhầm vệt tốt. Giữ tới chạm-bánh + 60s cho
+    # đồng nhất với cửa sổ học live (feed live giữ tàu ~1-2 phút sau hạ).
+    # CHÚ Ý: sân đi cũng có điểm ground (BKK/SGN... đều thấp <50ft, taxi chậm) — nếu
+    # không giới hạn quanh DAD thì sẽ cắt cụt cả chuyến ngay sau khi rời bến sân đi.
+    for p in points:
+        gan_dad = abs(p["lat"] - 16.0439) < 0.05 and abs(p["lng"] - 108.1995) < 0.05
+        if gan_dad and p["ground"] and (p["spdKt"] is not None and p["spdKt"] <= 45):
+            cutoff = p["t"] + 60_000
+            points = [q for q in points if q["t"] <= cutoff]
+            break
     origin = ((((flight.get("airport") or {}).get("origin") or {}).get("code") or {}).get("iata")) or ""
     number = (((flight.get("identification") or {}).get("number") or {}).get("default")) or ""
     return points, str(origin).upper(), str(number).upper()
