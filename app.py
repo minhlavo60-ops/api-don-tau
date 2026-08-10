@@ -834,6 +834,28 @@ def _aircraft_type_for_code(code: str, details: Optional[dict] = None) -> str:
     return str(hint.get("aircraft") or "").upper().strip()
 
 
+def _aircraft_type_from_radar(flight, details: Optional[dict], old_type: Optional[str]) -> Optional[str]:
+    """Loại tàu do RADAR báo. KHÁC _aircraft_type_for_code: KHÔNG rơi về lịch bay.
+
+    Lịch bay là thứ hay sai (hãng đổi tàu), nên nó phải nằm ở tầng fallback cuối cùng
+    (setdefault trong build_etas_payload), không được lẫn vào đây.
+
+    Chu kỳ giãn details thì details=None nhưng bounds-feed vẫn có aircraft_code. Cả hai
+    cùng thiếu thì GIỮ giá trị radar đã biết — xoá đi là loại tàu nhấp nháy A321↔B78X
+    theo từng nhịp poll.
+    """
+    ac = ""
+    if details:
+        try:
+            ac = (((details.get("aircraft") or {}).get("model") or {}).get("code") or "")
+        except AttributeError:
+            ac = ""
+    if not ac:
+        ac = getattr(flight, "aircraft_code", None) or ""
+    ac = str(ac).upper().strip()
+    return ac or (old_type or None)
+
+
 def _taxi_buffer_ms_for(aircraft_type: Optional[str]) -> int:
     """N của fallback landing+N theo loại tàu."""
     return LANDING_TO_PARK_FALLBACK_WIDEBODY_MS if _is_wide_body(aircraft_type) else LANDING_TO_PARK_FALLBACK_MS
@@ -1697,6 +1719,11 @@ class FlightEntry:
     # (radar còn thấy, tàu có thể lăn tiếp). Provisional vẫn ghi vào lịch sử để xem/đếm
     # nhưng CHƯA "chốt"; chỉ chốt khi confirmed=True (tín hiệu mất sau khi đã dừng).
     parked_confirmed: bool = False
+    # Loại tàu THẬT do radar báo (FR24 details/feed). Trước đây entry không giữ trường này
+    # nên to_public không xuất -> setdefault ở build_etas_payload LUÔN điền loại theo lịch bay.
+    # Hãng đổi tàu (swap) là chuyện thường: lịch in A321 nhưng bay B78X — sai này kéo theo
+    # taxi buffer chọn nhầm thân hẹp/thân rộng, tức lệch cả giờ chốt vào bến.
+    aircraft_type: Optional[str] = None
 
     def to_public(self, now_ms: int) -> dict:
         stale_seconds = (now_ms - self.updated_at) // 1000 if self.updated_at else None
@@ -1760,6 +1787,10 @@ class FlightEntry:
             # vội khi tàu còn có thể lăn tiếp.
             "parked_confirmed": self.parked_confirmed,
             "actual_parked_provisional": bool(self.parked_at_millis) and not self.parked_confirmed,
+            # CHỈ xuất khi radar thật sự biết loại tàu. Vắng key thì setdefault ở
+            # build_etas_payload mới điền theo lịch bay — giữ nguyên hành vi cũ làm fallback,
+            # nhưng radar biết thì radar thắng.
+            **({"aircraft_type": self.aircraft_type} if self.aircraft_type else {}),
         }
 
 
@@ -3106,14 +3137,14 @@ def _code_aliases(value) -> set[str]:
                     aliases.update(_flight_code_ocr_aliases(t + cs_suffix))
 
     # Charter prefix "CH": lịch nội bộ ghi "CH" + ICAO callsign cho chuyến charter.
-    # Hỗ trợ 3 dạng đã gặp: CHMJJ721 (3 chữ + số), CHBLCAT62 (5 chữ + số),
-    # CHOOLET (chữ thuần không số). Sinh alias 2 chiều cho radar match được.
-    # Yêu cầu ≥3 chữ sau CH để tránh strip nhầm mã ICAO bắt đầu bằng "CH" (CHH = Hainan).
+    # Hỗ trợ callsign và đăng bạ tàu viết liền: CHVH8MJ ↔ VH8MJ. Nhánh đăng bạ
+    # 1–2 chữ phải có cả số + hậu tố chữ, nên CHH123 (Hainan) không bị strip nhầm.
+    charter_pattern = r"(?:[A-Z]{3,7}(?:\d{1,5}[A-Z]{0,3})?|[A-Z]{1,2}\d{1,5}[A-Z]{1,3})"
     for alias in list(aliases):
-        strip_m = re.match(r"^CH([A-Z]{3,7}(?:\d{1,5}[A-Z]?)?)$", alias)
+        strip_m = re.match(rf"^CH({charter_pattern})$", alias)
         if strip_m:
             aliases.update(_flight_code_ocr_aliases(strip_m.group(1)))
-        if re.match(r"^[A-Z]{3,7}(?:\d{1,5}[A-Z]?)?$", alias):
+        if re.match(rf"^{charter_pattern}$", alias):
             aliases.update(_flight_code_ocr_aliases("CH" + alias))
 
     # Một lượt cuối để OCR alias cũng được hưởng leading-zero/ICAO nếu vừa phát sinh.
@@ -3760,7 +3791,11 @@ def _process_match(
     #   - Đã qua LANDED_MIN_AGE_BEFORE_FALLBACK_MS (8 phút) — cho radar đủ cơ hội phát PARKED
     # Cách này xử lý trường hợp FR24 cache stale báo TAXIING dù tàu đã đứng yên.
     # CHÚ Ý: Tầng 2 (_resolve_landed_at_millis) đảm bảo landed_at chỉ được set khi tàu ở DAD.
-    aircraft_type = _aircraft_type_for_code(code, details)
+    # Loại tàu radar báo được giữ lại trên entry để to_public xuất ra cho app; `old` đã bị
+    # reset ở trên nếu đây là chuyến MỚI dùng lại số hiệu, nên không kéo theo loại tàu cũ.
+    radar_aircraft_type = _aircraft_type_from_radar(flight, details, old.aircraft_type if old else None)
+    # Radar trước, lịch bay sau: chọn buffer thân rộng/thân hẹp bằng loại tàu ĐANG BAY thật.
+    aircraft_type = radar_aircraft_type or _aircraft_type_for_code(code, details)
     taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
     landing_fallback_parked = _fallback_parked_from_landing(landed_at_millis, now_ms, taxi_buffer_ms)
     # Không để fallback landing+N tái-chốt NGAY khi vừa GỠ (tàu đang lăn tiếp), cũng không
@@ -3830,6 +3865,7 @@ def _process_match(
                 parked_anchor_lat=parked_anchor_lat,
                 parked_anchor_lng=parked_anchor_lng,
                 parked_confirmed=parked_confirmed,
+                aircraft_type=radar_aircraft_type,
             )
 
         # Reset history khi sang FINAL (dynamics khác hẳn)
@@ -3887,6 +3923,7 @@ def _process_match(
         parked_anchor_lat=parked_anchor_lat,
         parked_anchor_lng=parked_anchor_lng,
         parked_confirmed=parked_confirmed,
+        aircraft_type=radar_aircraft_type,
     )
 
 
@@ -3939,9 +3976,10 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
     # Chỉ fallback khi đã miss đủ chu kỳ — tránh chốt sớm khi radar chỉ tạm mất 1 cycle.
     if old.state in GROUND_ACTIVE_STATES:
         landed_at = old.landed_at_millis or old.updated_at or now_ms
-        # _process_miss không có details. Lấy aircraft từ schedule hint.
+        # _process_miss không có details. Ưu tiên loại tàu RADAR đã ghi được trên entry
+        # (lịch bay hay sai vì hãng đổi tàu), chỉ khi chưa từng biết mới lấy theo lịch.
         hint = SCHEDULE_HINTS.get(code) or {}
-        aircraft_type = str(hint.get("aircraft") or "").upper().strip()
+        aircraft_type = str(old.aircraft_type or hint.get("aircraft") or "").upper().strip()
         taxi_buffer_ms = _taxi_buffer_ms_for(aircraft_type)
         fallback_parked = _fallback_parked_from_landing(landed_at, now_ms, taxi_buffer_ms)
         # Ước lượng theo KHOẢNG CÁCH (mất sóng giữa đường lăn, chưa tới bến) — thay landing+N phẳng.
@@ -5097,8 +5135,11 @@ SERVER_FINALIZE_FROM_LIVE = os.environ.get("SERVER_FINALIZE_FROM_LIVE", "0").str
 # Bản này mặc định TẮT để nguồn chốt chính quay về máy tính CHÍNH; chỉ bật thủ công nếu cần dự phòng.
 SERVER_FINALIZE_AT_STAND = os.environ.get("SERVER_FINALIZE_AT_STAND", "0").strip().lower() in ("1", "true", "yes", "on")
 # SERVER ONLINE = BỘ NÃO: tự xử lý TOÀN BỘ nghiệp vụ giờ vào bến từ radarLive đã gộp.
-# Bản này mặc định TẮT để tránh lỗi Render tự chốt sớm; máy chính/fetcher là source-of-truth.
-SERVER_FINALIZE_ALL = os.environ.get("SERVER_FINALIZE_ALL", "0").strip().lower() in ("1", "true", "yes", "on")
+# Mặc định BẬT ở server online: đêm 09/08/2026 máy chính ngắt quãng làm 5 chuyến đã hạ
+# không có shell doc; client chỉ cứu được chuyến đã có người Đón. Bộ dò server đã có đủ
+# cửa vị trí/tốc độ/độ cao/freshness ở dưới, nên nó là lớp dự phòng độc lập đúng chỗ.
+# Vẫn cho phép đặt env=0 để rollback tức thì nếu cần quan sát vận hành.
+SERVER_FINALIZE_ALL = os.environ.get("SERVER_FINALIZE_ALL", "1").strip().lower() in ("1", "true", "yes", "on")
 SERVER_LOOP_SLEEP_S = int(os.environ.get("SERVER_LOOP_SLEEP_S", "25"))
 # Server tự chốt từ radarLive (box cấp vị trí, độ tin thấp hơn FR24 đầy đủ của PC) nên SIẾT thêm
 # bằng chứng "thật sự dưới đất", chống "chưa hạ đã chốt giờ":
@@ -7042,6 +7083,7 @@ def health():
             "queue_count": len(QUEUE),
             "schedule_count": len(SCHEDULE_HINTS),
             "pid": os.getpid(),
+            "server_finalize_all": SERVER_FINALIZE_ALL,
             "firestore_status": FIRESTORE_STATUS,
             "last_firestore_schedule_sync_ms": LAST_FIRESTORE_SCHEDULE_SYNC_MS,
             "last_firestore_manual_tracking_sync_ms": LAST_FIRESTORE_MANUAL_TRACKING_SYNC_MS,
