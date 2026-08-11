@@ -444,13 +444,36 @@ FIREBASE_SERVICE_ACCOUNT_B64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_B64", ""
 #   FR24 chặn IP trung tâm dữ liệu (Render) qua Cloudflare. Giải pháp: chạy phần
 #   gọi FR24 trên máy có IP nhà dân (máy nhà/cơ quan), đẩy kết quả qua Firestore.
 #   RADAR_ROLE:
-#     "fetcher" (mặc định, chạy ở máy nhà/cơ quan): gọi FR24 như cũ + sau mỗi vòng
-#        poll GHI snapshot tàu live lên Firestore doc radarLive/current.
-#     "server"  (đặt trên Render): KHÔNG gọi FR24; ĐỌC radarLive/current rồi phục vụ
-#        /api/etas như cũ → web app không phải sửa gì.
+#     "fetcher" (mặc định, chạy ở máy nhà/cơ quan): gọi FR24, đẩy riêng thẳng Render và
+#        vẫn ghi Firestore radarLive/current làm đường tương thích/dự phòng.
+#     "server"  (đặt trên Render): KHÔNG gọi FR24; nhận từng nguồn qua HTTP, đồng thời đọc
+#        radarLive/current dự phòng rồi phục vụ /api/etas như cũ → web app không phải sửa.
 RADAR_ROLE = os.environ.get("RADAR_ROLE", "fetcher").strip().lower()
 RADAR_LIVE_COLLECTION = os.environ.get("RADAR_LIVE_COLLECTION", "radarLive")
 RADAR_LIVE_DOC_ID = os.environ.get("RADAR_LIVE_DOC_ID", "current")
+# Kênh chính mới: mỗi máy đẩy ảnh chụp thẳng lên Render. Firestore ``current`` vẫn được
+# ghi song song làm đường dự phòng cho máy chưa nâng cấp và lúc Render khởi động lại.
+# Việc gửi chạy ở luồng riêng, chỉ giữ ảnh mới nhất nên Render chậm/ngủ không được phép
+# làm chậm vòng quét FR24 trên máy radar.
+RADAR_LIVE_DIRECT_PUSH_ENABLED = (
+    os.environ.get("RADAR_LIVE_DIRECT_PUSH_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+RADAR_LIVE_ONLINE_URL = os.environ.get(
+    "RADAR_LIVE_ONLINE_URL", "https://api-don-tau.onrender.com"
+).rstrip("/")
+RADAR_LIVE_PUSH_TIMEOUT_S = float(os.environ.get("RADAR_LIVE_PUSH_TIMEOUT_S", "8"))
+RADAR_LIVE_INGEST_MAX_BYTES = int(os.environ.get("RADAR_LIVE_INGEST_MAX_BYTES", "1800000"))
+RADAR_LIVE_INGEST_MAX_FLIGHTS = int(os.environ.get("RADAR_LIVE_INGEST_MAX_FLIGHTS", "600"))
+# ``auto``: khi POST thẳng Render còn khỏe, máy mới không ghi đè ``current`` để dành ô
+# legacy này cho máy ở xa chưa thể cập nhật. Nếu POST hỏng quá 3 phút, tự ghi lại Firestore.
+# ``always`` dùng khi cần hành vi cũ; ``never`` chỉ nên dùng khi đã chắc kênh HTTP ổn định.
+RADAR_LIVE_FIRESTORE_WRITE_MODE = os.environ.get(
+    "RADAR_LIVE_FIRESTORE_WRITE_MODE", "auto"
+).strip().lower()
+if RADAR_LIVE_FIRESTORE_WRITE_MODE not in {"auto", "always", "never"}:
+    RADAR_LIVE_FIRESTORE_WRITE_MODE = "auto"
+RADAR_LIVE_DIRECT_HEALTH_MS = int(os.environ.get("RADAR_LIVE_DIRECT_HEALTH_MS", "180000"))
 # Server coi dữ liệu radarLive là cũ nếu fetcher ngừng cập nhật quá ngưỡng này (mặc định 5 phút).
 RADAR_LIVE_STALE_MS = int(os.environ.get("RADAR_LIVE_STALE_MS", str(5 * 60 * 1000)))
 # Nhãn nguồn để debug biết máy nào đang ghi.
@@ -553,6 +576,13 @@ LAST_RADAR_LIVE_WRITE_MS: Optional[int] = None
 LAST_RADAR_LIVE_WRITE_ERROR: Optional[str] = None
 LAST_RADAR_LIVE_READ_MS: Optional[int] = None
 LAST_RADAR_LIVE_READ_ERROR: Optional[str] = None
+LAST_RADAR_DIRECT_PUSH_MS: Optional[int] = None
+LAST_RADAR_DIRECT_PUSH_ERROR: Optional[str] = None
+LAST_RADAR_DIRECT_INGEST_MS: Optional[int] = None
+RADAR_DIRECT_INGEST_COUNT = 0
+_RADAR_LIVE_PUSH_LOCK = threading.Lock()
+_RADAR_LIVE_PUSH_PENDING: Optional[dict] = None
+_RADAR_LIVE_PUSH_WORKER_RUNNING = False
 # Server phụ: quan sát máy chính qua radarLive/current.
 PHU_LAST_MAIN_WRITE_MS: Optional[int] = None   # lần ghi gần nhất của máy CHÍNH (giờ Firestore)
 PHU_MAIN_WRITES: deque = deque(maxlen=6)       # các mốc ghi của chính → ước lượng chu kỳ
@@ -4962,6 +4992,10 @@ def poll_loop() -> None:
                         _maybe_persist_radar_ink_map()
                     except Exception as _e:
                         log.warning("radar-ink loop error: %s", _e)
+                try:
+                    _maybe_persist_raw_snapshots()
+                except Exception as _e:
+                    log.warning("sổ quan sát radar loop error: %s", _e)
             else:
                 if FETCHER_PHU:
                     # Máy phụ: đợi tới điểm giữa khoảng trống của máy chính rồi mới poll.
@@ -5153,30 +5187,116 @@ SERVER_TRACKED: dict = {}                          # state xuyên vòng cho dò 
 SERVER_LAST_CHINH_WRITE_MS: Optional[int] = None   # lần ghi radarLive gần nhất của máy CHÍNH thật
 
 
+def _push_live_direct_once(snapshot: dict) -> None:
+    """Đẩy một ảnh chụp lên Render; lỗi chỉ được ghi nhận, không làm hỏng vòng radar."""
+    global LAST_RADAR_DIRECT_PUSH_MS, LAST_RADAR_DIRECT_PUSH_ERROR
+    try:
+        body = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{RADAR_LIVE_ONLINE_URL}/api/radar_live/ingest",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": ETA_API_KEY,
+                "User-Agent": "NKDT-RadarLive/2",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=RADAR_LIVE_PUSH_TIMEOUT_S) as response:
+            result = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            if response.status < 200 or response.status >= 300 or result.get("status") != "success":
+                raise RuntimeError(f"HTTP {response.status}: {result}")
+        LAST_RADAR_DIRECT_PUSH_MS = int(time.time() * 1000)
+        LAST_RADAR_DIRECT_PUSH_ERROR = None
+    except Exception as error:
+        LAST_RADAR_DIRECT_PUSH_ERROR = str(error)[:500]
+        log.warning("Đẩy radar live thẳng lên Render lỗi (Firestore vẫn dự phòng): %s", error)
+
+
+def _radar_live_direct_push_worker() -> None:
+    """Chỉ gửi ảnh mới nhất; ảnh cũ đang xếp hàng được thay thế để không dồn backlog."""
+    global _RADAR_LIVE_PUSH_PENDING, _RADAR_LIVE_PUSH_WORKER_RUNNING
+    while True:
+        with _RADAR_LIVE_PUSH_LOCK:
+            snapshot = _RADAR_LIVE_PUSH_PENDING
+            _RADAR_LIVE_PUSH_PENDING = None
+            if snapshot is None:
+                _RADAR_LIVE_PUSH_WORKER_RUNNING = False
+                return
+        _push_live_direct_once(snapshot)
+
+
+def _queue_live_direct_push(snapshot: dict) -> None:
+    """Xếp ảnh chụp cho luồng HTTP riêng; tuyệt đối không chờ mạng trên luồng poll FR24."""
+    global _RADAR_LIVE_PUSH_PENDING, _RADAR_LIVE_PUSH_WORKER_RUNNING
+    if not RADAR_LIVE_DIRECT_PUSH_ENABLED or RADAR_ROLE != "fetcher":
+        return
+    with _RADAR_LIVE_PUSH_LOCK:
+        _RADAR_LIVE_PUSH_PENDING = snapshot
+        if _RADAR_LIVE_PUSH_WORKER_RUNNING:
+            return
+        _RADAR_LIVE_PUSH_WORKER_RUNNING = True
+    threading.Thread(
+        target=_radar_live_direct_push_worker,
+        daemon=True,
+        name="radar_live_direct_push",
+    ).start()
+
+
+def _radar_live_direct_is_healthy(now_ms: Optional[int] = None) -> bool:
+    """Kênh trực tiếp chỉ được coi là khỏe khi vừa POST thành công trong cửa ngắn."""
+    if not RADAR_LIVE_DIRECT_PUSH_ENABLED or not LAST_RADAR_DIRECT_PUSH_MS:
+        return False
+    now_ms = int(now_ms or time.time() * 1000)
+    return 0 <= now_ms - int(LAST_RADAR_DIRECT_PUSH_MS) <= RADAR_LIVE_DIRECT_HEALTH_MS
+
+
+def _radar_live_should_write_legacy_current(now_ms: Optional[int] = None) -> bool:
+    """Quyết định ghi ô legacy; chế độ auto tự failover khi HTTP Render mất."""
+    if RADAR_LIVE_FIRESTORE_WRITE_MODE == "always":
+        return True
+    if RADAR_LIVE_FIRESTORE_WRITE_MODE == "never":
+        return False
+    return not _radar_live_direct_is_healthy(now_ms)
+
+
 def _write_live_to_firestore() -> None:
-    """Fetcher: ghi snapshot tàu live (giống payload /api/etas) lên radarLive/current."""
+    """Fetcher: đẩy thẳng Render; ô ``current`` tự nhường cho máy legacy khi HTTP khỏe."""
     global LAST_RADAR_LIVE_WRITE_MS, LAST_RADAR_LIVE_WRITE_ERROR
     if RADAR_ROLE != "fetcher":
         return
+    payload = build_etas_payload()  # dict đầy đủ {mã: thông tin}
+    flights = payload.get("flights") or {}
+    snapshot = {
+        "schema": "nkdt-radar-live-v2",
+        "snapshot_id": str(payload.get("feed_revision") or ""),
+        "flights": flights,
+        "flight_count": len(flights),
+        "server_time_millis": payload.get("server_time_millis"),
+        "feed_revision": payload.get("feed_revision"),
+        "last_poll_millis": payload.get("last_poll_millis"),
+        "source": RADAR_SOURCE_ID,
+        "vai_tro": _vai_tro_hien_tai(),
+    }
+    # Kênh trực tiếp là đường chính mới nhưng chạy hoàn toàn ngoài luồng poll.
+    _queue_live_direct_push(snapshot)
+
     db = _init_firestore_client()
     if db is None:
         return
     try:
-        payload = build_etas_payload()  # dict đầy đủ {mã: thông tin}
-        flights = payload.get("flights") or {}
-        doc = {
-            "flights": flights,
-            "flight_count": len(flights),
-            "server_time_millis": payload.get("server_time_millis"),
-            "feed_revision": payload.get("feed_revision"),
-            "last_poll_millis": payload.get("last_poll_millis"),
-            "source": RADAR_SOURCE_ID,
-            "vai_tro": _vai_tro_hien_tai(),
-            "updated_at": firebase_firestore.SERVER_TIMESTAMP,
-        }
-        db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
-        LAST_RADAR_LIVE_WRITE_MS = int(time.time() * 1000)
-        LAST_RADAR_LIVE_WRITE_ERROR = None
+        if _radar_live_should_write_legacy_current():
+            doc = dict(snapshot)
+            doc["updated_at"] = firebase_firestore.SERVER_TIMESTAMP
+            db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
+            LAST_RADAR_LIVE_WRITE_MS = int(time.time() * 1000)
+            LAST_RADAR_LIVE_WRITE_ERROR = None
+        else:
+            LAST_RADAR_LIVE_WRITE_ERROR = None
         _ghi_heartbeat_fetcher(db)
     except Exception as e:
         LAST_RADAR_LIVE_WRITE_ERROR = str(e)
@@ -5213,22 +5333,61 @@ def _load_live_from_firestore():
         return None, {}
 
 
-# ── SERVER GỘP ĐA MÁY (đọc dày radarLive rồi hợp nhất) ──────────────────────
-# VẤN ĐỀ: chính + nhiều phụ đều .set() GHI ĐÈ chung radarLive/current bằng ảnh chụp
-# RIÊNG của máy đó. Server chỉ đọc ô đó nên mỗi lúc thấy 1 máy → máy nào ghi thiếu tàu
-# thì web MẤT tàu; máy phụ "non" ghi snapshot rỗng thì web báo "chưa có dữ liệu tàu".
-# CÁCH SỬA (CHỈ ở server online, KHÔNG đụng máy fetcher): đọc radarLive DÀY (mỗi vài
-# giây) rồi GỘP theo mã. Khi còn bay: mốc telemetry mới nhất thắng. Khi đã chạm đất:
-# khóa nguồn tạm theo từng chuyến để 2 máy không thay phiên báo TAXIING/PARKED lệch
-# vị trí làm marker nhảy loạn. Mã rỗng/PENDING không đè được mã đang có vị trí.
+# ── SERVER GỘP ĐA NGUỒN (HTTP riêng từng máy + Firestore dự phòng) ─────────
+# Kênh HTTP là đường chính: Render nhận trọn từng ảnh chụp nên không còn phải may rủi bắt
+# đúng lúc ba máy ghi đè radarLive/current. Đường đọc Firestore vẫn chạy để tương thích máy
+# cũ/khôi phục. Fix thô vào shadow; chỉ fix mịn hoặc đồng thuận thô 2/3 ở xa được tạo tọa độ.
 SERVER_LIVE_MERGE: dict = {}
+# Quan sát thô được giữ riêng để tận dụng cho hiện diện/chẩn đoán nhưng không còn quyền
+# thay tọa độ chuẩn. Đây là lớp cách ly bắt buộc giữa máy 100% thô và bản đồ người dùng.
+SERVER_LIVE_SHADOW: dict = {}
 SERVER_LIVE_MERGE_LOCK = threading.Lock()
 SERVER_LIVE_MERGE_REV = 0
 SERVER_LIVE_MERGE_LAST_MS = 0
 SERVER_MERGE_REJECT_COUNTS: dict[str, int] = {}
 SERVER_MERGE_SOURCE_PROFILES: dict[str, dict] = {}
 SERVER_MERGE_SOURCE_CALIBRATION: dict[str, dict] = {}
+SERVER_MERGE_SOURCE_LAST_SNAPSHOT: dict[str, str] = {}
+SERVER_MERGE_SOURCE_LAST_WRITE_MS: dict[str, int] = {}
 SERVER_MERGE_REFINED_COUNT = 0
+SERVER_MERGE_SHADOW_OBSERVATION_COUNT = 0
+SERVER_MERGE_SHADOW_POSITION_ENABLED = (
+    os.environ.get("SERVER_MERGE_SHADOW_POSITION_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SERVER_MERGE_SHADOW_MAX_SOURCES = max(
+    1, int(os.environ.get("SERVER_MERGE_SHADOW_MAX_SOURCES", "4"))
+)
+# “Sổ quan sát radar”: lưu BẢN MỚI NHẤT của từng nguồn thô, không ghi từng fix thành
+# document riêng. Mặc định 5 phút/lần/nguồn (~864 writes/ngày với 3 máy) để còn xa quota.
+SERVER_RAW_SNAPSHOT_PERSIST_ENABLED = (
+    os.environ.get("SERVER_RAW_SNAPSHOT_PERSIST_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SERVER_RAW_SNAPSHOT_COLLECTION = os.environ.get(
+    "SERVER_RAW_SNAPSHOT_COLLECTION", "radarRawLatestV1"
+)
+SERVER_RAW_SNAPSHOT_PERSIST_MS = int(os.environ.get("SERVER_RAW_SNAPSHOT_PERSIST_MS", "300000"))
+SERVER_RAW_SNAPSHOT_MAX_FLIGHTS = max(
+    20, int(os.environ.get("SERVER_RAW_SNAPSHOT_MAX_FLIGHTS", "240"))
+)
+SERVER_RAW_CONSENSUS_MIN_SOURCES = max(
+    2, int(os.environ.get("SERVER_RAW_CONSENSUS_MIN_SOURCES", "2"))
+)
+SERVER_RAW_CONSENSUS_ENABLED = (
+    os.environ.get("SERVER_RAW_CONSENSUS_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SERVER_RAW_CONSENSUS_FRESH_MS = int(os.environ.get("SERVER_RAW_CONSENSUS_FRESH_MS", "120000"))
+SERVER_RAW_CONSENSUS_AGREE_M = float(os.environ.get("SERVER_RAW_CONSENSUS_AGREE_M", "9000"))
+SERVER_RAW_CONSENSUS_MIN_DAD_KM = float(os.environ.get("SERVER_RAW_CONSENSUS_MIN_DAD_KM", "45"))
+SERVER_RAW_CONSENSUS_MAX_CHAIN_GAP_MS = int(
+    os.environ.get("SERVER_RAW_CONSENSUS_MAX_CHAIN_GAP_MS", "300000")
+)
+SERVER_RAW_SNAPSHOT_PENDING: dict[str, dict] = {}
+SERVER_RAW_SNAPSHOT_LAST_PERSIST_MS: dict[str, int] = {}
+LAST_SERVER_RAW_SNAPSHOT_PERSIST_MS: Optional[int] = None
+LAST_SERVER_RAW_SNAPSHOT_ERROR: Optional[str] = None
 # Render chỉ dùng atlas để giải lưới thô sau khi atlas đã tự làm-thô FINE lịch sử
 # và chứng minh sai số nhỏ hơn cách quán tính+lưới hiện tại. Kết quả vẫn là ESTIMATED.
 SERVER_MERGE_ROUTE_REFINE_ENABLED = (
@@ -5404,11 +5563,21 @@ def _merge_snapshot_profile(
         and dominant_ms > 0
         and abs(int(doc_write_ms or 0) - dominant_ms) <= SERVER_MERGE_BATCH_CLOCK_WINDOW_MS
     )
+    coarse_share = (coarse / positioned) if positioned else 0.0
+    if positioned <= 0:
+        position_mode = "unknown"
+    elif coarse_share >= 0.8:
+        position_mode = "shadow"
+    elif coarse_share > 0:
+        position_mode = "mixed-gated"
+    else:
+        position_mode = "trusted"
     return {
         "source": str(source or ""),
         "vai_tro": str(vai_tro or ""),
         "positioned": positioned,
-        "coarse_share": (coarse / positioned) if positioned else 0.0,
+        "coarse_share": coarse_share,
+        "position_mode": position_mode,
         "batch_clock": batch_clock,
         "dominant_share": round(dominant_share, 3),
         "doc_write_ms": int(doc_write_ms or 0),
@@ -5444,6 +5613,332 @@ def _merge_entry_quality(entry: dict, inc_ts: int, now_ms: int, vai_tro: str, pr
         "time_trusted": time_trusted,
         "batch_clock": batch_clock,
     }
+
+
+def _merge_position_is_shadow_only(entry: dict, quality: dict) -> bool:
+    """Fix rơi đúng lưới 0,01° chỉ là quan sát, không được điều khiển tọa độ chuẩn.
+
+    Trước đây fix thô được trộn với quán tính rồi thay luôn canonical. Khi máy xa ghi chen,
+    mục tiêu của bộ làm mượt đổi liên tục giữa nhiều nguồn và marker có thể bị kéo rất xa.
+    Giữ dữ liệu này ở shadow vẫn cho biết tàu còn xuất hiện, độ cao/tốc độ/trạng thái thô,
+    nhưng web chỉ được chạy theo một neo mịn đã kiểm chứng.
+    """
+    return bool(
+        SERVER_MERGE_SHADOW_POSITION_ENABLED
+        and quality.get("has_position")
+        and (quality.get("coarse") or _merge_entry_is_coarse(entry))
+    )
+
+
+def _merge_presence_only_entry(
+    entry: dict,
+    source: str,
+    vai_tro: str,
+    now_ms: int,
+) -> dict:
+    """Bản public không có lat/lng: dùng được ở danh sách nhưng không tạo marker sai."""
+    out = dict(entry)
+    raw_lat, raw_lng = _merge_entry_lat_lng(entry)
+    out["latitude"] = None
+    out["longitude"] = None
+    out["merge_presence_only"] = True
+    out["merge_position_quality"] = "shadow"
+    out["merge_time_quality"] = "observation"
+    out["merge_reason"] = "shadow-position-only"
+    out["merge_source"] = source
+    out["merge_vai_tro"] = vai_tro
+    out["merge_shadow_seen_millis"] = int(now_ms)
+    # Giữ số liệu thô dưới tên riêng để chẩn đoán/tính toán sau này; client hiện tại chỉ đọc
+    # latitude/longitude nên không thể vô tình vẽ các tọa độ này.
+    out["merge_shadow_latitude"] = raw_lat
+    out["merge_shadow_longitude"] = raw_lng
+    return out
+
+
+def _merge_shadow_consensus_candidate_locked(code: str, now_ms: int) -> Optional[tuple[dict, dict]]:
+    """Tạo estimate 2-trong-3 khi không nguồn nào có fix mịn.
+
+    Chỉ áp dụng ngoài 45 km. Gần sân bay, sai số 0,01° đủ lớn để nhảy nhầm runway/đường
+    lăn nên dữ liệu thô chỉ còn giá trị hiện diện.
+    """
+    if not SERVER_RAW_CONSENSUS_ENABLED:
+        return None
+    observations = []
+    for source, row in (SERVER_LIVE_SHADOW.get(code) or {}).items():
+        seen_ms = int((row or {}).get("seen_ms") or 0)
+        entry = (row or {}).get("entry") or {}
+        if not seen_ms or now_ms - seen_ms > SERVER_RAW_CONSENSUS_FRESH_MS:
+            continue
+        if _merge_entry_state(entry) not in SERVER_MERGE_AIR_STATES:
+            continue
+        lat, lng = _merge_entry_lat_lng(entry)
+        if lat is None or lng is None:
+            continue
+        calculated_km = _haversine_km(lat, lng, DAD_LAT, DAD_LNG)
+        if calculated_km < SERVER_RAW_CONSENSUS_MIN_DAD_KM:
+            continue
+        reported_km = _merge_float(entry.get("distance_km"))
+        # Bắt lỗi tọa độ và trường distance không cùng một mẫu. Sai số rộng để không loại
+        # tàu xa chỉ vì hai mốc được lấy lệch vài chục giây.
+        if reported_km is not None and abs(reported_km - calculated_km) > max(35.0, calculated_km * 0.20):
+            continue
+        observations.append({
+            "source": source,
+            "seen_ms": seen_ms,
+            "entry": entry,
+            "lat": lat,
+            "lng": lng,
+        })
+    if len(observations) < SERVER_RAW_CONSENSUS_MIN_SOURCES:
+        return None
+
+    best_cluster = []
+    best_spread = float("inf")
+    for anchor in observations:
+        cluster = []
+        spread = 0.0
+        for candidate in observations:
+            distance_m = _merge_entry_distance_m(anchor["entry"], candidate["entry"])
+            if distance_m is not None and distance_m <= SERVER_RAW_CONSENSUS_AGREE_M:
+                cluster.append(candidate)
+                spread = max(spread, distance_m)
+        if len(cluster) > len(best_cluster) or (len(cluster) == len(best_cluster) and spread < best_spread):
+            best_cluster = cluster
+            best_spread = spread
+    if len(best_cluster) < SERVER_RAW_CONSENSUS_MIN_SOURCES:
+        return None
+
+    lat = _merge_median([row["lat"] for row in best_cluster])
+    lng = _merge_median([row["lng"] for row in best_cluster])
+    if lat is None or lng is None:
+        return None
+    newest = max(best_cluster, key=lambda row: row["seen_ms"])
+    out = dict(newest["entry"])
+    out["latitude"] = lat
+    out["longitude"] = lng
+    out["updated_at_millis"] = int(now_ms)
+    out["last_seen_millis"] = int(now_ms)
+    out["server_seen_millis"] = int(now_ms)
+    out["distance_km"] = _haversine_km(lat, lng, DAD_LAT, DAD_LNG)
+    sources = sorted(str(row["source"]) for row in best_cluster)
+    out["merge_refined"] = True
+    out["merge_refine_method"] = "raw-consensus-2of3"
+    out["merge_raw_position_quality"] = "coarse"
+    out["merge_consensus_sources"] = sources
+    out["merge_consensus_source_count"] = len(sources)
+    out["merge_consensus_spread_m"] = int(round(best_spread))
+    quality = {
+        "score": 55,
+        "has_position": True,
+        "coarse": False,
+        "time_trusted": False,
+        "batch_clock": True,
+        "estimated": True,
+        "assisted": True,
+        "raw_coarse": True,
+        "raw_consensus": True,
+    }
+    return out, quality
+
+
+def _merge_store_shadow_observation_locked(
+    code: str,
+    cur: Optional[dict],
+    entry: dict,
+    quality: dict,
+    now_ms: int,
+    doc_write_ms: int,
+    source: str,
+    vai_tro: str,
+) -> bool:
+    """Cất fix thô theo nguồn và chỉ tạo/cập nhật một dòng hiện diện không tọa độ."""
+    global SERVER_MERGE_SHADOW_OBSERVATION_COUNT
+    source_key = source or "unknown"
+    by_source = SERVER_LIVE_SHADOW.setdefault(code, {})
+    by_source[source_key] = {
+        "entry": dict(entry),
+        "quality": dict(quality),
+        "seen_ms": int(now_ms),
+        "doc_write_ms": int(doc_write_ms or now_ms),
+        "source": source_key,
+        "vai_tro": vai_tro,
+    }
+    if len(by_source) > SERVER_MERGE_SHADOW_MAX_SOURCES:
+        oldest = min(by_source, key=lambda key: int(by_source[key].get("seen_ms") or 0))
+        by_source.pop(oldest, None)
+    SERVER_MERGE_SHADOW_OBSERVATION_COUNT += 1
+
+    cur_quality = (cur or {}).get("quality") or {}
+    # Đã có neo MỊN thật: chỉ gia hạn sự hiện diện ở wrapper, tuyệt đối không chạm entry
+    # public hoặc timestamp telemetry của neo — web sẽ coast ngắn rồi tự đóng băng.
+    if (
+        cur
+        and _merge_entry_has_position(cur.get("entry") or {})
+        and not cur_quality.get("raw_consensus")
+    ):
+        cur["seen_ms"] = int(now_ms)
+        cur["last_shadow_seen_ms"] = int(now_ms)
+        cur["last_shadow_source"] = source_key
+        return False
+
+    consensus = _merge_shadow_consensus_candidate_locked(code, now_ms)
+    if consensus is not None:
+        consensus_entry, consensus_quality = consensus
+        if cur and cur_quality.get("raw_consensus"):
+            gap_ms = now_ms - int(cur.get("accepted_ms") or 0)
+            if gap_ms <= 0 or gap_ms > SERVER_RAW_CONSENSUS_MAX_CHAIN_GAP_MS:
+                consensus = None
+            else:
+                reject = _merge_motion_reject_reason(cur.get("entry") or {}, consensus_entry, gap_ms)
+                if reject:
+                    SERVER_MERGE_REJECT_COUNTS[f"raw-consensus-{reject}"] = (
+                        SERVER_MERGE_REJECT_COUNTS.get(f"raw-consensus-{reject}", 0) + 1
+                    )
+                    consensus = None
+        if consensus is not None:
+            consensus_source = "consensus:" + "+".join(consensus_entry["merge_consensus_sources"])
+            stored_entry = _merge_entry_for_store(
+                consensus_entry,
+                consensus_source,
+                "du-phong-dong-thuan",
+                "raw-consensus-2of3",
+                consensus_quality,
+            )
+            previous = (cur or {}).get("entry") or {}
+            SERVER_LIVE_MERGE[code] = {
+                "entry": stored_entry,
+                "ts": int(now_ms),
+                "seen_ms": int(now_ms),
+                "accepted_ms": int(now_ms),
+                "doc_write_ms": int(doc_write_ms or now_ms),
+                "source": consensus_source,
+                "vai_tro": "du-phong-dong-thuan",
+                "quality": consensus_quality,
+                "time_trusted": False,
+                "last_shadow_seen_ms": int(now_ms),
+                "last_shadow_source": source_key,
+            }
+            return stored_entry != previous
+
+    # Đã có một quỹ đạo đồng thuận nhưng nhịp mới chưa đủ 2 nguồn hoặc không qua cổng vật
+    # lý: giữ nguyên vị trí cũ, không hạ ngược thành một marker/entry mới.
+    if cur and cur_quality.get("raw_consensus"):
+        cur["seen_ms"] = int(now_ms)
+        cur["last_shadow_seen_ms"] = int(now_ms)
+        cur["last_shadow_source"] = source_key
+        return False
+
+    presence = _merge_presence_only_entry(entry, source_key, vai_tro, now_ms)
+    previous = (cur or {}).get("entry") or {}
+    presence_quality = {
+        "score": 0,
+        "has_position": False,
+        "coarse": False,
+        "time_trusted": False,
+        "batch_clock": bool(quality.get("batch_clock")),
+        "shadow_only": True,
+    }
+    SERVER_LIVE_MERGE[code] = {
+        "entry": presence,
+        # Không dùng timestamp thô làm neo. Fix mịn đến sau sẽ đi thẳng vào nhánh
+        # replace-empty-current và lấy quyền canonical ngay.
+        "ts": 0,
+        "seen_ms": int(now_ms),
+        "accepted_ms": int((cur or {}).get("accepted_ms") or now_ms),
+        "doc_write_ms": int(doc_write_ms or now_ms),
+        "source": source_key,
+        "vai_tro": vai_tro,
+        "quality": presence_quality,
+        "time_trusted": False,
+        "last_shadow_seen_ms": int(now_ms),
+        "last_shadow_source": source_key,
+    }
+    return presence != previous
+
+
+def _merge_raw_snapshot_entry(entry: dict) -> dict:
+    """Rút gọn một mẫu thô để sổ quan sát nhỏ, đủ điều tra mà không chép cả payload nặng."""
+    keep = (
+        "state", "status", "updated_at_millis", "last_seen_millis", "server_seen_millis",
+        "latitude", "longitude", "heading", "ground_speed_kt", "altitude_ft", "distance_km",
+        "on_ground", "landed", "taxiing", "parked", "eta_millis", "eta_source",
+        "origin_iata", "destination_iata", "aircraft_type", "registration", "fr24_id",
+    )
+    return {key: entry.get(key) for key in keep if key in entry}
+
+
+def _merge_queue_raw_snapshot_locked(
+    flights: dict,
+    source: str,
+    vai_tro: str,
+    profile: dict,
+    now_ms: int,
+) -> None:
+    """Giữ ảnh thô mới nhất theo nguồn để luồng nền ghi bền, không chặn request ingest."""
+    if not SERVER_RAW_SNAPSHOT_PERSIST_ENABLED or not source or not isinstance(flights, dict):
+        return
+    raw_entries = {}
+    for code, entry in flights.items():
+        if len(raw_entries) >= SERVER_RAW_SNAPSHOT_MAX_FLIGHTS:
+            break
+        if not isinstance(entry, dict) or not _merge_entry_has_position(entry):
+            continue
+        if not _merge_entry_is_coarse(entry):
+            continue
+        raw_entries[str(code)[:24]] = _merge_raw_snapshot_entry(entry)
+    if not raw_entries:
+        return
+    SERVER_RAW_SNAPSHOT_PENDING[source] = {
+        "schema": "nkdt-radar-raw-latest-v1",
+        "source": source,
+        "vai_tro": vai_tro,
+        "observed_millis": int(now_ms),
+        "coarse_share": round(float((profile or {}).get("coarse_share") or 0.0), 4),
+        "positioned_count": int((profile or {}).get("positioned") or 0),
+        "raw_count": len(raw_entries),
+        "flights": raw_entries,
+    }
+
+
+def _maybe_persist_raw_snapshots() -> int:
+    """Ghi sổ quan sát theo nguồn tối đa một lần/5 phút; lỗi giữ pending để retry."""
+    global LAST_SERVER_RAW_SNAPSHOT_PERSIST_MS, LAST_SERVER_RAW_SNAPSHOT_ERROR
+    if not SERVER_RAW_SNAPSHOT_PERSIST_ENABLED or RADAR_ROLE != "server":
+        return 0
+    now_ms = int(time.time() * 1000)
+    due: list[tuple[str, dict]] = []
+    with SERVER_LIVE_MERGE_LOCK:
+        for source, payload in SERVER_RAW_SNAPSHOT_PENDING.items():
+            last_ms = int(SERVER_RAW_SNAPSHOT_LAST_PERSIST_MS.get(source) or 0)
+            if not last_ms or now_ms - last_ms >= SERVER_RAW_SNAPSHOT_PERSIST_MS:
+                due.append((source, dict(payload)))
+    if not due:
+        return 0
+    db = _init_firestore_client()
+    if db is None:
+        return 0
+
+    saved = 0
+    for source, payload in due:
+        try:
+            doc_id = hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest()[:24]
+            durable = dict(payload)
+            durable["source_id"] = source
+            durable["updatedAt"] = firebase_firestore.SERVER_TIMESTAMP
+            db.collection(SERVER_RAW_SNAPSHOT_COLLECTION).document(doc_id).set(durable, merge=False)
+            persisted_at = int(time.time() * 1000)
+            with SERVER_LIVE_MERGE_LOCK:
+                SERVER_RAW_SNAPSHOT_LAST_PERSIST_MS[source] = persisted_at
+                current = SERVER_RAW_SNAPSHOT_PENDING.get(source) or {}
+                if int(current.get("observed_millis") or 0) <= int(payload.get("observed_millis") or 0):
+                    SERVER_RAW_SNAPSHOT_PENDING.pop(source, None)
+            LAST_SERVER_RAW_SNAPSHOT_PERSIST_MS = persisted_at
+            LAST_SERVER_RAW_SNAPSHOT_ERROR = None
+            saved += 1
+        except Exception as error:
+            LAST_SERVER_RAW_SNAPSHOT_ERROR = str(error)[:500]
+            log.warning("Ghi sổ quan sát radar %s lỗi (sẽ retry): %s", source, error)
+    return saved
 
 
 def _merge_entry_speed_kt(entry: dict) -> Optional[float]:
@@ -5758,6 +6253,10 @@ def _merge_limit_track_correction(
     """
     if not cur or bool(quality.get("assisted")):
         return None
+    # Neo hiện tại chỉ là đồng thuận thô. Fix mịn tái xuất phải trở thành sự thật ngay;
+    # không được làm méo fix thật để hội tụ từ một estimate cấp thấp hơn.
+    if bool((cur.get("quality") or {}).get("raw_consensus")):
+        return None
     if not bool(quality.get("time_trusted")):
         return None
     cur_entry = cur.get("entry") or {}
@@ -6043,7 +6542,11 @@ def _merge_should_accept_entry(
     if inc_ts <= 0 and cur_ts > 0:
         return False, "no-telemetry"
     if cur_ts <= 0:
-        return True, "replace-empty-current"
+        # Entry hiện diện từ shadow không có tọa độ/timestamp canonical. Chỉ một fix có vị
+        # trí thật mới được thay nó; PENDING/LOST không được xóa mất thông tin tàu đang thấy.
+        if inc_quality.get("has_position") and inc_state not in SERVER_MERGE_EMPTY_STATES:
+            return True, "replace-empty-current"
+        return False, "keep-shadow-presence"
     # Chỉ so timestamp trực tiếp khi CẢ HAI là telemetry thật. Dấu giờ theo lô chỉ là
     # giờ fetch, không có quyền thắng/thua một mốc FR24 thật.
     if inc_quality["time_trusted"] and cur_time_trusted and inc_ts < cur_ts:
@@ -6226,12 +6729,13 @@ def _merge_live_snapshot_into_store(
     now_ms: int,
     source: Optional[str] = None,
     vai_tro: Optional[str] = None,
+    snapshot_id: Optional[str] = None,
 ) -> None:
     """Gộp 1 ảnh chụp vào SERVER_LIVE_MERGE. Gọi được từ CẢ luồng nền LẪN đường request
     /api/etas (để chắc chắn chạy dù gunicorn không giữ luồng nền).
 
-    - CHỈ gộp dữ liệu mới khi doc THỰC SỰ có ghi mới (doc_write_ms đổi) → 1 doc bị nhiều
-      máy ghi đè vẫn gộp đúng, không gộp trùng cùng 1 bản ghi nhiều lần.
+    - Khử trùng theo ``snapshot_id`` RIÊNG từng nguồn: HTTP và Firestore cùng chuyển một
+      ảnh cũng chỉ gộp một lần; hai máy gửi cùng mili-giây không loại nhau.
     - LUÔN prune mã vắng mặt quá TTL — kể cả khi radar chết (doc đứng yên) → tàu hết hạn
       biến mất → web báo 'mất kết nối' đúng lúc, không treo tàu ma.
     - Trong từng mã: mốc telemetry mới hơn thắng, nhưng pha mặt đất có khóa nguồn tạm
@@ -6245,9 +6749,20 @@ def _merge_live_snapshot_into_store(
     role_label = str(vai_tro or "").strip()
     profile = _merge_snapshot_profile(flights, doc_write_ms, source_label, role_label)
     with SERVER_LIVE_MERGE_LOCK:
-        is_new_write = bool(doc_write_ms) and doc_write_ms != SERVER_MERGE_LAST_DOC_WRITE_MS
+        # Khử trùng RIÊNG từng nguồn. Kênh trực tiếp và Firestore có thể chuyển cùng một
+        # snapshot tới Render; feed_revision khiến nó chỉ được gộp một lần. Hai máy gửi cùng
+        # một mili-giây vẫn là hai nguồn độc lập, không còn bị bỏ oan bởi khóa toàn cục cũ.
+        source_key = source_label or "legacy-unknown"
+        marker = str(snapshot_id or "").strip() or f"write:{int(doc_write_ms or 0)}"
+        last_marker = SERVER_MERGE_SOURCE_LAST_SNAPSHOT.get(source_key)
+        is_new_write = bool(snapshot_id or doc_write_ms) and marker != last_marker
         if is_new_write and isinstance(flights, dict):
-            SERVER_MERGE_LAST_DOC_WRITE_MS = doc_write_ms
+            SERVER_MERGE_SOURCE_LAST_SNAPSHOT[source_key] = marker
+            SERVER_MERGE_SOURCE_LAST_WRITE_MS[source_key] = int(doc_write_ms or now_ms)
+            SERVER_MERGE_LAST_DOC_WRITE_MS = max(
+                int(SERVER_MERGE_LAST_DOC_WRITE_MS or 0),
+                int(doc_write_ms or now_ms),
+            )
             if source_label:
                 SERVER_MERGE_SOURCE_PROFILES[source_label] = dict(profile, last_seen_ms=now_ms)
             _merge_learn_source_calibration_locked(
@@ -6263,6 +6778,32 @@ def _merge_live_snapshot_into_store(
                 inc_ts = _entry_telemetry_ms(entry)
                 quality = _merge_entry_quality(entry, inc_ts, now_ms, role_label, profile)
                 cur = SERVER_LIVE_MERGE.get(code)
+                if (
+                    quality.get("has_position")
+                    and quality.get("time_trusted")
+                    and _merge_entry_state(entry) not in SERVER_MERGE_EMPTY_STATES
+                    and now_ms - inc_ts > SERVER_MERGE_TRUSTED_MAX_AGE_MS
+                ):
+                    SERVER_MERGE_REJECT_COUNTS["stale-telemetry"] = (
+                        SERVER_MERGE_REJECT_COUNTS.get("stale-telemetry", 0) + 1
+                    )
+                    continue
+                if _merge_position_is_shadow_only(entry, quality):
+                    if _merge_store_shadow_observation_locked(
+                        code,
+                        cur,
+                        entry,
+                        quality,
+                        now_ms,
+                        doc_write_ms,
+                        source_label,
+                        role_label,
+                    ):
+                        changed = True
+                    SERVER_MERGE_REJECT_COUNTS["shadow-position-only"] = (
+                        SERVER_MERGE_REJECT_COUNTS.get("shadow-position-only", 0) + 1
+                    )
+                    continue
                 refined = _merge_refine_aux_entry(
                     cur,
                     entry,
@@ -6329,6 +6870,13 @@ def _merge_live_snapshot_into_store(
                         cur["last_reject_source"] = source_label
                         cur["last_reject_ms"] = now_ms
                     SERVER_MERGE_REJECT_COUNTS[reason] = SERVER_MERGE_REJECT_COUNTS.get(reason, 0) + 1
+            _merge_queue_raw_snapshot_locked(
+                flights,
+                source_label,
+                role_label,
+                profile,
+                now_ms,
+            )
         if is_new_write and isinstance(flights, dict):
             SERVER_MERGE_LAST_INGEST_MS = now_ms
         # Dọn mã quá hạn — NHƯNG chỉ khi ĐƯỜNG ỐNG CÒN SỐNG.
@@ -6346,6 +6894,13 @@ def _merge_live_snapshot_into_store(
             if hard_dead or (stale_seen and pipeline_alive):
                 SERVER_LIVE_MERGE.pop(code, None)
                 changed = True
+        # Shadow chỉ là hộp đen ngắn hạn; dọn riêng để không giữ vô hạn các tọa độ thô.
+        for code, by_source in list(SERVER_LIVE_SHADOW.items()):
+            for shadow_source, observation in list(by_source.items()):
+                if now_ms - int(observation.get("seen_ms") or 0) > SERVER_LIVE_MERGE_HARD_TTL_MS:
+                    by_source.pop(shadow_source, None)
+            if not by_source:
+                SERVER_LIVE_SHADOW.pop(code, None)
         SERVER_LIVE_MERGE_LAST_MS = now_ms
         if changed:
             SERVER_LIVE_MERGE_REV += 1
@@ -6358,9 +6913,11 @@ def _server_merge_snapshot_view() -> dict:
 
 
 def _server_merge_reader_loop() -> None:
-    """Server role: đọc radarLive/current DÀY rồi gộp, để bắt ảnh chụp của MỌI máy fetcher
-    dù chúng ghi đè chung 1 ô. Chạy nền, độc lập poll_loop. Hàm gộp tự gate ghi-mới + prune.
-    (Đường request /api/etas cũng gọi gộp → đúng kể cả khi gunicorn không giữ luồng nền này.)"""
+    """Đường dự phòng: đọc radarLive/current cho máy cũ hoặc khi HTTP trực tiếp gián đoạn.
+
+    Chạy nền, độc lập poll_loop. ``snapshot_id`` ngăn ảnh đã nhận qua HTTP bị gộp lại.
+    Đường request /api/etas cũng gọi gộp để sống được khi gunicorn mất luồng nền.
+    """
     global SERVER_MERGE_LOOP_HEARTBEAT_MS
     SERVER_MERGE_LOOP_HEARTBEAT_MS = int(time.time() * 1000)
     time.sleep(2)
@@ -6375,6 +6932,7 @@ def _server_merge_reader_loop() -> None:
                 int(time.time() * 1000),
                 (_meta or {}).get("source"),
                 (_meta or {}).get("vai_tro"),
+                (_meta or {}).get("snapshot_id") or (_meta or {}).get("feed_revision"),
             )
         except Exception as e:
             log.warning("Luồng gộp radarLive lỗi: %s", e)
@@ -6871,6 +7429,18 @@ def _phu_cho_den_luot() -> None:
     của máy khác để không trùng mốc nhau.
     """
     global PHU_DA_BU_CHO_MS
+    if _radar_live_direct_is_healthy():
+        # Kênh HTTP đã tách riêng từng nguồn nên không còn phải rình ô ``current`` để chen
+        # giữa nhịp máy chính. Vẫn giữ đúng adaptive interval của máy này, tránh vòng dưới
+        # chỉ nghỉ 2 giây rồi poll FR24 dồn dập.
+        if LAST_POLL_MS:
+            target_ms = int(LAST_POLL_MS) + int(_adaptive_poll_interval_ms())
+            while True:
+                remain_s = (target_ms - int(time.time() * 1000)) / 1000.0
+                if remain_s <= 0:
+                    break
+                time.sleep(min(15.0, max(1.0, remain_s)))
+        return
     deadline = time.time() + PHU_MAX_WAIT_S
     while True:
         last_any_ms, _src = _phu_quan_sat_live()
@@ -6972,6 +7542,7 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
         now_ms,
         (meta or {}).get("source"),
         (meta or {}).get("vai_tro"),
+        (meta or {}).get("snapshot_id") or (meta or {}).get("feed_revision"),
     )
     # Ưu tiên bộ ĐÃ GỘP theo thời gian (mượt, dùng cả 3 máy). Store rỗng lúc vừa khởi động
     # → fallback ảnh thô để không gián đoạn.
@@ -6979,7 +7550,14 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     if merged:
         flights = merged
     fetcher_time = meta.get("server_time_millis")
-    stale = (fetcher_time is None) or (now_ms - int(fetcher_time) > RADAR_LIVE_STALE_MS)
+    # Kênh trực tiếp có thể mới hơn ảnh Firestore ``current``. Tình trạng stale phải dựa
+    # trên mốc mới nhất của cả hai đường, nếu không bảng điều hành báo đỏ dù Render vẫn
+    # đang nhận đều từng máy.
+    latest_ingest_ms = max(
+        int(fetcher_time or 0),
+        int(SERVER_MERGE_LAST_INGEST_MS or 0),
+    )
+    stale = not latest_ingest_ms or now_ms - latest_ingest_ms > RADAR_LIVE_STALE_MS
     # Revision theo bộ gộp: web biết khi nội dung đổi để xin bản đầy đủ; không đổi → nhẹ.
     base_revision = f"merge:{SERVER_LIVE_MERGE_REV}" if merged else (meta.get("feed_revision") or "live:none")
     # Atlas đổi thì web cần nhận guidance mới dù snapshot vị trí chưa đổi.
@@ -7012,6 +7590,58 @@ def _build_etas_payload_from_live(known_revision, now_ms) -> dict:
     }
 
 
+@app.route("/api/radar_live/ingest", methods=["POST"])
+def radar_live_ingest():
+    """Nhận ảnh chụp riêng từng máy, không còn phụ thuộc việc ghi đè Firestore ``current``."""
+    global LAST_RADAR_DIRECT_INGEST_MS, RADAR_DIRECT_INGEST_COUNT
+    if (err := require_api_key()):
+        return err
+    if RADAR_ROLE != "server":
+        return jsonify({"status": "error", "message": "Chỉ Render role server được nhận live"}), 409
+    content_length = int(request.content_length or 0)
+    if content_length > RADAR_LIVE_INGEST_MAX_BYTES:
+        return jsonify({"status": "error", "message": "Ảnh radar vượt giới hạn dung lượng"}), 413
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "Payload không hợp lệ"}), 400
+    flights = data.get("flights") or {}
+    if not isinstance(flights, dict):
+        return jsonify({"status": "error", "message": "flights phải là object"}), 400
+    if len(flights) > RADAR_LIVE_INGEST_MAX_FLIGHTS:
+        return jsonify({"status": "error", "message": "Ảnh radar có quá nhiều chuyến"}), 413
+    source = str(data.get("source") or "").strip()[:80]
+    if not source:
+        return jsonify({"status": "error", "message": "Thiếu source"}), 400
+    vai_tro = str(data.get("vai_tro") or "phu").strip().lower()
+    if vai_tro not in {"chinh", "phu", "chinh-tam"}:
+        vai_tro = "phu"
+    now_ms = int(time.time() * 1000)
+    snapshot_id = str(
+        data.get("snapshot_id")
+        or data.get("feed_revision")
+        or data.get("server_time_millis")
+        or now_ms
+    )[:160]
+    _merge_live_snapshot_into_store(
+        flights,
+        now_ms,
+        now_ms,
+        source,
+        vai_tro,
+        snapshot_id,
+    )
+    LAST_RADAR_DIRECT_INGEST_MS = now_ms
+    RADAR_DIRECT_INGEST_COUNT += 1
+    return jsonify({
+        "status": "success",
+        "accepted": True,
+        "source": source,
+        "flight_count": len(flights),
+        "merge_revision": SERVER_LIVE_MERGE_REV,
+        "server_time_millis": now_ms,
+    })
+
+
 @app.route("/", methods=["GET"])
 def health():
     """Health check public (không yêu cầu API key) để cron-job.org ping keep-alive."""
@@ -7022,6 +7652,8 @@ def health():
         merge_reject_counts = dict(SERVER_MERGE_REJECT_COUNTS)
         merge_source_profiles = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_PROFILES.items()}
         merge_source_calibration = {key: dict(value) for key, value in SERVER_MERGE_SOURCE_CALIBRATION.items()}
+        merge_shadow_flights = len(SERVER_LIVE_SHADOW)
+        merge_shadow_sources = sum(len(value) for value in SERVER_LIVE_SHADOW.values())
     with _lock:
         return jsonify({
             "status": "ok",
@@ -7037,6 +7669,14 @@ def health():
             "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
             "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
             "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
+            "radar_direct_push_enabled": RADAR_LIVE_DIRECT_PUSH_ENABLED,
+            "radar_direct_push_healthy": _radar_live_direct_is_healthy(),
+            "radar_legacy_write_mode": RADAR_LIVE_FIRESTORE_WRITE_MODE,
+            "radar_legacy_current_write_active": _radar_live_should_write_legacy_current(),
+            "last_radar_direct_push_ms": LAST_RADAR_DIRECT_PUSH_MS,
+            "last_radar_direct_push_error": LAST_RADAR_DIRECT_PUSH_ERROR,
+            "last_radar_direct_ingest_ms": LAST_RADAR_DIRECT_INGEST_MS,
+            "radar_direct_ingest_count": RADAR_DIRECT_INGEST_COUNT,
             # Gộp đa máy (server role): kiểm tra nhanh bản mới đã chạy chưa + đang gộp bao nhiêu tàu.
             "merge_size": len(SERVER_LIVE_MERGE),
             "merge_revision": SERVER_LIVE_MERGE_REV,
@@ -7056,11 +7696,24 @@ def health():
             "fr24_detail_cloudflare_blocked": FR24_DETAIL_CLOUDFLARE,
             "fr24_detail_other_error": FR24_DETAIL_OTHER_ERR,
             "fr24_detail_last_error": FR24_DETAIL_LAST_ERROR,
-            "merge_policy": "quality-first-route-fusion-v4",
+            "merge_policy": "trusted-anchor-shadow-v5",
             "merge_reject_counts": merge_reject_counts,
             "merge_source_profiles": merge_source_profiles,
             "merge_source_calibration": merge_source_calibration,
             "merge_refined_count": SERVER_MERGE_REFINED_COUNT,
+            "merge_shadow_position_enabled": SERVER_MERGE_SHADOW_POSITION_ENABLED,
+            "merge_shadow_flights": merge_shadow_flights,
+            "merge_shadow_sources": merge_shadow_sources,
+            "merge_shadow_observation_count": SERVER_MERGE_SHADOW_OBSERVATION_COUNT,
+            "raw_consensus_enabled": SERVER_RAW_CONSENSUS_ENABLED,
+            "raw_consensus_min_sources": SERVER_RAW_CONSENSUS_MIN_SOURCES,
+            "raw_consensus_agree_m": SERVER_RAW_CONSENSUS_AGREE_M,
+            "raw_consensus_min_dad_km": SERVER_RAW_CONSENSUS_MIN_DAD_KM,
+            "raw_snapshot_persist_enabled": SERVER_RAW_SNAPSHOT_PERSIST_ENABLED,
+            "raw_snapshot_collection": SERVER_RAW_SNAPSHOT_COLLECTION,
+            "raw_snapshot_pending_sources": len(SERVER_RAW_SNAPSHOT_PENDING),
+            "raw_snapshot_last_persist_ms": LAST_SERVER_RAW_SNAPSHOT_PERSIST_MS,
+            "raw_snapshot_last_error": LAST_SERVER_RAW_SNAPSHOT_ERROR,
             "merge_route_refine_enabled": SERVER_MERGE_ROUTE_REFINE_ENABLED,
             "merge_route_refined_count": SERVER_MERGE_ROUTE_REFINED_COUNT,
             "radar_ink_enabled": RADAR_INK_ENABLED,
@@ -7204,6 +7857,8 @@ def radar_status():
         merge_revision = SERVER_LIVE_MERGE_REV
         merge_last_ingest_ms = SERVER_MERGE_LAST_INGEST_MS
         merge_loop_heartbeat_ms = SERVER_MERGE_LOOP_HEARTBEAT_MS
+        merge_shadow_flights = len(SERVER_LIVE_SHADOW)
+        merge_shadow_sources = sum(len(value) for value in SERVER_LIVE_SHADOW.values())
 
     servers: list[dict] = []
     current_data: dict = {}
@@ -7262,6 +7917,7 @@ def radar_status():
                     "positioned": positioned if quality_fresh else 0,
                     "coarse_share": round(coarse_share, 3) if quality_fresh else None,
                     "batch_clock": bool(profile.get("batch_clock")) if quality_fresh else None,
+                    "position_mode": str(profile.get("position_mode") or "unknown") if quality_fresh else "unknown",
                     "quality_sample_millis": profile_seen_ms or None,
                 })
         except Exception as error:
@@ -7288,9 +7944,13 @@ def radar_status():
     feed_summary = _radar_status_feed_summary(feed_entries)
     feed_summary.update({
         "mode": "merged" if merged_entries else "snapshot_fallback",
-        "merge_policy": "quality-first-route-fusion-v4",
+        "merge_policy": "trusted-anchor-shadow-v5",
         "merge_size": merge_size,
         "merge_revision": merge_revision,
+        "merge_shadow_flights": merge_shadow_flights,
+        "merge_shadow_sources": merge_shadow_sources,
+        "direct_ingest_millis": LAST_RADAR_DIRECT_INGEST_MS,
+        "direct_ingest_count": RADAR_DIRECT_INGEST_COUNT,
         "merge_last_ingest_millis": merge_last_ingest_ms or None,
         "merge_last_ingest_age_ms": (
             max(0, now_ms - merge_last_ingest_ms) if merge_last_ingest_ms else None
@@ -8582,8 +9242,8 @@ def _start_poller():
         _poller_started = True
     t = threading.Thread(target=poll_loop, daemon=True, name="poll_loop")
     t.start()
-    # Server online: thêm luồng đọc-gộp radarLive DÀY để hợp nhất dữ liệu nhiều máy fetcher
-    # (chống chập chờn khi chạy ≥2 phụ). KHÔNG chạy ở máy fetcher.
+    # Server online: luồng Firestore dự phòng cho máy cũ/HTTP gián đoạn. Kênh chính mới là
+    # /api/radar_live/ingest; snapshot_id bảo đảm hai đường không gộp trùng.
     if RADAR_ROLE == "server":
         tm = threading.Thread(target=_server_merge_reader_loop, daemon=True, name="merge_reader")
         tm.start()
