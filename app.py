@@ -500,6 +500,13 @@ RADAR_LIVE_FIRESTORE_WRITE_MODE = os.environ.get(
 ).strip().lower()
 if RADAR_LIVE_FIRESTORE_WRITE_MODE not in {"auto", "always", "never"}:
     RADAR_LIVE_FIRESTORE_WRITE_MODE = "auto"
+# DẤU SỐNG trên ô chung — KHÔNG phải để chở dữ liệu (dữ liệu đi đường riêng rồi).
+# Máy đời cũ không nâng cấp được vẫn nhìn ``current`` để biết máy chính còn sống; im hẳn ở
+# đó là nó TỰ GÁNH THAY, tự đứng ra ghi giờ vào bến và bắn thông báo — trùng với máy chính.
+# Một lượt ghi mỗi 4 phút là đủ chặn chuyện đó (ngưỡng gánh thay PHU_TAKEOVER_MS = 7 phút),
+# tốn ~360 write/ngày. Đặt 0 để tắt.
+RADAR_LIVE_CURRENT_DAU_SONG_MS = int(
+    os.environ.get("RADAR_LIVE_CURRENT_DAU_SONG_MS", "240000"))
 RADAR_LIVE_DIRECT_HEALTH_MS = int(os.environ.get("RADAR_LIVE_DIRECT_HEALTH_MS", "180000"))
 # Server coi dữ liệu radarLive là cũ nếu fetcher ngừng cập nhật quá ngưỡng này (mặc định 5 phút).
 RADAR_LIVE_STALE_MS = int(os.environ.get("RADAR_LIVE_STALE_MS", str(5 * 60 * 1000)))
@@ -5468,14 +5475,38 @@ def _radar_live_direct_is_healthy(now_ms: Optional[int] = None) -> bool:
 
 
 def _radar_live_should_write_legacy_current(now_ms: Optional[int] = None) -> bool:
-    """Quyết định ghi ô legacy; chế độ auto tự failover khi HTTP Render mất."""
+    """Có ghi ĐẦY ĐỦ vào ô legacy ``current`` ở vòng này không.
+
+    v174: máy nào cũng có đường riêng của mình, nên ô chung không còn là chỗ chở dữ liệu.
+    Vòng nào đã ghi đường riêng thì thôi ghi ở đây — ghi cả hai chỉ là trả tiền hai lần cho
+    một ảnh chụp, và đè mất ảnh của máy đời cũ đang dùng ô này làm đường riêng của nó.
+    """
     if RADAR_LIVE_FIRESTORE_WRITE_MODE == "never":
         return False
-    if RADAR_LIVE_FIRESTORE_WRITE_MODE != "always" and _radar_live_direct_is_healthy(now_ms):
+    if RADAR_LIVE_FIRESTORE_WRITE_MODE == "always":
+        return True
+    if _radar_live_direct_is_healthy(now_ms):
         return False
-    # v174: ô chung chỉ dành cho MỘT người ghi. Máy phụ đã có đường riêng của nó nên không
-    # cần chen vào đây; chỉ khi máy chính im lặng (phụ đang gánh thay) thì phụ mới nhận ô này.
+    if _radar_live_should_write_lane(now_ms):
+        return False
+    # Máy phụ không chen vào ô chung khi máy chính còn sống (nó đã có đường riêng).
     if RADAR_LIVE_CURRENT_CHINH_ONLY and FETCHER_PHU and _phu_chinh_dang_song():
+        return False
+    return True
+
+
+def _nen_ghi_dau_song_o_chung(now_ms: Optional[int] = None) -> bool:
+    """Vòng này có đóng dấu "máy chính còn sống" lên ô chung không.
+
+    Chỉ MÁY ĐANG LÀM CHÍNH (kể cả phụ đang gánh thay — lúc đó nó chính là chính), và chỉ khi
+    vòng này không ghi đầy đủ. ``never`` = người dùng cố ý tắt hẳn đường Firestore.
+    """
+    if RADAR_ROLE != "fetcher" or RADAR_LIVE_FIRESTORE_WRITE_MODE == "never":
+        return False
+    if RADAR_LIVE_CURRENT_DAU_SONG_MS <= 0 or _vai_tro_hien_tai() == "phu":
+        return False
+    now_ms = int(now_ms or time.time() * 1000)
+    if LAST_RADAR_LIVE_WRITE_MS and now_ms - LAST_RADAR_LIVE_WRITE_MS < RADAR_LIVE_CURRENT_DAU_SONG_MS:
         return False
     return True
 
@@ -5536,8 +5567,9 @@ def _write_live_to_firestore() -> None:
             lane["lane_source"] = RADAR_SOURCE_ID
             db.collection(RADAR_LIVE_COLLECTION).document(_radar_live_lane_doc_id()).set(lane)
             LAST_RADAR_LIVE_LANE_WRITE_MS = int(time.time() * 1000)
-        # Ô chung giữ lại cho server/máy đời cũ; nay chỉ một máy ghi nên hết cảnh đè nhau.
-        if _radar_live_should_write_legacy_current():
+        # Ô chung nay chỉ còn hai việc: đường riêng của máy đời cũ (nó chỉ biết ghi ở đây),
+        # và chỗ máy chính đóng dấu sống 4 phút/lần để máy đó khỏi tưởng mình đã tắt.
+        if _radar_live_should_write_legacy_current() or _nen_ghi_dau_song_o_chung():
             doc = dict(snapshot)
             doc["updated_at"] = firebase_firestore.SERVER_TIMESTAMP
             db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
@@ -8018,6 +8050,7 @@ def health():
             "radar_lane_doc_id": _radar_live_lane_doc_id() if RADAR_ROLE == "fetcher" else None,
             "last_radar_live_lane_write_ms": LAST_RADAR_LIVE_LANE_WRITE_MS,
             "radar_lane_write_mode": RADAR_LIVE_LANE_WRITE_MODE,
+            "o_chung_dau_song_ms": RADAR_LIVE_CURRENT_DAU_SONG_MS,
             "radar_lane_catalog": sorted(SERVER_LANE_CATALOG.values()) if RADAR_ROLE == "server" else [],
             "radar_lane_reads": SERVER_LANE_READS,
             "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
