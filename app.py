@@ -161,13 +161,28 @@ IMMEDIATE_POLL_COOLDOWN_MS = 10_000
 
 # Adaptive polling: giảm tải server miễn phí nhưng vẫn cập nhật dày khi tàu gần DAD/taxi.
 ADAPTIVE_POLL_FAR_MS = int(os.environ.get("ADAPTIVE_POLL_FAR_MS", "60000"))       # tàu còn xa
-ADAPTIVE_POLL_MID_MS = int(os.environ.get("ADAPTIVE_POLL_MID_MS", "30000"))       # approach xa / còn 10-20 phút
-ADAPTIVE_POLL_NEAR_MS = int(os.environ.get("ADAPTIVE_POLL_NEAR_MS", "30000"))     # final / taxi / gần sân bay (đo 06/2026: FR24 tươi ~8s, web client refresh 60s → 30s đủ cho chockon mà nhẹ request hơn 20s)
+ADAPTIVE_POLL_MID_MS = int(os.environ.get("ADAPTIVE_POLL_MID_MS", "20000"))       # approach xa / còn 10-20 phút
+# v173: 30s → 12s. Con số 30s cũ dựa trên "web client refresh 60s" — tiền đề đó đã sai từ
+# lâu (web nay 10s, và 5s khi mở bản đồ). Đo 14/08 trên vệt thật: sai số pha tiếp cận
+# 1390 m ≈ đúng quãng đường tàu final đi trong 30 giây. FR24 tươi ~8s nên 12s là sát trần.
+# Quét dày có thể bị FR24 làm thô toạ độ → _he_so_lui_nhip() tự giãn lại khi đo thấy thô.
+ADAPTIVE_POLL_NEAR_MS = int(os.environ.get("ADAPTIVE_POLL_NEAR_MS", "12000"))     # final / taxi / gần sân bay
 ADAPTIVE_POLL_TAXI_MS = int(os.environ.get("ADAPTIVE_POLL_TAXI_MS", "20000"))     # đã hạ, đang taxi
 ADAPTIVE_MID_REMAINING_MS = int(os.environ.get("ADAPTIVE_MID_REMAINING_MS", str(20 * 60_000)))
 ADAPTIVE_NEAR_REMAINING_MS = int(os.environ.get("ADAPTIVE_NEAR_REMAINING_MS", str(10 * 60_000)))
 ADAPTIVE_MID_DISTANCE_KM = float(os.environ.get("ADAPTIVE_MID_DISTANCE_KM", "120"))
 ADAPTIVE_NEAR_DISTANCE_KM = float(os.environ.get("ADAPTIVE_NEAR_DISTANCE_KM", "45"))
+
+# NHỊP GỌI CHI TIẾT — TÁCH HẲN KHỎI NHỊP QUÉT BOUNDS (v174).
+# Hai việc này có GIÁ khác nhau hoàn toàn: quét bounds là ĐÚNG MỘT request cho cả đội tàu,
+# còn get_flight_details là MỘT request MỖI TÀU. Trước v174 chúng dùng chung một hằng số,
+# nên khi v173 rút nhịp 30s→12s thì lượng gọi FR24 không tăng 1 mà tăng theo SỐ TÀU: với
+# 14 tàu là từ ~30 lên ~75 request/phút. Đó là cách nhanh nhất để mất uy tín IP với
+# Cloudflare — mà mất chi tiết chính là mất trail, tức mất luôn cái làm MỊN toạ độ.
+# Nay bounds quét dày như v173 muốn (vị trí tươi), còn chi tiết giữ nhịp thưa như trước.
+DETAIL_REFRESH_NEAR_MS = int(os.environ.get("DETAIL_REFRESH_NEAR_MS", "30000"))
+DETAIL_REFRESH_MID_MS = int(os.environ.get("DETAIL_REFRESH_MID_MS", "30000"))
+DETAIL_REFRESH_FAR_MS = int(os.environ.get("DETAIL_REFRESH_FAR_MS", "60000"))
 
 # Nếu app hỏi lại mà dữ liệu cũ hơn ngưỡng này thì server poll FR24 ngay,
 # không chỉ trả cache. Dùng làm fallback khi app không gửi min_refresh_ms.
@@ -232,9 +247,19 @@ EMA_ALPHA = 0.3                         # 30% giá trị mới + 70% cũ
 APPROACH_FR24_WEIGHT = 0.6              # blend FR24 vs physics ở APPROACH
 APPROACH_PHYS_WEIGHT = 0.4
 
-# Miss handling
-MISS_LANDED_FROM_FINAL = 2   # state cũ = FINAL & miss ≥ 2 → LANDED
-MISS_DROP_THRESHOLD = 5      # miss ≥ 5 → LOST (hoặc LANDED nếu trước đó APPROACH)
+# Miss handling — ĐO BẰNG THỜI GIAN, KHÔNG ĐẾM CHU KỲ (v174).
+# Trước v174 ba ngưỡng này là SỐ VÒNG POLL (2 · 5 · 4). Vòng poll khi đó ~30s nên chúng
+# thật ra có nghĩa "60s · 150s · 120s". v173 rút nhịp quét xuống 12s để marker tươi hơn và
+# vô tình rút luôn quỹ thời gian chịu hụt sóng theo đúng tỉ lệ: tàu chỉ cần vắng 60s là bị
+# đánh LOST và biến khỏi bản đồ, FINAL vắng 24s đã bị coi là đã hạ. Đó là gốc của triệu
+# chứng "lúc lấy được 2 tàu, lúc thì đầy đủ" — FR24 hụt vài nhịp là chuyện thường ngày.
+# Đo bằng mốc telemetry cuối (entry.updated_at) thì đổi nhịp quét bao nhiêu cũng không lay
+# chuyển các quyết định nghiệp vụ này nữa.
+MISS_LANDED_FROM_FINAL_MS = int(os.environ.get("MISS_LANDED_FROM_FINAL_MS", "60000"))
+MISS_DROP_MS = int(os.environ.get("MISS_DROP_MS", "150000"))   # → LOST (hoặc LANDED nếu trước đó APPROACH)
+# Sàn chống kết luận từ ĐÚNG MỘT nhịp hụt: một cycle trắng của FR24 xảy ra liên tục và
+# không nói lên điều gì. Ở nhịp chậm (60s) sàn này giữ nguyên hành vi cũ.
+MISS_MIN_CYCLES = int(os.environ.get("MISS_MIN_CYCLES", "2"))
 
 # Theo dõi sau hạ cánh: tiếp tục refresh khi tàu đã touchdown/taxi.
 # PARKED là mốc tàu gần như đứng yên trong khu vực sân bay, ổn định đủ lâu.
@@ -313,8 +338,10 @@ STAND_SEED_COORDS = {
 AT_STAND_CHOT_ENABLED = os.environ.get("AT_STAND_CHOT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 AT_STAND_GS_KT = int(os.environ.get("AT_STAND_GS_KT", "10"))
 # Nếu tàu đã LANDED/TAXIING rồi mất radar, không đợi quá lâu mới chốt PARKED.
-# 4 chu kỳ poll giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh.
-LANDED_MISS_TO_PARKED = int(os.environ.get("LANDED_MISS_TO_PARKED", "4"))
+# 2 phút giúp tránh tàu nằm mãi trên bản đồ khi ADS-B/FR24 tắt sau hạ cánh. Đây là mốc
+# GHI VÀO SỔ (giờ vào bến) nên càng phải bám đồng hồ, không bám nhịp quét: v173 rút nhịp
+# 30s→12s đã kéo nó từ 120s xuống 48s, tức chốt giờ vào bến sớm hơn thực tế hơn một phút.
+LANDED_MISS_TO_PARKED_MS = int(os.environ.get("LANDED_MISS_TO_PARKED_MS", "120000"))
 # Quy tắc nghiệp vụ: khi radar xác nhận tàu đã hạ cánh, lưu mốc hạ.
 # Nếu không có mốc vào bến tốt hơn, lấy hạ cánh + N phút làm giờ vào bến dự phòng.
 # N được chọn theo loại tàu (narrow body 5 phút, wide body 7 phút) để khớp taxi-in
@@ -479,6 +506,32 @@ RADAR_LIVE_STALE_MS = int(os.environ.get("RADAR_LIVE_STALE_MS", str(5 * 60 * 100
 # Nhãn nguồn để debug biết máy nào đang ghi.
 RADAR_SOURCE_ID = (os.environ.get("RADAR_SOURCE_ID") or os.environ.get("COMPUTERNAME")
                    or os.environ.get("HOSTNAME") or "fetcher")
+
+# ── MỖI MÁY MỘT ĐƯỜNG GHI RIÊNG TRÊN FIRESTORE (v174) ───────────────────────
+# Kênh HTTP đã cho mỗi máy một đường riêng từ lâu (POST /api/radar_live/ingest mang theo
+# ``source``). Nhưng đường DỰ PHÒNG Firestore thì vẫn là MỘT ô chung: cả ba máy cùng
+# ``set()`` đè lên radarLive/current. Chỗ này đã có lời khai trong chính mã nguồn —
+# _phu_quan_sat_heartbeat_chinh ghi rõ "radarLive/current bị cả 3 máy ghi đè nên đọc 1 doc
+# đó dễ bắt trượt". Hệ quả: đúng lúc Render mất kênh HTTP (lúc CẦN dự phòng nhất), server
+# đọc một ô mà chỉ thấy ảnh chụp của MÁY GHI SAU CÙNG — tàu máy khác thấy thì biến mất.
+# Từ v174 mỗi máy ghi doc riêng radarLive/src_<máy>; server đọc gộp từng nguồn y như cách
+# nó gộp các ảnh HTTP. ``current`` vẫn được ghi để máy/server đời cũ không đứt feed.
+RADAR_LIVE_LANE_PREFIX = os.environ.get("RADAR_LIVE_LANE_PREFIX", "src_")
+# ``auto`` = ghi đường riêng đúng lúc đang phải dùng Firestore (HTTP hỏng). ``always`` =
+# ghi mọi vòng (tốn write, chỉ để chẩn đoán). ``never`` = tắt hẳn, quay về hành vi v173.
+RADAR_LIVE_LANE_WRITE_MODE = os.environ.get("RADAR_LIVE_LANE_WRITE_MODE", "auto").strip().lower()
+if RADAR_LIVE_LANE_WRITE_MODE not in {"auto", "always", "never"}:
+    RADAR_LIVE_LANE_WRITE_MODE = "auto"
+# Máy PHỤ không ghi đè ``current`` khi máy chính còn sống: đường riêng đã chở đủ dữ liệu của
+# nó rồi, ghi thêm vào ô chung chỉ để giẫm lên ảnh chụp của máy chính.
+RADAR_LIVE_CURRENT_CHINH_ONLY = os.environ.get(
+    "RADAR_LIVE_CURRENT_CHINH_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Server: lập danh mục các đường riêng (quét collection) THƯA thôi — danh sách máy radar
+# gần như không đổi, mà quét dày thì mỗi lượt tốn 1 read/doc và phá vỡ mức quota Spark.
+SERVER_LANE_CATALOG_MS = int(os.environ.get("SERVER_LANE_CATALOG_MS", "300000"))
+# Đường riêng của một máy chỉ được ĐỌC khi máy đó không còn gửi HTTP tươi — kênh HTTP đã
+# mang đúng dữ liệu ấy rồi, đọc thêm Firestore là trả tiền hai lần cho một thứ.
+SERVER_LANE_HTTP_FRESH_MS = int(os.environ.get("SERVER_LANE_HTTP_FRESH_MS", "60000"))
 # Khóa service account đặt cạnh app.py (dùng cho máy nhà/cơ quan chạy role fetcher).
 _LOCAL_SERVICE_ACCOUNT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "serviceAccount.json")
@@ -573,6 +626,7 @@ LAST_FIRESTORE_FALLBACK_WRITE_MS: Optional[int] = None
 LAST_FIRESTORE_FALLBACK_SYNC_MS: Optional[int] = None
 # Live bridge: trạng thái ghi/đọc radarLive.
 LAST_RADAR_LIVE_WRITE_MS: Optional[int] = None
+LAST_RADAR_LIVE_LANE_WRITE_MS: Optional[int] = None   # lần ghi đường riêng radarLive/src_<máy>
 LAST_RADAR_LIVE_WRITE_ERROR: Optional[str] = None
 LAST_RADAR_LIVE_READ_MS: Optional[int] = None
 LAST_RADAR_LIVE_READ_ERROR: Optional[str] = None
@@ -3183,37 +3237,63 @@ def _code_aliases(value) -> set[str]:
     return aliases
 
 
-def _desired_refresh_interval_ms(entry: Optional[FlightEntry], now_ms: int) -> int:
-    """Chu kỳ refresh thông minh cho từng tàu.
+def _pha_cua_tau(entry: Optional[FlightEntry], now_ms: int) -> str:
+    """Tàu đang ở pha nào: "near" (final/taxi/gần) · "mid" (approach) · "far" (còn xa/đã xong).
 
-    Server/app biết tàu xa hay gần nhờ state, ETA còn lại và distance_km đã lấy từ FR24.
-    - Xa: 60s
-    - Approach/còn 10-20 phút: 30s
-    - Final/còn dưới 10 phút/gần sân bay/taxi: 20s
+    Tách riêng để nhịp QUÉT BOUNDS và nhịp GỌI CHI TIẾT xếp loại y hệt nhau mà vẫn được
+    đặt giá khác nhau (xem DETAIL_REFRESH_*): sai lệch giữa hai cách xếp loại sẽ làm một tàu
+    được quét dày nhưng lại bị bỏ chi tiết, hoặc ngược lại.
     """
     if entry is None:
-        return ADAPTIVE_POLL_NEAR_MS
+        return "near"
     if entry.state in TERMINAL_STATES:
-        return ADAPTIVE_POLL_FAR_MS
+        return "far"
     if entry.state in GROUND_ACTIVE_STATES or entry.state == "FINAL":
-        return ADAPTIVE_POLL_NEAR_MS
+        return "near"
     if entry.state == "APPROACH":
-        return ADAPTIVE_POLL_MID_MS
+        return "mid"
 
     if entry.eta_millis is not None:
         remaining = entry.eta_millis - now_ms
         if remaining <= ADAPTIVE_NEAR_REMAINING_MS:
-            return ADAPTIVE_POLL_NEAR_MS
+            return "near"
         if remaining <= ADAPTIVE_MID_REMAINING_MS:
-            return ADAPTIVE_POLL_MID_MS
+            return "mid"
 
     if entry.distance_km is not None:
         if entry.distance_km <= ADAPTIVE_NEAR_DISTANCE_KM:
-            return ADAPTIVE_POLL_NEAR_MS
+            return "near"
         if entry.distance_km <= ADAPTIVE_MID_DISTANCE_KM:
-            return ADAPTIVE_POLL_MID_MS
+            return "mid"
 
+    return "far"
+
+
+def _desired_refresh_interval_ms(entry: Optional[FlightEntry], now_ms: int) -> int:
+    """Chu kỳ QUÉT BOUNDS mong muốn cho từng tàu (1 request phục vụ cả đội).
+
+    Server/app biết tàu xa hay gần nhờ state, ETA còn lại và distance_km đã lấy từ FR24.
+    """
+    pha = _pha_cua_tau(entry, now_ms)
+    if pha == "near":
+        return ADAPTIVE_POLL_NEAR_MS
+    if pha == "mid":
+        return ADAPTIVE_POLL_MID_MS
     return ADAPTIVE_POLL_FAR_MS
+
+
+def _desired_detail_interval_ms(entry: Optional[FlightEntry], now_ms: int) -> int:
+    """Chu kỳ GỌI CHI TIẾT mong muốn cho từng tàu (1 request MỖI TÀU → đắt gấp N lần).
+
+    Giữ thưa hơn nhịp bounds có chủ ý: chi tiết chỉ cần cho ETA-FR24, real_arrival và
+    trail-làm-mịn — không cái nào cần tươi từng 12 giây, trong khi vị trí thì có.
+    """
+    pha = _pha_cua_tau(entry, now_ms)
+    if pha == "near":
+        return DETAIL_REFRESH_NEAR_MS
+    if pha == "mid":
+        return DETAIL_REFRESH_MID_MS
+    return DETAIL_REFRESH_FAR_MS
 
 
 def _should_fetch_details(entry: Optional[FlightEntry], last_detail_ms: int, now_ms: int) -> bool:
@@ -3223,11 +3303,14 @@ def _should_fetch_details(entry: Optional[FlightEntry], last_detail_ms: int, now
     1 request get_flight_details (ETA-FR24, real_arrival, chi tiết tàu) cho từng mã.
     - PARKED/LOST: không cần (đã chốt; vị trí bounds scan là đủ).
     - Mã mới (last_detail_ms=0) hoặc tàu near/approach/final/đang lăn: fetch (giữ chất lượng).
-    - Tàu en-route ở xa: chỉ fetch lại sau _desired_refresh_interval_ms (60s) → giãn tải.
+    - Tàu en-route ở xa: chỉ fetch lại sau DETAIL_REFRESH_FAR_MS (60s) → giãn tải.
+
+    v174: dùng _desired_detail_interval_ms, KHÔNG dùng nhịp bounds. Bám nhịp bounds nghĩa là
+    mỗi lần quét dày thêm một nấc thì lượng request nhân với SỐ TÀU đang bám.
     """
     if entry is not None and entry.state in TERMINAL_STATES:
         return False
-    desired = max(5_000, _desired_refresh_interval_ms(entry, now_ms))
+    desired = max(5_000, _desired_detail_interval_ms(entry, now_ms))
     return now_ms - last_detail_ms >= desired
 
 
@@ -3266,6 +3349,9 @@ def _adaptive_poll_interval_ms(now_ms: Optional[int] = None) -> int:
     if not active_entries:
         return min(POLL_INTERVAL * 1000, ADAPTIVE_POLL_FAR_MS)
     desired = min(_desired_refresh_interval_ms(entry, now_ms) for entry in active_entries)
+    # v173: giãn nhịp khi FR24 đang làm thô toạ độ. Quét dày mà nhận về lưới 1,1km thì
+    # tươi hơn cũng vô nghĩa — thà chậm lại vài giây để lấy được vị trí mịn.
+    desired = int(desired * _he_so_lui_nhip())
     return min(POLL_INTERVAL * 1000, desired)
 
 
@@ -3554,6 +3640,86 @@ def _looks_grid_coarse(lat, lng) -> bool:
             and abs(lng * 100 - round(lng * 100)) < 1e-6)
 
 
+# ── TỰ ĐIỀU NHỊP THEO CHẤT LƯỢNG TOẠ ĐỘ (v173) ────────────────────────────────
+# Nhịp NEAR/MID cũ là 30s, lý do ghi thẳng trong mã: "web client refresh 60s → 30s là đủ
+# mà nhẹ request hơn 20s". TIỀN ĐỀ ĐÓ KHÔNG CÒN ĐÚNG: web nay hỏi 10s, và 5s khi đang mở
+# bản đồ. Với tàu final ~70 m/s thì mỗi 10 giây trễ là ~700 m sai số trên màn hình — đo
+# ngày 14/08 trên vệt bay thật: sai số pha tiếp cận 1390 m, xấp xỉ đúng quãng đường 30
+# giây đó. Tức khâu chậm nhất của cả dây chuyền chính là nhịp quét này, không phải web.
+#
+# Nhưng quét dày lại làm FR24 trả toạ độ THÔ (lưới 0,01° ≈ 1,1 km) — bẫy đã gặp, và đã có
+# lớp gỡ (_refine_sensors_from_trail lấy lại vị trí mịn từ trail). Nên KHÔNG chốt cứng một
+# con số: quét dày nhất có thể, tự LÙI khi đo thấy bị làm thô, tự tiến lại khi hết. Máy nào
+# IP sạch thì hưởng nhịp nhanh, máy nào bị siết thì tự chậm lại — không ai phải chỉnh tay,
+# và không máy nào kéo cả hệ xuống theo mình.
+#
+# v174 — SỬA CHỖ ĐO. Bản v173 đo SAU _keep_fine_position_if_bounds_coarse, mà lớp đó chép
+# lại vị trí MỊN CŨ của chu kỳ trước khi bounds về thô. Nghĩa là đúng lúc FR24 bắt đầu siết,
+# bộ đo lại ghi "mịn" và không lùi nhịp — mù đúng phút cần thấy. Nay đo NGAY SAU
+# _refine_sensors_from_trail: trail là dữ liệu MỚI thật (gỡ thô được thì tính là mịn),
+# còn giữ-vị-trí-cũ thì không phải dữ liệu mới nên không được tính là mịn.
+# Thêm một mắt thứ hai: tỉ lệ get_flight_details HỎNG. Khi Cloudflare siết, dạng thường gặp
+# không phải "toạ độ thô" mà là "chi tiết rỗng / bounds trả thiếu tàu" — v173 không đếm gì
+# trong hai trường hợp đó nên hệ số lùi đứng nguyên 1.0 suốt.
+_COARSE_GAN_DAY = deque(maxlen=200)          # 1 = vị trí bị làm thô, 0 = mịn
+_DETAIL_LOI_GAN_DAY = deque(maxlen=100)      # 1 = get_flight_details hỏng/rỗng, 0 = có dữ liệu
+_COARSE_TOI_THIEU_MAU = 20                   # dưới mức này chưa đủ cơ sở để lùi nhịp
+_DETAIL_TOI_THIEU_MAU = 10
+COARSE_BACKOFF_NGUONG = float(os.environ.get("COARSE_BACKOFF_NGUONG", "0.35"))
+COARSE_BACKOFF_TOI_DA = float(os.environ.get("COARSE_BACKOFF_TOI_DA", "3.0"))
+DETAIL_BACKOFF_NGUONG = float(os.environ.get("DETAIL_BACKOFF_NGUONG", "0.30"))
+
+
+def _ghi_nhan_chat_luong_toa_do(sensors: dict) -> None:
+    """Đếm tỉ lệ toạ độ bị FR24 làm thô, tính trên chính các fix vừa nhận."""
+    if not isinstance(sensors, dict):
+        return
+    lat, lng = sensors.get("lat"), sensors.get("lng")
+    if lat is None or lng is None:
+        return
+    _COARSE_GAN_DAY.append(1 if _looks_grid_coarse(lat, lng) else 0)
+
+
+def _ghi_nhan_ket_qua_details(details_map: dict) -> None:
+    """Đếm tỉ lệ lượt gọi chi tiết KHÔNG lấy được gì — dấu hiệu bị chặn sớm nhất."""
+    if not isinstance(details_map, dict) or not details_map:
+        return
+    for details in details_map.values():
+        _DETAIL_LOI_GAN_DAY.append(0 if details else 1)
+
+
+def _ty_le_toa_do_tho() -> float:
+    mau = list(_COARSE_GAN_DAY)
+    return (sum(mau) / len(mau)) if mau else 0.0
+
+
+def _ty_le_details_loi() -> float:
+    mau = list(_DETAIL_LOI_GAN_DAY)
+    return (sum(mau) / len(mau)) if mau else 0.0
+
+
+def _lui_theo_ty_le(ty_le: float, nguong: float) -> float:
+    """Vượt ngưỡng bao nhiêu thì giãn nhịp bấy nhiêu, trần COARSE_BACKOFF_TOI_DA."""
+    if ty_le <= nguong:
+        return 1.0
+    phan_vuot = (ty_le - nguong) / max(1e-6, 1.0 - nguong)
+    return min(COARSE_BACKOFF_TOI_DA, 1.0 + phan_vuot * (COARSE_BACKOFF_TOI_DA - 1.0))
+
+
+def _he_so_lui_nhip() -> float:
+    """1.0 = quét đúng nhịp mong muốn. >1 = FR24 đang siết, giãn nhịp ra.
+
+    Lấy mức lùi LỚN NHẤT trong hai dấu hiệu: toạ độ bị làm thô, và chi tiết gọi hỏng. Chưa đủ
+    mẫu thì không được lùi — vài fix thô đầu ca không phải bằng chứng.
+    """
+    he_so = 1.0
+    if len(_COARSE_GAN_DAY) >= _COARSE_TOI_THIEU_MAU:
+        he_so = max(he_so, _lui_theo_ty_le(_ty_le_toa_do_tho(), COARSE_BACKOFF_NGUONG))
+    if len(_DETAIL_LOI_GAN_DAY) >= _DETAIL_TOI_THIEU_MAU:
+        he_so = max(he_so, _lui_theo_ty_le(_ty_le_details_loi(), DETAIL_BACKOFF_NGUONG))
+    return he_so
+
+
 def _keep_fine_position_if_bounds_coarse(sensors: dict, old, now_ms: int) -> dict:
     """Chu kỳ KHÔNG fetch details: bounds thô (lưới 1.1km) mà entry cũ đang giữ vị trí
     MỊN còn tươi (≤90s) → giữ vị trí mịn cũ ("cycle này không có thông tin vị trí mới"),
@@ -3745,6 +3911,10 @@ def _process_match(
     # Bounds-feed bị FR24 làm thô tọa độ (~1.1km) cho IP poll dày → lấy lại vị trí
     # đầy đủ độ phân giải từ details.trail khi có (details=None thì giữ nguyên).
     sensors = _refine_sensors_from_trail(sensors, details, now_ms)
+    # Đo chất lượng toạ độ NGAY ĐÂY — sau lớp gỡ thô bằng trail (dữ liệu MỚI thật), nhưng
+    # TRƯỚC lớp giữ-vị-trí-cũ ở dưới. Đo sau lớp dưới là đo hiệu quả của thuốc chứ không đo
+    # bệnh: chu kỳ nào bị FR24 làm thô cũng hiện ra "mịn" nhờ toạ độ cũ chép lại.
+    _ghi_nhan_chat_luong_toa_do(sensors)
     # Chu kỳ giãn details: bounds vẫn thô → giữ vị trí mịn cũ còn tươi thay vì nhảy lưới.
     sensors = _keep_fine_position_if_bounds_coarse(sensors, old, now_ms)
 
@@ -3957,6 +4127,38 @@ def _process_match(
     )
 
 
+def _tuoi_mat_song_ms(old: Optional[FlightEntry], now_ms: int) -> Optional[int]:
+    """Bao lâu rồi KHÔNG có telemetry thật của tàu này (ms). None = không biết.
+
+    Lấy mốc ``updated_at`` — đúng mốc fix cuối, kể cả khi lớp giữ-mịn đã chép lại vị trí cũ
+    (nó cũng chép nguyên ts_ms cũ). Đồng hồ FR24 lệch nhẹ có thể cho hiệu âm; kẹp về 0.
+    """
+    if old is None or not old.updated_at:
+        return None
+    return max(0, now_ms - int(old.updated_at))
+
+
+def _qua_nguong_mat_song(
+    old: Optional[FlightEntry],
+    now_ms: int,
+    miss_count: int,
+    nguong_ms: int,
+    min_cycles: int = MISS_MIN_CYCLES,
+) -> bool:
+    """Đã vắng đủ lâu để kết luận chưa? Đo bằng ĐỒNG HỒ, chốt chặn bằng số nhịp tối thiểu.
+
+    Bất biến với nhịp quét: đổi ADAPTIVE_POLL_* bao nhiêu cũng không xê dịch mốc LOST/LANDED
+    /chốt-bến. Không đọc được mốc fix (entry cũ thiếu updated_at) thì lùi về cách đếm cũ,
+    quy đổi ngưỡng ms sang số chu kỳ 30s — đúng bằng hành vi trước v173.
+    """
+    if miss_count < max(1, min_cycles):
+        return False
+    tuoi = _tuoi_mat_song_ms(old, now_ms)
+    if tuoi is None:
+        return miss_count >= max(min_cycles, round(nguong_ms / 30_000))
+    return tuoi >= nguong_ms
+
+
 def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optional[FlightEntry]:
     """Mã KHÔNG xuất hiện trong scan cycle này. Giữ vị trí cuối để map vẫn vẽ được.
 
@@ -4056,7 +4258,8 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 "%s: signal cutoff confirms stop → PARKED at candidate %s (miss=%d, ac=%s)",
                 code, candidate_ms, miss_count, aircraft_type or "?",
             )
-        elif (TAXI_EST_ENABLED and miss_count >= LANDED_MISS_TO_PARKED
+        elif (TAXI_EST_ENABLED
+              and _qua_nguong_mat_song(old, now_ms, miss_count, LANDED_MISS_TO_PARKED_MS)
               and taxi_est_ms is not None and now_ms >= taxi_est_ms):
             # MẤT TÍN HIỆU GIỮA ĐƯỜNG LĂN: ước lượng giờ vào bến theo khoảng cách vị-trí-cuối → bến
             # (gần bến/thoát E4 → cộng ít; xa → cộng nhiều). Chỉ ghi khi mốc dự kiến ĐÃ QUA (không
@@ -4068,7 +4271,7 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
                 "%s: signal lost mid-taxi → ƯỚC LƯỢNG vào bến %s (provisional, miss=%d, ac=%s)",
                 code, parked_at, miss_count, aircraft_type or "?",
             )
-        elif miss_count >= LANDED_MISS_TO_PARKED and fallback_parked:
+        elif _qua_nguong_mat_song(old, now_ms, miss_count, LANDED_MISS_TO_PARKED_MS) and fallback_parked:
             # Mất tín hiệu đủ lâu + đã qua taxi buffer + KHÔNG ước lượng được (thiếu vị trí cuối) →
             # hậu phương cuối: landing+N. Không dùng min(landing+buffer, now) nữa, vì nó làm
             # Render/online chốt sớm ngay khi vừa mất tín hiệu sau hạ cánh.
@@ -4136,8 +4339,11 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         )
 
     # Trước đó FINAL + miss ≥ 2 → tàu đã touchdown, FR24 ngừng track
-    if old.state == "FINAL" and miss_count >= MISS_LANDED_FROM_FINAL and _missed_signal_can_mean_landed(old):
-        log.info("%s: FINAL → LANDED (missed %d cycles)", code, miss_count)
+    if (old.state == "FINAL"
+            and _qua_nguong_mat_song(old, now_ms, miss_count, MISS_LANDED_FROM_FINAL_MS)
+            and _missed_signal_can_mean_landed(old)):
+        log.info("%s: FINAL → LANDED (mất sóng %ss, miss=%d)",
+                 code, (_tuoi_mat_song_ms(old, now_ms) or 0) // 1000, miss_count)
         return FlightEntry(
             state="LANDED",
             eta_millis=old.eta_millis or now_ms,
@@ -4167,9 +4373,10 @@ def _process_miss(code: str, old: Optional[FlightEntry], now_ms: int) -> Optiona
         )
 
     # Vượt ngưỡng drop
-    if miss_count >= MISS_DROP_THRESHOLD:
+    if _qua_nguong_mat_song(old, now_ms, miss_count, MISS_DROP_MS):
         if old.state == "APPROACH" and _missed_signal_can_mean_landed(old):
-            log.info("%s: APPROACH + missed %d → LANDED", code, miss_count)
+            log.info("%s: APPROACH + mất sóng %ss → LANDED",
+                     code, (_tuoi_mat_song_ms(old, now_ms) or 0) // 1000)
             return FlightEntry(
                 state="LANDED",
                 eta_millis=old.eta_millis or now_ms,
@@ -4726,6 +4933,8 @@ def _do_poll() -> None:
     # Lọc fetch chi tiết theo nhịp riêng TỪNG tàu (tiết kiệm request FR24 → giảm rủi ro chặn IP):
     #   - Tàu near/approach/final/đang lăn → fetch ~30s (giữ ETA-FR24 & mốc hạ chính xác).
     #   - Tàu en-route ở xa → giãn ra ~60s; vị trí vẫn cập nhật MỖI chu kỳ từ get_flights.
+    # v174: nhịp này là DETAIL_REFRESH_*, độc lập với nhịp quét bounds — quét bounds dày thêm
+    # KHÔNG được kéo theo N request chi tiết mỗi vòng.
     #   - Tàu đã PARKED/LOST → khỏi fetch (vị trí bounds scan là đủ).
     # Trước đây fetch MỌI mã mỗi chu kỳ; 1 tàu hạ (cycle=30s) kéo cả đội bị fetch 30s.
     # _process_match đã xử lý details=None an toàn (vốn xảy ra khi detail timeout) nên mã bị
@@ -4754,6 +4963,9 @@ def _do_poll() -> None:
                 except Exception as e:
                     log.warning("Detail fail %s: %s", code, e)
                     details_map[code] = None
+        # Tỉ lệ lượt chi tiết trắng tay là dấu hiệu bị siết SỚM NHẤT — sớm hơn cả toạ độ thô,
+        # vì Cloudflare chặn endpoint chi tiết trước khi FR24 hạ độ phân giải bounds.
+        _ghi_nhan_ket_qua_details(details_map)
         fetched_ms = int(time.time() * 1000)
         with _lock:
             for code in detail_targets:
@@ -5257,16 +5469,43 @@ def _radar_live_direct_is_healthy(now_ms: Optional[int] = None) -> bool:
 
 def _radar_live_should_write_legacy_current(now_ms: Optional[int] = None) -> bool:
     """Quyết định ghi ô legacy; chế độ auto tự failover khi HTTP Render mất."""
-    if RADAR_LIVE_FIRESTORE_WRITE_MODE == "always":
-        return True
     if RADAR_LIVE_FIRESTORE_WRITE_MODE == "never":
         return False
+    if RADAR_LIVE_FIRESTORE_WRITE_MODE != "always" and _radar_live_direct_is_healthy(now_ms):
+        return False
+    # v174: ô chung chỉ dành cho MỘT người ghi. Máy phụ đã có đường riêng của nó nên không
+    # cần chen vào đây; chỉ khi máy chính im lặng (phụ đang gánh thay) thì phụ mới nhận ô này.
+    if RADAR_LIVE_CURRENT_CHINH_ONLY and FETCHER_PHU and _phu_chinh_dang_song():
+        return False
+    return True
+
+
+def _radar_live_lane_doc_id(source_id: Optional[str] = None) -> str:
+    """Tên doc đường riêng của một máy: radarLive/src_<máy>.
+
+    Firestore cấm '/' trong docId và giới hạn độ dài; tên máy thì do người đặt nên phải làm
+    sạch. Giữ nguyên chữ-số-gạch để nhìn vào Firestore console là biết ngay máy nào.
+    """
+    import re
+    raw = str(source_id or RADAR_SOURCE_ID or "fetcher").strip()
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-") or "fetcher"
+    return f"{RADAR_LIVE_LANE_PREFIX}{slug[:100]}"
+
+
+def _radar_live_should_write_lane(now_ms: Optional[int] = None) -> bool:
+    """Có ghi đường riêng của máy này ở vòng hiện tại không."""
+    if RADAR_LIVE_LANE_WRITE_MODE == "always":
+        return True
+    if RADAR_LIVE_LANE_WRITE_MODE == "never":
+        return False
+    # ``auto``: chỉ ghi khi đang thật sự phải dựa vào Firestore. Kênh HTTP còn khỏe thì mỗi
+    # máy đã có đường riêng của nó rồi (ảnh chụp POST mang theo ``source``).
     return not _radar_live_direct_is_healthy(now_ms)
 
 
 def _write_live_to_firestore() -> None:
     """Fetcher: đẩy thẳng Render; ô ``current`` tự nhường cho máy legacy khi HTTP khỏe."""
-    global LAST_RADAR_LIVE_WRITE_MS, LAST_RADAR_LIVE_WRITE_ERROR
+    global LAST_RADAR_LIVE_WRITE_MS, LAST_RADAR_LIVE_WRITE_ERROR, LAST_RADAR_LIVE_LANE_WRITE_MS
     if RADAR_ROLE != "fetcher":
         return
     payload = build_etas_payload()  # dict đầy đủ {mã: thông tin}
@@ -5289,14 +5528,20 @@ def _write_live_to_firestore() -> None:
     if db is None:
         return
     try:
+        LAST_RADAR_LIVE_WRITE_ERROR = None
+        # ĐƯỜNG RIÊNG trước: đây mới là ảnh chụp KHÔNG ai giẫm lên được, server gộp từ đây.
+        if _radar_live_should_write_lane():
+            lane = dict(snapshot)
+            lane["updated_at"] = firebase_firestore.SERVER_TIMESTAMP
+            lane["lane_source"] = RADAR_SOURCE_ID
+            db.collection(RADAR_LIVE_COLLECTION).document(_radar_live_lane_doc_id()).set(lane)
+            LAST_RADAR_LIVE_LANE_WRITE_MS = int(time.time() * 1000)
+        # Ô chung giữ lại cho server/máy đời cũ; nay chỉ một máy ghi nên hết cảnh đè nhau.
         if _radar_live_should_write_legacy_current():
             doc = dict(snapshot)
             doc["updated_at"] = firebase_firestore.SERVER_TIMESTAMP
             db.collection(RADAR_LIVE_COLLECTION).document(RADAR_LIVE_DOC_ID).set(doc)
             LAST_RADAR_LIVE_WRITE_MS = int(time.time() * 1000)
-            LAST_RADAR_LIVE_WRITE_ERROR = None
-        else:
-            LAST_RADAR_LIVE_WRITE_ERROR = None
         _ghi_heartbeat_fetcher(db)
     except Exception as e:
         LAST_RADAR_LIVE_WRITE_ERROR = str(e)
@@ -6723,6 +6968,89 @@ def _read_live_raw_for_merge():
         return None, {}, 0
 
 
+# ── SERVER: ĐỌC CÁC ĐƯỜNG RIÊNG radarLive/src_<máy> (v174) ──────────────────
+# Ba việc tách bạch, vì mỗi việc có giá Firestore khác nhau:
+#   1. Lập DANH MỤC đường riêng: quét collection, ~1 read/doc → chỉ làm mỗi 5 phút.
+#   2. ĐỌC nội dung một đường: 1 read/lượt → chỉ đọc đường của máy KHÔNG còn gửi HTTP tươi.
+#   3. Gộp: dùng chung _merge_live_snapshot_into_store với đường HTTP, không có luật riêng.
+# Khi cả ba máy POST bình thường thì cả hai việc trên đều KHÔNG đọc gì thêm.
+SERVER_LANE_CATALOG: dict = {}          # {doc_id: source}
+SERVER_LANE_CATALOG_AT_MS = 0
+SERVER_LANE_LAST_WRITE_MS: dict = {}    # {doc_id: update_time đã gộp} — chống gộp lại ảnh cũ
+SERVER_LANE_READS = 0
+
+
+def _nguon_dang_gui_http(source: str, now_ms: int) -> bool:
+    """Máy này có đang POST thẳng lên Render không (đọc từ hồ sơ nguồn của bộ gộp)."""
+    if not source:
+        return False
+    with SERVER_LIVE_MERGE_LOCK:
+        profile = dict(SERVER_MERGE_SOURCE_PROFILES.get(source) or {})
+    moc = int(profile.get("last_seen_ms") or profile.get("doc_write_ms") or 0)
+    return bool(moc) and 0 <= now_ms - moc <= SERVER_LANE_HTTP_FRESH_MS
+
+
+def _lam_moi_danh_muc_duong_rieng(db, now_ms: int) -> None:
+    """Quét THƯA collection radarLive để biết có những đường riêng nào."""
+    global SERVER_LANE_CATALOG, SERVER_LANE_CATALOG_AT_MS, SERVER_LANE_READS
+    # Chưa biết đường riêng nào thì dò nhanh hơn: đúng lúc kênh HTTP vừa đứt, máy radar mới
+    # bắt đầu ghi đường riêng của nó — chờ trọn 5 phút mới nhìn là bỏ trống đúng phút cần.
+    nhip = SERVER_LANE_CATALOG_MS if SERVER_LANE_CATALOG else min(SERVER_LANE_CATALOG_MS, 60_000)
+    if SERVER_LANE_CATALOG_AT_MS and now_ms - SERVER_LANE_CATALOG_AT_MS < nhip:
+        return
+    SERVER_LANE_CATALOG_AT_MS = now_ms
+    danh_muc = {}
+    try:
+        for snap in db.collection(RADAR_LIVE_COLLECTION).select(["source"]).stream(
+                timeout=RADAR_LIVE_READ_TIMEOUT_S):
+            if not snap.id.startswith(RADAR_LIVE_LANE_PREFIX):
+                continue
+            SERVER_LANE_READS += 1
+            data = snap.to_dict() or {}
+            danh_muc[snap.id] = str(data.get("source") or snap.id[len(RADAR_LIVE_LANE_PREFIX):])
+        SERVER_LANE_CATALOG = danh_muc
+    except Exception as e:
+        log.warning("Quét danh mục đường riêng radarLive lỗi: %s", e)
+
+
+def _doc_cac_duong_rieng(now_ms: int) -> list[tuple[dict, dict, int]]:
+    """Trả danh sách (flights, meta, doc_write_ms) của các đường riêng ĐÁNG đọc lúc này."""
+    global SERVER_LANE_READS
+    if RADAR_ROLE != "server":
+        return []
+    db = _init_firestore_client()
+    if db is None:
+        return []
+    _lam_moi_danh_muc_duong_rieng(db, now_ms)
+    ket_qua = []
+    for doc_id, source in list(SERVER_LANE_CATALOG.items()):
+        if _nguon_dang_gui_http(source, now_ms):
+            continue     # kênh HTTP đã chở đúng dữ liệu này rồi
+        try:
+            snap = db.collection(RADAR_LIVE_COLLECTION).document(doc_id).get(
+                timeout=RADAR_LIVE_READ_TIMEOUT_S)
+            SERVER_LANE_READS += 1
+        except Exception as e:
+            log.warning("Đọc đường riêng %s lỗi: %s", doc_id, e)
+            continue
+        if not snap.exists:
+            continue
+        data = snap.to_dict() or {}
+        try:
+            doc_write_ms = int(snap.update_time.timestamp() * 1000)
+        except Exception:
+            doc_write_ms = _to_int_ms(data.get("server_time_millis")) or 0
+        # Doc chưa ghi lại từ lần gộp trước → bỏ, khỏi trả tiền xử lý cho ảnh cũ.
+        if doc_write_ms and SERVER_LANE_LAST_WRITE_MS.get(doc_id) == doc_write_ms:
+            continue
+        SERVER_LANE_LAST_WRITE_MS[doc_id] = doc_write_ms
+        if now_ms - doc_write_ms > RADAR_LIVE_STALE_MS:
+            continue     # máy đã tắt lâu; giữ trong danh mục nhưng không gộp ảnh cũ
+        data["_doc_write_ms"] = doc_write_ms
+        ket_qua.append((data.get("flights") or {}, data, doc_write_ms))
+    return ket_qua
+
+
 def _merge_live_snapshot_into_store(
     flights: dict,
     doc_write_ms: int,
@@ -6934,6 +7262,17 @@ def _server_merge_reader_loop() -> None:
                 (_meta or {}).get("vai_tro"),
                 (_meta or {}).get("snapshot_id") or (_meta or {}).get("feed_revision"),
             )
+            # v174: gộp thêm ĐƯỜNG RIÊNG của từng máy. Ô ``current`` chỉ chở được ảnh của một
+            # máy tại một thời điểm; các đường riêng mới là chỗ giữ đủ cả đội khi HTTP gián đoạn.
+            for lane_flights, lane_meta, lane_write_ms in _doc_cac_duong_rieng(int(time.time() * 1000)):
+                _merge_live_snapshot_into_store(
+                    lane_flights,
+                    lane_write_ms,
+                    int(time.time() * 1000),
+                    (lane_meta or {}).get("source"),
+                    (lane_meta or {}).get("vai_tro"),
+                    (lane_meta or {}).get("snapshot_id") or (lane_meta or {}).get("feed_revision"),
+                )
         except Exception as e:
             log.warning("Luồng gộp radarLive lỗi: %s", e)
         time.sleep(max(2.0, SERVER_MERGE_READ_INTERVAL_S))
@@ -7657,6 +7996,13 @@ def health():
     with _lock:
         return jsonify({
             "status": "ok",
+            # v173: soi được bộ tự điều nhịp mà không phải vào máy. ty_le_toa_do_tho cao mà
+            # he_so_lui_nhip > 1 nghĩa là FR24 đang siết và server đã tự chậm lại đúng ý.
+            "ty_le_toa_do_tho": round(_ty_le_toa_do_tho(), 3),
+            "ty_le_details_loi": round(_ty_le_details_loi(), 3),
+            "he_so_lui_nhip": round(_he_so_lui_nhip(), 2),
+            "nhip_quet_hien_tai_ms": _adaptive_poll_interval_ms(),
+            "nhip_chi_tiet_near_ms": DETAIL_REFRESH_NEAR_MS,
             "radar_role": RADAR_ROLE,
             "radar_source_id": RADAR_SOURCE_ID,
             "fetcher_vai_tro": FETCHER_VAI_TRO,
@@ -7667,6 +8013,13 @@ def health():
             "phu_chu_ky_chinh_ms": _phu_chu_ky_chinh_ms() if FETCHER_PHU else None,
             "last_radar_live_write_ms": LAST_RADAR_LIVE_WRITE_MS,
             "last_radar_live_write_error": LAST_RADAR_LIVE_WRITE_ERROR,
+            # v174: mỗi máy một đường ghi riêng. Ở fetcher xem lane_doc_id/last_lane_write_ms;
+            # ở server xem lane_catalog (đường riêng nào đang tồn tại) + lane_reads (chi phí).
+            "radar_lane_doc_id": _radar_live_lane_doc_id() if RADAR_ROLE == "fetcher" else None,
+            "last_radar_live_lane_write_ms": LAST_RADAR_LIVE_LANE_WRITE_MS,
+            "radar_lane_write_mode": RADAR_LIVE_LANE_WRITE_MODE,
+            "radar_lane_catalog": sorted(SERVER_LANE_CATALOG.values()) if RADAR_ROLE == "server" else [],
+            "radar_lane_reads": SERVER_LANE_READS,
             "last_radar_live_read_ms": LAST_RADAR_LIVE_READ_MS,
             "last_radar_live_read_error": LAST_RADAR_LIVE_READ_ERROR,
             "radar_direct_push_enabled": RADAR_LIVE_DIRECT_PUSH_ENABLED,
