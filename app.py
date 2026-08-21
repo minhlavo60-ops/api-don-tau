@@ -8991,7 +8991,14 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
 
     doc = Document(BytesIO(file_bytes))
     flights: list[dict] = []
-    seen_codes: set[str] = set()
+    seen_rows: set[tuple] = set()
+
+    # Tài liệu ngày D phủ 03:00 D → 03:00 D+1, nên mấy dòng CUỐI (0025 · 0030 · 0300) là
+    # rạng sáng ngày D+1. Bảng được đọc theo ĐÚNG thứ tự tài liệu nên chỗ vắt qua nửa đêm
+    # nhận ra bằng cú tụt giờ >12 tiếng. Không cộng ngày ở đây thì sibtMillis lệch nguyên
+    # một ngày và cả phần rạng sáng rơi khỏi ngày vận hành đúng — đo trên lịch thật
+    # 20/08/2026: ca Đêm mất TW013 0025 và 7C2217 0030, tổng 146 tụt còn 144.
+    moc = {"ngay_them": 0, "phut_truoc": None}
 
     def add_row(cells: list[str]) -> None:
         while cells and not cells[-1]:
@@ -9039,12 +9046,31 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
         if not sibt_ms:
             return
 
-        # Chống trùng mã trong cùng file.
-        if arrival_code in seen_codes:
+        # Chặn ở MỘT lần sang ngày: tài liệu chỉ dài ~24h, để một dòng lỡ đặt sai chỗ
+        # không kéo cả phần còn lại trôi sang những ngày sau.
+        dt_sibt = datetime.fromtimestamp(sibt_ms / 1000, VN_TZ)
+        phut = dt_sibt.hour * 60 + dt_sibt.minute
+        if (moc["phut_truoc"] is not None
+                and phut < moc["phut_truoc"] - 12 * 60
+                and moc["ngay_them"] < 1):
+            moc["ngay_them"] += 1
+        moc["phut_truoc"] = phut
+        sibt_ms += moc["ngay_them"] * 86_400_000
+
+        # Chống trùng DÒNG trong cùng file. Khoá phải gồm cả mốc giờ: một số hiệu bay đến
+        # DAD hai lần trong cùng tài liệu là chuyện có thật (9G2962 đến 13:15 rồi 06:15
+        # hôm sau) — khử theo mã trần là nuốt mất lượt thứ hai ngay từ lúc parse, rồi
+        # không màn nào của app có đường nào biết mà báo.
+        khoa = (arrival_code, int(sibt_ms))
+        if khoa in seen_rows:
             return
-        seen_codes.add(arrival_code)
+        seen_rows.add(khoa)
 
         flights.append({
+            # Cột NO ghi ra CẢ HAI tên: `stt` cho các bản đã quen đọc tên này, `no` cho
+            # đường nạp trên web và cho ganNgayLichBay của client (nó dựa vào NO để dựng
+            # lại thứ tự tài liệu sau khi mảng bị sắp lại theo giờ ở dòng cuối hàm này).
+            "no": int(_compact_text(cells[0])),
             "stt": _compact_text(cells[0]) if cells else "",
             "aircraftType": _compact_text(aircraft_type).upper(),
             "arrivalFlight": arrival_code,
@@ -9069,7 +9095,9 @@ def _parse_docx_flight_plan_bytes(file_bytes: bytes, date_key: str) -> list[dict
         for row in table.rows:
             add_row([_compact_text(cell.text) for cell in row.cells])
 
-    flights.sort(key=lambda item: item.get("sibtMillis") or _parse_sibt_to_millis(item.get("sibt"), date_key) or 0)
+    # Sắp theo mốc thời gian THẬT (đã cộng ngày cho phần sau nửa đêm) nên phần rạng sáng
+    # nằm đúng ở cuối. Thứ tự tài liệu vẫn đọc lại được từ cột NO ở trên.
+    flights.sort(key=lambda item: item.get("sibtMillis") or 0)
     return flights
 
 
